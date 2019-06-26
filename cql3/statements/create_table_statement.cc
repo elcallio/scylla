@@ -51,6 +51,7 @@
 
 #include "auth/resource.hh"
 #include "auth/service.hh"
+#include "cdc/cdc.hh"
 #include "schema_builder.hh"
 #include "service/storage_service.hh"
 #include "db/extensions.hh"
@@ -96,10 +97,31 @@ std::vector<column_definition> create_table_statement::get_columns()
     return column_defs;
 }
 
+template <typename CreateTable>
+future<shared_ptr<cql_transport::event::schema_change>>
+create_table_statement::create_table_with_cdc(service::storage_proxy& proxy,
+                                              schema_ptr schema,
+                                              CreateTable&& create_table) {
+    if (_if_not_exists) {
+        throw exceptions::invalid_request_exception(
+                "Can't create table with CDC support using IF NOT EXISTS");
+    }
+    return cdc::setup(proxy, schema).then([create_table = std::move(create_table), schema = std::move(schema)] () mutable{
+        return create_table().handle_exception([schema = std::move(schema)](std::exception_ptr ep) mutable {
+            return cdc::remove(schema->ks_name(), schema->cf_name()).then([ep = std::move(ep)] {
+                using ret_type = shared_ptr<cql_transport::event::schema_change>;
+                return make_exception_future<ret_type>(std::move(ep));
+            });
+        });
+    });
+}
+
 future<shared_ptr<cql_transport::event::schema_change>> create_table_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) {
-    auto create_table = [this, is_local_only, &proxy] {
+    auto schema = get_cf_meta_data(proxy.get_db().local());
+    auto create_table = [this, is_local_only, schema] () mutable {
         auto& mm = service::get_local_migration_manager();
-        return mm.announce_new_column_family(get_cf_meta_data(proxy.get_db().local()), is_local_only).then_wrapped([this] (auto&& f) {
+        auto res = mm.announce_new_column_family(std::move(schema), is_local_only);
+        return res.then_wrapped([this] (auto&& f) {
             try {
                 f.get();
                 using namespace cql_transport;
@@ -116,7 +138,10 @@ future<shared_ptr<cql_transport::event::schema_change>> create_table_statement::
             }
         });
     };
-    return create_table();
+    return _properties->is_cdc_enabled()
+            ? create_table_with_cdc(
+                    proxy, std::move(schema), std::move(create_table))
+            : create_table();
 }
 
 /**

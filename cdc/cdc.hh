@@ -1,0 +1,48 @@
+/*
+ * Copyright (C) 2019 ScyllaDB
+ */
+
+/*
+ * This file is part of Scylla.
+ *
+ * Scylla is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Scylla is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include <seastar/core/future.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sstring.hh>
+
+class schema;
+using schema_ptr = seastar::lw_shared_ptr<const schema>;
+
+namespace service {
+
+class storage_proxy;
+
+} // namespace service
+
+namespace cdc {
+
+seastar::future<> setup(service::storage_proxy& proxy, schema_ptr schema);
+
+seastar::future<>
+remove(const seastar::sstring& ks_name, const seastar::sstring& table_name);
+
+seastar::sstring log_name(const seastar::sstring& table_name);
+
+seastar::sstring desc_name(const seastar::sstring& table_name);
+
+} // namespace cdc
