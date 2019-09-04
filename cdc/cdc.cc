@@ -35,12 +35,12 @@ using seastar::sstring;
 
 namespace cdc {
 
-static sstring log_name(const sstring& table_name) {
+sstring log_name(const sstring& table_name) {
     static constexpr const auto cdc_log_suffix = "_scylla_cdc_log";
     return table_name + cdc_log_suffix;
 }
 
-static sstring desc_name(const sstring& table_name) {
+sstring desc_name(const sstring& table_name) {
     static constexpr const auto cdc_desc_suffix = "_scylla_cdc_desc";
     return table_name + cdc_desc_suffix;
 }
