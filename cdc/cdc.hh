@@ -21,18 +21,22 @@
 
 #pragma once
 
+#include <vector>
+
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 
+#include "service/storage_proxy.hh"
+#include "timestamp.hh"
+
 class schema;
 using schema_ptr = seastar::lw_shared_ptr<const schema>;
 
-namespace service {
+class service_permit;
 
-class storage_proxy;
-
-} // namespace service
+class mutation;
+class partition_key;
 
 namespace cdc {
 
@@ -44,5 +48,12 @@ remove(const seastar::sstring& ks_name, const seastar::sstring& table_name);
 seastar::sstring log_name(const seastar::sstring& table_name);
 
 seastar::sstring desc_name(const seastar::sstring& table_name);
+
+seastar::future<std::vector<mutation>>apply(
+        service::storage_proxy& proxy,
+        schema_ptr s,
+        service::storage_proxy::clock_type::time_point timeout,
+        service_permit permit,
+        std::vector<mutation> mutations);
 
 } // namespace cdc

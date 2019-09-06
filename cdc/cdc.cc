@@ -22,13 +22,14 @@
 #include <utility>
 
 #include "cdc/cdc.hh"
+#include "bytes.hh"
 #include "database.hh"
 #include "db/config.hh"
 #include "dht/murmur3_partitioner.hh"
+#include "partition_slice_builder.hh"
 #include "schema.hh"
 #include "schema_builder.hh"
 #include "service/migration_manager.hh"
-#include "service/storage_proxy.hh"
 #include "service/storage_service.hh"
 
 using seastar::sstring;
@@ -191,6 +192,196 @@ future<> setup(service::storage_proxy& proxy, schema_ptr s) {
                 });;
             });
         });
+    });
+}
+
+class transformer final {
+public:
+    struct map_cmp {
+        bool operator()(const std::pair<net::inet_address, unsigned int>& a,
+                        const std::pair<net::inet_address, unsigned int>& b) const {
+            if (a.first.is_ipv4()) {
+                if (b.first.is_ipv4()) {
+                    if (a.first.as_ipv4_address().ip > b.first.as_ipv4_address().ip) {
+                        return false;
+                    }
+                    return a.second < b.second;
+                } else {
+                    return true;
+                }
+            } else {
+                if (b.first.is_ipv4()) {
+                    return false;
+                } else {
+                    if (a.first.as_ipv6_address().ip > b.first.as_ipv6_address().ip) {
+                        return false;
+                    }
+                    return a.second < b.second;
+                }
+            }
+        }
+    };
+    using streams_type = std::map<std::pair<net::inet_address, unsigned int>, utils::UUID, map_cmp>;
+private:
+    schema_ptr _schema;
+    schema_ptr _log_schema;
+    utils::UUID _time;
+    bytes _decomposed_time;
+    std::reference_wrapper<locator::token_metadata> _token_metadata;
+    std::reference_wrapper<const locator::abstract_replication_strategy> _replication_strategy;
+    // The assumption here is that all nodes in the cluster are using the
+    // same murmur3_partitioner_ignore_msb_bits. If it's not true, we will
+    // have to gossip it around together with shard_count.
+    unsigned _ignore_msb_bits;
+    streams_type _streams;
+
+    clustering_key set_pk_columns(const partition_key& pk, int batch_no, mutation& m) const {
+        const auto log_ck = clustering_key::from_exploded(
+                *m.schema(), { _decomposed_time, int32_type->decompose(batch_no) });
+        auto pk_value = pk.explode(*_schema);
+        size_t pos = 0;
+        for (const auto& column : _schema->partition_key_columns()) {
+            assert (pos < pk_value.size());
+            auto cdef = m.schema()->get_column_definition(to_bytes("_" + column.name()));
+            auto value = atomic_cell::make_live(*column.type,
+                                                _time.timestamp(),
+                                                bytes_view(pk_value[pos]));
+            m.set_cell(log_ck, *cdef, std::move(value));
+            ++pos;
+        }
+        return log_ck;
+    }
+    partition_key stream_id(const schema& s, const net::inet_address& ip, unsigned int shard_id) const {
+        auto it = _streams.find(std::make_pair(ip, shard_id));
+        if (it == std::end(_streams)) {
+                throw std::runtime_error(format("No stream found for node {} and shard {}", ip, shard_id));
+        }
+        return partition_key::from_exploded(s, { uuid_type->decompose(it->second) });
+    }
+public:
+    transformer(database& db, schema_ptr s, streams_type streams)
+        : _schema(std::move(s))
+        , _log_schema(db.find_schema(_schema->ks_name(), log_name(_schema->cf_name())))
+        , _time(utils::UUID_gen::get_time_UUID())
+        , _decomposed_time(timeuuid_type->decompose(_time))
+        , _token_metadata(service::get_local_storage_service().get_token_metadata())
+        , _replication_strategy(db.find_keyspace(_schema->ks_name()).get_replication_strategy())
+        , _ignore_msb_bits(db.get_config().murmur3_partitioner_ignore_msb_bits())
+        , _streams(std::move(streams))
+    { }
+
+    mutation transform(const mutation& m) const {
+        auto& t = m.token();
+        auto&& eps = _replication_strategy.get().calculate_natural_endpoints(t, _token_metadata.get());
+        if (eps.empty()) {
+            throw std::runtime_error(format("No primary replica found for key {}", m.decorated_key()));
+        }
+        auto shard_id = dht::murmur3_partitioner::shard_of(
+                t, locator::i_endpoint_snitch::get_local_snitch_ptr()->get_shard_count(eps[0]), _ignore_msb_bits);
+        mutation res(_log_schema, stream_id(*_log_schema, eps[0].addr(), shard_id));
+        set_pk_columns(m.key(), 0, res);
+        return res;
+    }
+};
+
+class streams_builder {
+    schema_ptr _schema;
+    transformer::streams_type _streams{transformer::map_cmp{}};
+    net::inet_address _node_ip = net::inet_address();
+    unsigned int _shard_id = 0;
+    api::timestamp_type _latest_row_timestamp = api::min_timestamp;
+    utils::UUID _latest_row_stream_id = utils::UUID();
+public:
+    streams_builder(schema_ptr s) : _schema(std::move(s)) {}
+
+    void accept_new_partition(const partition_key& key, uint32_t row_count) {
+        auto exploded = key.explode(*_schema);
+        _node_ip = value_cast<net::inet_address>(inet_addr_type->deserialize(exploded[0]));
+        _shard_id = static_cast<unsigned int>(value_cast<int>(int32_type->deserialize(exploded[1])));
+        _latest_row_timestamp = api::min_timestamp;
+        _latest_row_stream_id = utils::UUID();
+    }
+
+    void accept_new_partition(uint32_t row_count) {
+        assert(false);
+    }
+
+    void accept_new_row(
+            const clustering_key& key,
+            const query::result_row_view& static_row,
+            const query::result_row_view& row) {
+        auto row_iterator = row.iterator();
+        api::timestamp_type timestamp = value_cast<db_clock::time_point>(
+                timestamp_type->deserialize(key.explode(*_schema)[0])).time_since_epoch().count();
+        if (timestamp <= _latest_row_timestamp) {
+            return;
+        }
+        _latest_row_timestamp = timestamp;
+        for (auto&& cdef : _schema->regular_columns()) {
+            if (cdef.name_as_text() != "stream_id") {
+                row_iterator.skip(cdef);
+                continue;
+            }
+            auto val_opt = row_iterator.next_atomic_cell();
+            assert(val_opt);
+            val_opt->value().with_linearized([&] (bytes_view bv) {
+                _latest_row_stream_id = value_cast<utils::UUID>(uuid_type->deserialize(bv));
+            });
+        }
+    }
+
+    void accept_new_row(const query::result_row_view& static_row, const query::result_row_view& row) {
+        assert(false);
+    }
+
+    void accept_partition_end(const query::result_row_view& static_row) {
+        _streams.emplace(std::make_pair(_node_ip, _shard_id), _latest_row_stream_id);
+    }
+
+    transformer::streams_type build() {
+        return std::move(_streams);
+    }
+};
+
+static future<transformer> get_transformer(
+        service::storage_proxy& proxy,
+        schema_ptr s,
+        service::storage_proxy::clock_type::time_point timeout,
+        service_permit permit) {
+    auto desc_schema =
+        proxy.get_db().local().find_schema(s->ks_name(), desc_name(s->cf_name()));
+    query::read_command cmd(
+            desc_schema->id(),
+            desc_schema->version(),
+            partition_slice_builder(*desc_schema).with_no_static_columns().build());
+    return proxy.query(
+            desc_schema,
+            make_lw_shared(std::move(cmd)),
+            {dht::partition_range::make_open_ended_both_sides()},
+            db::consistency_level::QUORUM,
+            {timeout, permit}).then([&proxy, desc_schema = std::move(desc_schema), s = std::move(s)] (auto qr) mutable {
+        return query::result_view::do_with(*qr.query_result, [&proxy, desc_schema = std::move(desc_schema), s = std::move(s)] (query::result_view v) mutable {
+            auto slice = partition_slice_builder(*desc_schema).with_no_static_columns().build();
+            streams_builder builder{ std::move(desc_schema) };
+            v.consume(slice, builder);
+            return transformer(proxy.get_db().local(), std::move(s), builder.build());
+        });
+    });
+}
+
+future<std::vector<mutation>> apply(
+        service::storage_proxy& proxy,
+        schema_ptr s,
+        service::storage_proxy::clock_type::time_point timeout,
+        service_permit permit,
+        std::vector<mutation> mutations) {
+
+    return get_transformer(proxy, std::move(s), timeout, permit).then([mutations = std::move(mutations)] (transformer trans) mutable {
+        mutations.reserve(2 * mutations.size());
+        for(int i = 0, size = mutations.size(); i < size; ++i) {
+            mutations.push_back(trans.transform(mutations[i]));
+        }
+        return std::move(mutations);
     });
 }
 
