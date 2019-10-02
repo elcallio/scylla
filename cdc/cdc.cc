@@ -20,6 +20,7 @@
  */
 
 #include <utility>
+#include <algorithm>
 
 #include "cdc/cdc.hh"
 #include "bytes.hh"
@@ -31,6 +32,10 @@
 #include "schema_builder.hh"
 #include "service/migration_manager.hh"
 #include "service/storage_service.hh"
+#include "types/tuple.hh"
+#include "cql3/statements/select_statement.hh"
+#include "cql3/multi_column_relation.hh"
+#include "cql3/tuples.hh"
 
 using seastar::sstring;
 
@@ -230,6 +235,7 @@ public:
     };
     using streams_type = std::map<std::pair<net::inet_address, unsigned int>, utils::UUID, map_cmp>;
 private:
+    database& _db;
     schema_ptr _schema;
     schema_ptr _log_schema;
     utils::UUID _time;
@@ -267,7 +273,8 @@ private:
     }
 public:
     transformer(database& db, schema_ptr s, streams_type streams)
-        : _schema(std::move(s))
+        : _db(db)
+        , _schema(std::move(s))
         , _log_schema(db.find_schema(_schema->ks_name(), log_name(_schema->cf_name())))
         , _time(utils::UUID_gen::get_time_UUID())
         , _decomposed_time(timeuuid_type->decompose(_time))
@@ -342,6 +349,86 @@ public:
         }
         return res;
     }
+    ::shared_ptr<cql3::statements::select_statement> pre_value_select(const mutation& m) const {
+        using namespace cql3;
+        using namespace cql3::statements;
+
+        auto& p = m.partition();
+        if (p.partition_tombstone() || !p.row_tombstones().empty() || p.clustered_rows().empty()) {
+            return {};
+        }
+
+        auto str = ::make_shared<restrictions::statement_restrictions>(_db, _schema, statement_type::SELECT, std::vector<::shared_ptr<relation>>{}, nullptr, false, false);
+
+        auto&& pc = _schema->partition_key_columns();
+        auto&& cc = _schema->clustering_key_columns();
+
+
+        auto& k = m.key();
+        for (auto& pkc : pc) {
+            auto r = ::make_shared<restrictions::single_column_restriction::EQ>(pkc, ::make_shared<constants::value>(cql3::raw_value::make_value(bytes(k.get_component(*_schema, pkc.component_index())))));
+            str->add_restriction(std::move(r), false, false);
+        }
+
+        std::vector<std::vector<bytes_opt>> restrictions(pc.size() + cc.size());
+
+        for (const rows_entry& r : p.clustered_rows()) {
+            auto ck_value = r.key().explode(*_schema);
+            for (size_t pos = 0, n = cc.size(); pos < n; ++pos) {
+                restrictions[pos].emplace_back(std::move(ck_value[pos]));
+            }
+        }
+
+        std::vector<::shared_ptr<term>> value;
+        value.reserve(restrictions.size());
+
+        for (auto&& cr : restrictions) {
+            value.emplace_back(::make_shared<tuples::value>(std::move(cr)));
+        }
+
+        std::vector<const column_definition*> cdefs;
+        cdefs.reserve(_schema->all_columns().size());
+
+        std::transform(cc.begin(), cc.end(), std::back_inserter(cdefs), [](auto& c) { return &c; });
+        
+        auto mcr = ::make_shared<restrictions::multi_column_restriction::IN_with_values>(_schema, std::move(cdefs), std::move(value));
+        str->add_restriction(std::move(mcr), false, false);
+
+        cdefs.clear();
+        
+
+        for (auto cr : { _schema->partition_key_columns(), _schema->clustering_key_columns() }) {
+            for (auto& c : cr) {
+                cdefs.emplace_back(&c);
+            }
+        }
+
+        for (const row& r : { std::ref(p.static_row()), std::ref(p.clustered_rows().begin()->row().cells()) }) {
+            r.for_each_cell([&](column_id id, const atomic_cell_or_collection& cell) {
+                auto & cdef =_schema->column_at(column_kind::regular_column, id);
+                cdefs.emplace_back(&cdef);
+            });
+        }
+
+        auto sel = selection::selection::for_columns(_schema, std::move(cdefs));
+
+        // TODO: use qps? Or specific for cdc?
+        static cql_stats dummy;
+        auto st = ::make_shared<select_statement>(_schema, 0u
+            , ::make_shared<select_statement::parameters>()
+            , std::move(sel)
+            , std::move(str)
+            , nullptr
+            , false
+            , select_statement::ordering_comparator_type{}
+            , nullptr
+            , nullptr
+            , dummy
+            );
+
+        return st;
+    }
+
 };
 
 class streams_builder {
