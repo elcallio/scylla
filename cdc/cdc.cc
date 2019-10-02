@@ -247,6 +247,7 @@ private:
     // have to gossip it around together with shard_count.
     unsigned _ignore_msb_bits;
     streams_type _streams;
+    const column_definition& _op_col;
 
     clustering_key set_pk_columns(const partition_key& pk, int batch_no, mutation& m) const {
         const auto log_ck = clustering_key::from_exploded(
@@ -263,6 +264,9 @@ private:
             ++pos;
         }
         return log_ck;
+    }
+    void set_operation(const clustering_key& ck, operation op, mutation& m) const {
+        m.set_cell(ck, _op_col, atomic_cell::make_live(*_op_col.type, _time.timestamp(), _op_col.type->decompose(operation_native_type(op))));
     }
     partition_key stream_id(const schema& s, const net::inet_address& ip, unsigned int shard_id) const {
         auto it = _streams.find(std::make_pair(ip, shard_id));
@@ -282,6 +286,7 @@ public:
         , _replication_strategy(db.find_keyspace(_schema->ks_name()).get_replication_strategy())
         , _ignore_msb_bits(db.get_config().murmur3_partitioner_ignore_msb_bits())
         , _streams(std::move(streams))
+        , _op_col(*_log_schema->get_column_definition(to_bytes("operation")))
     { }
 
     mutation transform(const mutation& m) const {
@@ -294,9 +299,11 @@ public:
                 t, locator::i_endpoint_snitch::get_local_snitch_ptr()->get_shard_count(eps[0]), _ignore_msb_bits);
         mutation res(_log_schema, stream_id(*_log_schema, eps[0].addr(), shard_id));
         auto& p = m.partition();
-        if(p.partition_tombstone()) {
+
+        if (p.partition_tombstone()) {
             // Partition deletion
-            set_pk_columns(m.key(), 0, res);
+            auto log_ck = set_pk_columns(m.key(), 0, res);
+            set_operation(log_ck, operation::partition_delete, res);
         } else if (!p.row_tombstones().empty()) {
             // range deletion
             int batch_no = 0;
@@ -319,11 +326,13 @@ public:
                 {
                     auto log_ck = set_pk_columns(m.key(), batch_no, res);
                     set_bound(log_ck, rt.start);
+                    set_operation(log_ck, operation::range_delete_start, res);
                     ++batch_no;
                 }
                 {
                     auto log_ck = set_pk_columns(m.key(), batch_no, res);
                     set_bound(log_ck, rt.end);
+                    set_operation(log_ck, operation::range_delete_end, res);
                     ++batch_no;
                 }
             }
@@ -344,6 +353,7 @@ public:
                     ++pos;
                 }
 
+                set_operation(log_ck, operation::update, res);
                 ++batch_no;
             }
         }
