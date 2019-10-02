@@ -416,7 +416,7 @@ modification_statement::execute_without_condition(service::storage_proxy& proxy,
     }
 
     auto timeout = db::timeout_clock::now() + options.get_timeout_config().*get_timeout_config_selector();
-    return get_mutations(proxy, options, timeout, false, options.get_timestamp(qs), qs.get_trace_state(), qs.get_permit()).then([this, cl, timeout, &proxy, &qs] (auto mutations) {
+    return get_mutations(proxy, options, timeout, false, options.get_timestamp(qs), qs.get_trace_state(), qs.get_permit()).then([this, cl, timeout, &proxy, &qs, &options] (auto mutations) {
         if (mutations.empty()) {
             return now();
         }
@@ -428,7 +428,7 @@ modification_statement::execute_without_condition(service::storage_proxy& proxy,
         if (qs.get_client_state().is_internal() || qs.get_client_state().is_thrift() || !s->cdc_enabled()) {
             return mutate(std::move(mutations));
         }
-        return cdc::apply(proxy, s, timeout, qs.get_permit(), std::move(mutations)).then([cl, timeout, &proxy, &qs, mutate = std::move(mutate)] (std::vector<mutation> mutations) {
+        return cdc::apply(proxy, s, timeout, qs, options, std::move(mutations)).then([cl, timeout, &proxy, &qs, mutate = std::move(mutate)] (std::vector<mutation> mutations) {
             return mutate(std::move(mutations));
         });
     });

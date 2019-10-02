@@ -38,6 +38,10 @@ class service_permit;
 class mutation;
 class partition_key;
 
+namespace service {
+    class query_state;
+}
+
 namespace cdc {
 
 // cdc log table operation
@@ -63,7 +67,8 @@ seastar::future<std::vector<mutation>>apply(
         service::storage_proxy& proxy,
         schema_ptr s,
         service::storage_proxy::clock_type::time_point timeout,
-        service_permit permit,
+        service::query_state& qs, 
+        const cql3::query_options&,
         std::vector<mutation> mutations);
 
 } // namespace cdc
