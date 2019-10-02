@@ -40,6 +40,16 @@ class partition_key;
 
 namespace cdc {
 
+// cdc log table operation
+enum class operation : int8_t {
+    pre_image, update, row_delete, range_delete_start, range_delete_end, partition_delete
+};
+
+// cdc log data column operation
+enum class column_op : int8_t {
+    set, del, add,
+};
+
 seastar::future<> setup(service::storage_proxy& proxy, schema_ptr schema);
 
 seastar::future<>

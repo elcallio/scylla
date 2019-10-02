@@ -36,6 +36,9 @@ using seastar::sstring;
 
 namespace cdc {
 
+using operation_native_type = std::underlying_type_t<operation>;
+using column_op_native_type = std::underlying_type_t<column_op>;
+
 sstring log_name(const sstring& table_name) {
     static constexpr const auto cdc_log_suffix = "_scylla_cdc_log";
     return table_name + cdc_log_suffix;
@@ -67,17 +70,21 @@ static future<> setup_log(const schema& s) {
     b.with_column("stream_id", uuid_type, column_kind::partition_key);
     b.with_column("time", timeuuid_type, column_kind::clustering_key);
     b.with_column("batch_seq_no", int32_type, column_kind::clustering_key);
-    b.with_column("operation", int32_type);
+    b.with_column("operation", data_type_for<operation_native_type>());
     b.with_column("ttl", long_type);
-    auto add_columns = [&] (const auto& columns) {
+    auto add_columns = [&] (const schema::const_iterator_range_type& columns, bool is_data_col = false) {
         for (const auto& column : columns) {
-            b.with_column("_" + column.name(), column.type);
+            auto type = column.type;
+            if (is_data_col) {
+                type = tuple_type_impl::get_instance({ data_type_for<column_op_native_type>(), type, long_type});
+        }
+            b.with_column("_" + column.name(), type);
         }
     };
     add_columns(s.partition_key_columns());
     add_columns(s.clustering_key_columns());
-    add_columns(s.static_columns());
-    add_columns(s.regular_columns());
+    add_columns(s.static_columns(), true);
+    add_columns(s.regular_columns(), true);
     auto& mm = service::get_local_migration_manager();
     return mm.announce_new_column_family(b.build(), false);
 }
