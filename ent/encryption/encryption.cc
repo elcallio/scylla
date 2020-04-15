@@ -533,6 +533,13 @@ public:
             auto s = sst.get_schema();
             auto e = s->extensions().find(encryption_attribute);
             if (e != s->extensions().end()) {
+                // do not encrypt other components than Data for paxos/batch log.
+                // this prevents a chicken and egg issue with replicated provider, 
+                // and should effectively make it safe to use for system encryption.
+                if (type != sstables::component_type::Data && (s == db::system_keyspace::paxos() || s == db::system_keyspace::batchlog())) {
+                    return make_ready_future<file>();
+                }
+
                 auto& sc = sst.get_shared_components();
                 if (!sc.scylla_metadata) {
                     sc.scylla_metadata.emplace();
