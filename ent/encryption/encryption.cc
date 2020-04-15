@@ -719,6 +719,8 @@ future<> register_extensions(const db::config&, const encryption_config& cfg, db
         });
     }
 
+    replicated_key_provider_factory::init();
+
     return f;
 }
 

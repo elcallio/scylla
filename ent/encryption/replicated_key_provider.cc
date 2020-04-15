@@ -92,6 +92,9 @@ public:
         if (!id || _initialized) {
             return false;
         }
+        if (!_initialized) {
+            return true;
+        }
         auto& qp = _ctxt.get_query_processor();
         return !qp.local_is_initialized() || _ctxt.get_database().local().get_compaction_manager().stopped();
     }
@@ -370,6 +373,10 @@ shared_ptr<key_provider> replicated_key_provider_factory::get_provider(encryptio
     }
 
     return p;
+}
+
+void replicated_key_provider_factory::init() {
+    distributed_loader::mark_keyspace_as_load_prio(KSNAME);
 }
 
 }

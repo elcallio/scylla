@@ -21,6 +21,8 @@ public:
     ~replicated_key_provider_factory();
 
     shared_ptr<key_provider> get_provider(encryption_context&, const options&) override;
+
+    static void init();
 };
 
 }
