@@ -37,6 +37,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <exception>
+#include <filesystem>
 
 #include <seastar/core/align.hh>
 #include <seastar/core/seastar.hh>
@@ -1282,7 +1283,7 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
         auto fut = open_file_dma(filename, flags, opt);
         if (cfg.extensions && !cfg.extensions->commitlog_file_extensions().empty()) {
             for (auto * ext : cfg.extensions->commitlog_file_extensions()) {
-                fut = fut.then([ext, filename, flags](file f) {
+                fut = close_on_failure(std::move(fut), [ext, filename, flags](file f) {
                    return ext->wrap_file(filename, f, flags).then([f](file nf) mutable {
                        return nf ? nf : std::move(f);
                    });
@@ -2093,6 +2094,11 @@ db::commitlog::read_log_file(const sstring& filename, const sstring& pfx, seasta
             });
         }
     };
+
+    auto bare_filename = std::filesystem::path(filename).filename().string();
+    if (bare_filename.rfind(pfx, 0) != 0) {
+        return make_ready_future<>();
+    }
 
     auto fut = do_io_check(commit_error_handler, [&] {
         auto fut = open_file_dma(filename, open_flags::ro);

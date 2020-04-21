@@ -72,47 +72,8 @@ private:
         static std::vector<column_info> build(
                 const schema& s,
                 const utils::chunked_vector<serialization_header::column_desc>& src,
-                bool is_static) {
-            std::vector<column_info> cols;
-            if (s.is_dense()) {
-                const column_definition& col = is_static ? *s.static_begin() : *s.regular_begin();
-                cols.push_back(column_info{
-                    &col.name(),
-                    col.type,
-                    col.id,
-                    col.type->value_length_if_fixed(),
-                    col.is_multi_cell(),
-                    col.is_counter(),
-                    false
-                });
-            } else {
-                cols.reserve(src.size());
-                for (auto&& desc : src) {
-                    const bytes& type_name = desc.type_name.value;
-                    data_type type = db::marshal::type_parser::parse(to_sstring_view(type_name));
-                    const column_definition* def = s.get_column_definition(desc.name.value);
-                    std::optional<column_id> id;
-                    bool schema_mismatch = false;
-                    if (def) {
-                        id = def->id;
-                        schema_mismatch = def->is_multi_cell() != type->is_multi_cell() ||
-                                          def->is_counter() != type->is_counter() ||
-                                          !def->type->is_value_compatible_with(*type);
-                    }
-                    cols.push_back(column_info{
-                        &desc.name.value,
-                        type,
-                        id,
-                        type->value_length_if_fixed(),
-                        type->is_multi_cell(),
-                        type->is_counter(),
-                        schema_mismatch
-                    });
-                }
-                boost::range::stable_partition(cols, [](const column_info& column) { return !column.is_collection; });
-            }
-            return cols;
-        }
+                const sstable_enabled_features& features,
+                bool is_static);
 
         utils::UUID schema_uuid;
         std::vector<column_info> regular_schema_columns_from_sstable;
@@ -125,10 +86,10 @@ private:
         state(state&&) = default;
         state& operator=(state&&) = default;
 
-        state(const schema& s, const serialization_header& header)
+        state(const schema& s, const serialization_header& header, const sstable_enabled_features& features)
             : schema_uuid(s.version())
-            , regular_schema_columns_from_sstable(build(s, header.regular_columns.elements, false))
-            , static_schema_columns_from_sstable(build(s, header.static_columns.elements, true))
+            , regular_schema_columns_from_sstable(build(s, header.regular_columns.elements, features, false))
+            , static_schema_columns_from_sstable(build(s, header.static_columns.elements, features, true))
             , clustering_column_value_fix_lengths (get_clustering_values_fixed_lengths(header))
         {}
     };
@@ -136,9 +97,10 @@ private:
     lw_shared_ptr<const state> _state = make_lw_shared<const state>();
 
 public:
-    column_translation get_for_schema(const schema& s, const serialization_header& header) {
+    column_translation get_for_schema(
+            const schema& s, const serialization_header& header, const sstable_enabled_features& features) {
         if (s.version() != _state->schema_uuid) {
-            _state = make_lw_shared(state(s, header));
+            _state = make_lw_shared(state(s, header, features));
         }
         return *this;
     }
