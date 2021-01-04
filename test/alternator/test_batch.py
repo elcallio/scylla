@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for batch operations - BatchWriteItem, BatchReadItem.
 # Note that various other tests in other files also use these operations,
@@ -305,3 +294,16 @@ def test_batch_get_item_projection_expression(test_table):
         got_items = reply['Responses'][test_table.name]
         expected_items = [{k: item[k] for k in wanted if k in item} for item in items]
         assert multiset(got_items) == multiset(expected_items)
+
+# Test that we return the required UnprocessedKeys/UnprocessedItems parameters
+def test_batch_unprocessed(test_table_s):
+    p = random_string()
+    write_reply = test_table_s.meta.client.batch_write_item(RequestItems = {
+        test_table_s.name: [{'PutRequest': {'Item': {'p': p, 'a': 'hi'}}}],
+    })
+    assert 'UnprocessedItems' in write_reply and write_reply['UnprocessedItems'] == dict()
+
+    read_reply = test_table_s.meta.client.batch_get_item(RequestItems = {
+        test_table_s.name: {'Keys': [{'p': p}], 'ProjectionExpression': 'p, a', 'ConsistentRead': True}
+    })
+    assert 'UnprocessedKeys' in read_reply and read_reply['UnprocessedKeys'] == dict()

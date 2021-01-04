@@ -72,9 +72,15 @@ public:
     const unsigned murmur3_partitioner_ignore_msb_bits() const {
         return _murmur3_partitioner_ignore_msb_bits;
     }
+
+    uint32_t schema_registry_grace_period() const {
+        return _schema_registry_grace_period;
+    }
+
 private:
     const db::extensions& _extensions;
     const unsigned _murmur3_partitioner_ignore_msb_bits;
+    const uint32_t _schema_registry_grace_period;
 };
 
 namespace schema_tables {
@@ -98,6 +104,7 @@ static constexpr auto AGGREGATES = "aggregates";
 static constexpr auto INDEXES = "indexes";
 static constexpr auto VIEW_VIRTUAL_COLUMNS = "view_virtual_columns"; // Scylla specific
 static constexpr auto COMPUTED_COLUMNS = "computed_columns"; // Scylla specific
+static constexpr auto SCYLLA_TABLE_SCHEMA_HISTORY = "scylla_table_schema_history"; // Scylla specific;
 
 schema_ptr columns();
 schema_ptr view_virtual_columns();
@@ -107,6 +114,8 @@ schema_ptr tables();
 schema_ptr scylla_tables(schema_features features = schema_features::full());
 schema_ptr views();
 schema_ptr computed_columns();
+// Belongs to the "system" keyspace
+schema_ptr scylla_table_schema_history();
 
 }
 
@@ -141,10 +150,10 @@ std::vector<schema_ptr> all_tables(schema_features);
 std::vector<sstring> all_table_names(schema_features);
 
 // saves/creates "ks" + all tables etc, while first deleting all old schema entries (will be rewritten)
-future<> save_system_schema(const sstring & ks);
+future<> save_system_schema(cql3::query_processor& qp, const sstring & ks);
 
 // saves/creates "system_schema" keyspace
-future<> save_system_keyspace_schema();
+future<> save_system_keyspace_schema(cql3::query_processor& qp);
 
 future<utils::UUID> calculate_schema_digest(distributed<service::storage_proxy>& proxy, schema_features);
 
@@ -158,6 +167,13 @@ future<mutation> read_keyspace_mutation(distributed<service::storage_proxy>&, co
 future<> merge_schema(distributed<service::storage_proxy>& proxy, gms::feature_service& feat, std::vector<mutation> mutations);
 
 future<> merge_schema(distributed<service::storage_proxy>& proxy, std::vector<mutation> mutations, bool do_flush);
+
+// Recalculates the local schema version.
+//
+// It is safe to call concurrently with recalculate_schema_version() and merge_schema() in which case it
+// is guaranteed that the schema version we end up with after all calls will reflect the most recent state
+// of feature_service and schema tables.
+future<> recalculate_schema_version(distributed<service::storage_proxy>& proxy, gms::feature_service& feat);
 
 future<std::set<sstring>> merge_keyspaces(distributed<service::storage_proxy>& proxy, schema_result&& before, schema_result&& after);
 
@@ -184,6 +200,7 @@ void add_type_to_schema_mutation(user_type type, api::timestamp_type timestamp, 
 std::vector<mutation> make_create_table_mutations(lw_shared_ptr<keyspace_metadata> keyspace, schema_ptr table, api::timestamp_type timestamp);
 
 std::vector<mutation> make_update_table_mutations(
+    database& db,
     lw_shared_ptr<keyspace_metadata> keyspace,
     schema_ptr old_table,
     schema_ptr new_table,
@@ -235,6 +252,18 @@ std::optional<std::map<K, V>> get_map(const query::result_set_row& row, const ss
     }
     return std::nullopt;
 }
+
+/// Stores the column mapping for the table being created or altered in the system table
+/// which holds a history of schema versions alongside with their column mappings.
+/// Can be used to insert entries with TTL (equal to DEFAULT_GC_GRACE_SECONDS) in case we are
+/// overwriting an existing column mapping to garbage collect obsolete entries.
+future<> store_column_mapping(distributed<service::storage_proxy>& proxy, schema_ptr s, bool with_ttl);
+/// Query column mapping for a given version of the table locally.
+future<column_mapping> get_column_mapping(utils::UUID table_id, table_schema_version version);
+/// Check that column mapping exists for a given version of the table
+future<bool> column_mapping_exists(utils::UUID table_id, table_schema_version version);
+/// Delete matching column mapping entries from the `system.scylla_table_schema_history` table
+future<> drop_column_mapping(utils::UUID table_id, table_schema_version version);
 
 } // namespace schema_tables
 } // namespace db

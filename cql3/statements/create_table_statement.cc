@@ -78,7 +78,7 @@ std::vector<column_definition> create_table_statement::get_columns() const
     std::vector<column_definition> column_defs;
     for (auto&& col : _columns) {
         column_kind kind = column_kind::regular_column;
-        if (_static_columns.count(col.first)) {
+        if (_static_columns.contains(col.first)) {
             kind = column_kind::static_column;
         }
         column_defs.emplace_back(col.first->name(), col.second, kind);
@@ -86,10 +86,10 @@ std::vector<column_definition> create_table_statement::get_columns() const
     return column_defs;
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> create_table_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const {
+future<shared_ptr<cql_transport::event::schema_change>> create_table_statement::announce_migration(service::storage_proxy& proxy) const {
     auto schema = get_cf_meta_data(proxy.get_db().local());
-    return make_ready_future<>().then([this, is_local_only, schema = std::move(schema)] {
-        return service::get_local_migration_manager().announce_new_column_family(std::move(schema), is_local_only);
+    return make_ready_future<>().then([this, schema = std::move(schema)] {
+        return service::get_local_migration_manager().announce_new_column_family(std::move(schema));
     }).then_wrapped([this] (auto&& f) {
         try {
             f.get();
@@ -124,7 +124,7 @@ schema_ptr create_table_statement::get_cf_meta_data(const database& db) const {
 void create_table_statement::apply_properties_to(schema_builder& builder, const database& db) const {
     auto&& columns = get_columns();
     for (auto&& column : columns) {
-        builder.with_column(column);
+        builder.with_column_ordered(column);
     }
 #if 0
     cfmd.defaultValidator(defaultValidator)
@@ -193,6 +193,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
     }
 
     _properties.validate(db, _properties.properties()->make_schema_extensions(db.extensions()));
+    const bool has_default_ttl = _properties.properties()->get_default_time_to_live() > 0;
 
     auto stmt = ::make_shared<create_table_statement>(_cf_name, _properties.properties(), _if_not_exists, _static_columns, _properties.properties()->get_id());
 
@@ -200,9 +201,11 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
     for (auto&& entry : _definitions) {
         ::shared_ptr<column_identifier> id = entry.first;
         cql3_type pt = entry.second->prepare(db, keyspace());
-        if (pt.is_counter() && !db.features().cluster_supports_counters()) {
-            throw exceptions::invalid_request_exception("Counter support is not enabled");
+
+        if (has_default_ttl && pt.is_counter()) {
+            throw exceptions::invalid_request_exception("Cannot set default_time_to_live on a table with counters");
         }
+
         if (pt.get_type()->is_multi_cell()) {
             if (pt.get_type()->is_user_type()) {
                 // check for multi-cell types (non-frozen UDTs or collections) inside a non-frozen UDT
@@ -246,7 +249,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
         if (t->references_duration()) {
             throw exceptions::invalid_request_exception(format("duration type is not supported for PRIMARY KEY part {}", alias->text()));
         }
-        if (_static_columns.count(alias) > 0) {
+        if (_static_columns.contains(alias)) {
             throw exceptions::invalid_request_exception(format("Static column {} cannot be part of the PRIMARY KEY", alias->text()));
         }
         key_types.emplace_back(t);
@@ -273,7 +276,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
                 throw exceptions::invalid_request_exception("Non-frozen collections and UDTs are not supported with COMPACT STORAGE");
             }
             auto alias = _column_aliases[0];
-            if (_static_columns.count(alias) > 0) {
+            if (_static_columns.contains(alias)) {
                 throw exceptions::invalid_request_exception(format("Static column {} cannot be part of the PRIMARY KEY", alias->text()));
             }
             stmt->_column_aliases.emplace_back(alias->name());
@@ -296,7 +299,7 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
                 if (type->references_duration()) {
                     throw exceptions::invalid_request_exception(format("duration type is not supported for PRIMARY KEY part {}", t->text()));
                 }
-                if (_static_columns.count(t) > 0) {
+                if (_static_columns.contains(t)) {
                     throw exceptions::invalid_request_exception(format("Static column {} cannot be part of the PRIMARY KEY", t->text()));
                 }
                 types.emplace_back(type);

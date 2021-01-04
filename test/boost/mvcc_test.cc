@@ -38,7 +38,7 @@ static thread_local mutation_application_stats app_stats_for_tests;
 // Verifies that tombstones in "list" are monotonic, overlap with the requested range,
 // and have information equivalent with "expected" in that range.
 static
-void check_tombstone_slice(const schema& s, std::vector<range_tombstone> list,
+void check_tombstone_slice(const schema& s, const utils::chunked_vector<range_tombstone>& list,
     const query::clustering_range& range,
     std::initializer_list<range_tombstone> expected)
 {
@@ -540,7 +540,7 @@ static mutation_partition read_using_cursor(partition_snapshot& snap) {
     for (auto&& rt : snap.range_tombstones()) {
         mp.apply_delete(*snap.schema(), rt);
     }
-    mp.apply(*snap.schema(), static_row(snap.static_row(false)));
+    mp.apply(*snap.schema(), mutation_fragment(*snap.schema(), tests::make_permit(), static_row(snap.static_row(false))));
     mp.set_static_row_continuous(snap.static_row_continuous());
     mp.apply(snap.partition_tombstone());
     return mp;

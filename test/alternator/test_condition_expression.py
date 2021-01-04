@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for the ConditionExpression parameter which makes certain operations
 # (PutItem, UpdateItem and DeleteItem) conditional on the existing attribute
@@ -727,6 +716,17 @@ def test_update_condition_attribute_type_second_arg(test_table_s):
                 ConditionExpression='attribute_type (a, b)',
                 ExpressionAttributeValues={':val': 1})
 
+# If the attribute_type() parameter is not one of the known types
+# (N,NS,BS,L,SS,NULL,B,BOOL,S,M), an error is generated. We should
+# not get a failed condition.
+def test_update_condition_attribute_type_unknown(test_table_s):
+    p = random_string()
+    with pytest.raises(ClientError, match='ValidationException.*DOG'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET c = :val',
+                ConditionExpression='attribute_type (a, :type)',
+                ExpressionAttributeValues={':val': 1, ':type': 'DOG'})
+
 def test_update_condition_begins_with(test_table_s):
     p = random_string()
     test_table_s.update_item(Key={'p': p},
@@ -755,6 +755,11 @@ def test_update_condition_begins_with(test_table_s):
             UpdateExpression='SET c = :val',
                 ConditionExpression='begins_with(a, :arg)',
                 ExpressionAttributeValues={':val': 3, ':arg': 2})
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET c = :val',
+                ConditionExpression='begins_with(c, :arg)',
+                ExpressionAttributeValues={':val': 3, ':arg': 2})
     # However, that extra type check is only done on values inside the
     # expression. It isn't done on values from an item attributes - in that
     # case we got a normal failed condition.
@@ -768,6 +773,21 @@ def test_update_condition_begins_with(test_table_s):
             UpdateExpression='SET c = :val',
                 ConditionExpression='begins_with(c, a)',
                 ExpressionAttributeValues={':val': 3})
+    # Although the DynamoDB documentation suggests that begins_with()
+    # can only take a path as the first parameter and a constant as
+    # the second, this isn't actually true - begins_with() works
+    # as expected also to compare two attributes, or in reverse order:
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET c = :val',
+            ConditionExpression='begins_with(:str, a)',
+            ExpressionAttributeValues={':val': 'he', ':str': 'hellohi'})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c'] == 'he'
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET c = :val',
+            ConditionExpression='begins_with(a, c)',
+            ExpressionAttributeValues={':val': 5})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c'] == 5
+
 
 def test_update_condition_contains(test_table_s):
     p = random_string()
@@ -779,7 +799,8 @@ def test_update_condition_contains(test_table_s):
         AttributeUpdates={'a': {'Value': 'hello', 'Action': 'PUT'},
                           'b': {'Value': set([2, 4, 7]), 'Action': 'PUT'},
                           'c': {'Value': [2, 4, 7], 'Action': 'PUT'},
-                          'd': {'Value': b'hi there', 'Action': 'PUT'}})
+                          'd': {'Value': b'hi there', 'Action': 'PUT'},
+                          'e': {'Value': ['hi', set([1,2]), [3, 4]], 'Action': 'PUT'}})
     test_table_s.update_item(Key={'p': p},
         UpdateExpression='SET z = :val',
             ConditionExpression='contains(a, :arg)',
@@ -808,6 +829,24 @@ def test_update_condition_contains(test_table_s):
             UpdateExpression='SET z = :val',
                 ConditionExpression='contains(d, :arg)',
                 ExpressionAttributeValues={':val': 4, ':arg': b'dog'})
+    # Moreover, the second parameter to contains() may be *any* type, and
+    # contains checks if perhaps the first parameter is a list or a set
+    # containing that value!
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :val',
+                ConditionExpression='contains(d, :arg)',
+                ExpressionAttributeValues={':val': 4, ':arg': set([1, 2])})
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET z = :val',
+        ConditionExpression='contains(e, :arg)',
+        ExpressionAttributeValues={':val': 5, ':arg': set([1, 2])})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 5
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET z = :val',
+        ConditionExpression='contains(e, :arg)',
+        ExpressionAttributeValues={':val': 6, ':arg': [3, 4]})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 6
 
 
 # While both operands of contains() may be item attributes, strangely
@@ -1235,9 +1274,6 @@ def test_put_item_condition(test_table_s):
 # during parsing, or during evaluation? The stage we check this changes
 # our behavior when the condition was supposed to fail. So we have two
 # separate tests here, one for failed condition and one for successful.
-# Because Alternator does this check at a different stage from DynamoDB,
-# this test currently fails.
-@pytest.mark.xfail(reason="unused entries are checked too late")
 def test_update_condition_unused_entries_failed(test_table_s):
     p = random_string()
     # unused val3:
@@ -1313,6 +1349,29 @@ def test_update_condition_unused_entries_succeeded(test_table_s):
             ExpressionAttributeValues={':val2': 2},
             ExpressionAttributeNames={'#name2': 'b', '#name3': 'c'})
 
+# Another reason why we must test for used references right after parsing
+# the expressions, NOT at evaluation time, is that in some cases evaluation
+# may short-circuit and not reach certain parts of the expression, and as
+# a result we may wrongly think some names were not used, and refuse a
+# perfectly good request. Such a bug (see issue #6572) can be fixed by
+# either by dropping short-circuit evaluation (i.e., evaluate all parts
+# of the expression even if the first OR succeeds), or by testing for
+# unused references before evaluating anything.
+def test_update_condition_unused_entries_short_circuit(test_table_s):
+    p = random_string()
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'a': {'Value': 1, 'Action': 'PUT'}})
+    # If short-circuit evaluation is done for ConditionExpression, it will
+    # not use #name2 or :val2. But we should't fail this request claiming
+    # these references weren't used... They were used in the expression,
+    # just not in the evaluation. This request *should* work.
+    test_table_s.update_item(Key={'p': p},
+        ConditionExpression='#name1 = :val1 OR #name2 = :val2',
+        UpdateExpression='SET #name1 = :val3',
+        ExpressionAttributeValues={':val1': 1, ':val2': 2, ':val3': 3},
+        ExpressionAttributeNames={'#name1': 'a', '#name2': 'b'})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 3}
+
 # Test a bunch of cases with permissive write isolation levels,
 # i.e. LWT_ALWAYS, LWT_RMW_ONLY and UNSAFE_RMW.
 # These test cases make sense only for alternator, so they're skipped
@@ -1351,3 +1410,77 @@ def test_condition_expression_with_forbidden_rmw(scylla_only, dynamodb, test_tab
     assert test_table_s.get_item(Key={'p': s}, ConsistentRead=True)['Item'] == {'p': s, 'regular': 'write'}
     test_table_s.update_item(Key={'p': s}, AttributeUpdates={'write': {'Value': 'regular', 'Action': 'PUT'}})
     assert test_table_s.get_item(Key={'p': s}, ConsistentRead=True)['Item'] == {'p': s, 'regular': 'write', 'write': 'regular'}
+
+# Reproducer for issue #6573: binary strings should be ordered as unsigned
+# bytes, i.e., byte 128 comes after 127, not before as with signed bytes.
+# Test the five ordering operators: <, <=, >, >=, between
+def test_condition_expression_unsigned_bytes(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'b': bytearray([127])})
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET z = :newval',
+        ConditionExpression='b < :oldval',
+        ExpressionAttributeValues={':newval': 1, ':oldval': bytearray([128])})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 1
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET z = :newval',
+        ConditionExpression='b <= :oldval',
+        ExpressionAttributeValues={':newval': 2, ':oldval': bytearray([128])})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 2
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET z = :newval',
+        ConditionExpression='b between :oldval1 and :oldval2',
+        ExpressionAttributeValues={':newval': 3, ':oldval1': bytearray([126]), ':oldval2': bytearray([128])})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 3
+
+    test_table_s.put_item(Item={'p': p, 'b': bytearray([128])})
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET z = :newval',
+        ConditionExpression='b > :oldval',
+        ExpressionAttributeValues={':newval': 4, ':oldval': bytearray([127])})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 4
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET z = :newval',
+        ConditionExpression='b >= :oldval',
+        ExpressionAttributeValues={':newval': 5, ':oldval': bytearray([127])})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 5
+
+# In all other tests above, we use ConditionExpression to check a condition
+# on one the non-key attributes. In this test we confirm that a condition may
+# also be on a key attribute. We demonstrate this through a useful DynamoDB
+# idiom for creating an item unless an item already exists with the same key,
+# by using a "<>" (not equal) condition.
+def test_update_item_condition_key_ne(test_table_s):
+    p = random_string()
+    assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+    # Create an empty item with key p, but only an item with p exists yet.
+    # Note how when the item does not exist, the <> (not equal) test succeeds
+    # (we already tested that in test_update_condition_ne())
+    test_table_s.update_item(Key={'p': p},
+        ConditionExpression='p <> :p',
+        ExpressionAttributeValues={':p': p})
+    assert 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+    # If we do the same again, the item does exist, and the <> condition will
+    # fail.
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            ConditionExpression='p <> :p',
+            ExpressionAttributeValues={':p': p})
+
+# Another example of a condition on the key, again an idiom for creating an
+# item if no item already has that key. This time, using the
+# attribute_not_exists() instead of the <> (not equal) operator in the test
+# above.
+def test_update_item_condition_key_attribute_not_exists(test_table_s):
+    p = random_string()
+    assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+    # Create an empty item with key p, but only an item with p exists yet.
+    # Note how when the item does not exist, attribute_not_exists() succeeds
+    test_table_s.update_item(Key={'p': p},
+        ConditionExpression='attribute_not_exists(p)')
+    assert 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+    # If we do the same again, the item does exist, and the
+    # attribute_not_exists() condition will fail.
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            ConditionExpression='attribute_not_exists(p)')

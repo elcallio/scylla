@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
         ;
 
     return app.run(argc, argv, [&app] {
-        if (app.configuration().count("trace")) {
+        if (app.configuration().contains("trace")) {
             testlog.set_level(seastar::log_level::trace);
         }
 
@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
         cfg.enable_cache(true);
 
         return do_with_cql_env_thread([&app] (cql_test_env& env) {
-            auto reads_enabled = !app.configuration().count("no-reads");
+            auto reads_enabled = !app.configuration().contains("no-reads");
             auto seconds = app.configuration()["seconds"].as<unsigned>();
 
             engine().at_exit([] {
@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
                     auto&& col = *s->get_column_definition(to_bytes("v"));
                     m.set_clustered_cell(ck, col, atomic_cell::make_live(*col.type, api::new_timestamp(), serialized(value)));
                     auto t0 = clock::now();
-                    db.apply(s, freeze(m), db::commitlog::force_sync::no, db::no_timeout).get();
+                    db.apply(s, freeze(m), tracing::trace_state_ptr(), db::commitlog::force_sync::no, db::no_timeout).get();
                     writes_hist.add(std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count());
                     ++mutations;
                 }

@@ -136,6 +136,10 @@ decorated_key::less_comparator::operator()(const decorated_key& lhs, const ring_
     return lhs.tri_compare(*s, rhs) < 0;
 }
 
+std::ostream& operator<<(std::ostream& out, const ring_position_ext& pos) {
+    return out << (ring_position_view)pos;
+}
+
 std::ostream& operator<<(std::ostream& out, const ring_position& pos) {
     out << "{" << pos.token();
     if (pos.has_key()) {
@@ -301,11 +305,7 @@ int ring_position_tri_compare(const schema& s, ring_position_view lh, ring_posit
     }
 }
 
-int ring_position_comparator::operator()(ring_position_view lh, ring_position_view rh) const {
-    return ring_position_tri_compare(s, lh, rh);
-}
-
-int ring_position_comparator::operator()(ring_position_view lh, sstables::decorated_key_view rh) const {
+int ring_position_comparator_for_sstables::operator()(ring_position_view lh, sstables::decorated_key_view rh) const {
     auto token_cmp = tri_compare(*lh._token, rh.token());
     if (token_cmp) {
         return token_cmp;
@@ -319,7 +319,7 @@ int ring_position_comparator::operator()(ring_position_view lh, sstables::decora
     return lh._weight;
 }
 
-int ring_position_comparator::operator()(sstables::decorated_key_view a, ring_position_view b) const {
+int ring_position_comparator_for_sstables::operator()(sstables::decorated_key_view a, ring_position_view b) const {
     return -(*this)(b, a);
 }
 
@@ -343,11 +343,12 @@ to_partition_range(dht::token_range r) {
     return { std::move(start), std::move(end) };
 }
 
-dht::partition_range_vector to_partition_ranges(const dht::token_range_vector& ranges) {
+dht::partition_range_vector to_partition_ranges(const dht::token_range_vector& ranges, utils::can_yield can_yield) {
     dht::partition_range_vector prs;
     prs.reserve(ranges.size());
     for (auto& range : ranges) {
         prs.push_back(dht::to_partition_range(range));
+        utils::maybe_yield(can_yield);
     }
     return prs;
 }

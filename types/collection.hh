@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -29,6 +18,12 @@
 #include "collection_mutation.hh"
 #include "utils/chunked_vector.hh"
 #include "schema_fwd.hh"
+
+namespace cql3 {
+
+class column_specification;
+
+}
 
 class collection_type_impl : public abstract_type {
     static logging::logger _logger;
@@ -43,14 +38,31 @@ public:
     bool is_multi_cell() const { return _is_multi_cell; }
     virtual data_type name_comparator() const = 0;
     virtual data_type value_comparator() const = 0;
-    shared_ptr<cql3::column_specification> make_collection_receiver(const cql3::column_specification& collection, bool is_key) const;
+    lw_shared_ptr<cql3::column_specification> make_collection_receiver(const cql3::column_specification& collection, bool is_key) const;
     virtual bool is_compatible_with_frozen(const collection_type_impl& previous) const = 0;
     virtual bool is_value_compatible_with_frozen(const collection_type_impl& previous) const = 0;
     template <typename BytesViewIterator>
     static bytes pack(BytesViewIterator start, BytesViewIterator finish, int elements, cql_serialization_format sf);
-    virtual data_value deserialize(bytes_view v, cql_serialization_format sf) const = 0;
-    data_value deserialize_value(bytes_view v, cql_serialization_format sf) const {
+
+private:
+    // Explicitly instantiated in types.cc
+    template <FragmentedView View> data_value deserialize_impl(View v, cql_serialization_format sf) const;
+public:
+    template <FragmentedView View> data_value deserialize(View v, cql_serialization_format sf) const {
+        if (v.size_bytes() == v.current_fragment().size()) [[likely]] {
+            return deserialize_impl(single_fragmented_view(v.current_fragment()), sf);
+        } else {
+            return deserialize_impl(v, sf);
+        }
+    }
+    template <FragmentedView View> data_value deserialize_value(View v, cql_serialization_format sf) const {
         return deserialize(v, sf);
+    }
+    data_value deserialize(bytes_view v, cql_serialization_format sf) const {
+        return deserialize_impl(single_fragmented_view(v), sf);
+    }
+    data_value deserialize_value(bytes_view v, cql_serialization_format sf) const {
+        return deserialize_impl(single_fragmented_view(v), sf);
     }
     bytes_opt reserialize(cql_serialization_format from, cql_serialization_format to, bytes_view_opt v) const;
 };

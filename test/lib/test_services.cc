@@ -5,22 +5,11 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "test/lib/test_services.hh"
-#include "auth/service.hh"
+#include "test/lib/reader_permit.hh"
 #include "db/config.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "db/view/view_update_generator.hh"
@@ -38,11 +27,12 @@ class storage_service_for_tests::impl {
     sharded<gms::gossiper> _gossiper;
     distributed<database> _db;
     db::config _cfg;
-    sharded<auth::service> _auth_service;
-    sharded<locator::token_metadata> _token_metadata;
+    sharded<locator::shared_token_metadata> _token_metadata;
     sharded<service::migration_notifier> _mnotif;
     sharded<db::system_distributed_keyspace> _sys_dist_ks;
     sharded<db::view::view_update_generator> _view_update_generator;
+    sharded<netw::messaging_service> _messaging;
+    sharded<auth::service> _auth_service;
     sharded<qos::service_level_controller> _sl_controller;
 public:
     impl() {
@@ -55,19 +45,19 @@ public:
         _token_metadata.start().get();
         _mnotif.start().get();
         _feature_service.start(gms::feature_config_from_db_config(_cfg)).get();
-        _gossiper.start(std::ref(_abort_source), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_cfg)).get();
-        _sl_controller.start(qos::service_level_options{1000}).get();
-        netw::get_messaging_service().start(std::ref(_sl_controller), gms::inet_address("127.0.0.1"), 7000, false).get();
+        _sl_controller.start(std::ref(_auth_service), qos::service_level_options{1000}).get();
+        _messaging.start(std::ref(_sl_controller), gms::inet_address("127.0.0.1"), 7000).get();
+        _gossiper.start(std::ref(_abort_source), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_messaging), std::ref(_cfg)).get();
         service::storage_service_config sscfg;
         sscfg.available_memory = memory::stats().total_memory();
-        service::get_storage_service().start(std::ref(_abort_source), std::ref(_db), std::ref(_gossiper), std::ref(_auth_service), std::ref(_sys_dist_ks), std::ref(_view_update_generator), std::ref(_feature_service), sscfg, std::ref(_mnotif), std::ref(_token_metadata), std::ref(_sl_controller), true).get();
+        service::get_storage_service().start(std::ref(_abort_source), std::ref(_db), std::ref(_gossiper), std::ref(_sys_dist_ks), std::ref(_view_update_generator), std::ref(_feature_service), sscfg, std::ref(_mnotif), std::ref(_token_metadata), std::ref(_messaging), std::ref(_sl_controller), true).get();
         service::get_storage_service().invoke_on_all([] (auto& ss) {
             ss.enable_all_features();
         }).get();
     }
     ~impl() {
         service::get_storage_service().stop().get();
-        netw::get_messaging_service().stop().get();
+        _messaging.stop().get();
         _db.stop().get();
         _gossiper.stop().get();
         _mnotif.stop().get();
@@ -105,27 +95,28 @@ static const sstring some_column_family("cf");
 db::nop_large_data_handler nop_lp_handler;
 db::config test_db_config;
 gms::feature_service test_feature_service(gms::feature_config_from_db_config(test_db_config));
-thread_local sstables::sstables_manager test_sstables_manager(nop_lp_handler, test_db_config, test_feature_service);
 
-column_family::config column_family_test_config() {
+column_family::config column_family_test_config(sstables::sstables_manager& sstables_manager) {
     column_family::config cfg;
-    cfg.sstables_manager = &test_sstables_manager;
+    cfg.sstables_manager = &sstables_manager;
+    cfg.compaction_concurrency_semaphore = &tests::semaphore();
     return cfg;
 }
 
-column_family_for_tests::column_family_for_tests()
+column_family_for_tests::column_family_for_tests(sstables::sstables_manager& sstables_manager)
     : column_family_for_tests(
+        sstables_manager,
         schema_builder(some_keyspace, some_column_family)
             .with_column(utf8_type->decompose("p1"), utf8_type, column_kind::partition_key)
             .build()
     )
 { }
 
-column_family_for_tests::column_family_for_tests(schema_ptr s)
+column_family_for_tests::column_family_for_tests(sstables::sstables_manager& sstables_manager, schema_ptr s)
     : _data(make_lw_shared<data>())
 {
     _data->s = s;
-    _data->cfg = column_family_test_config();
+    _data->cfg = column_family_test_config(sstables_manager);
     _data->cfg.enable_disk_writes = false;
     _data->cfg.enable_commitlog = false;
     _data->cf = make_lw_shared<column_family>(_data->s, _data->cfg, column_family::no_commitlog(), _data->cm, _data->cl_stats, _data->tracker);

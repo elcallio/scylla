@@ -90,8 +90,6 @@ public:
      */
     virtual bool contains_bind_marker() const = 0;
 
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const = 0;
-
     virtual sstring to_string() const {
         return format("term@{:p}", static_cast<const void*>(this));
     }
@@ -121,7 +119,7 @@ public:
          * case this RawTerm describe a list index or a map key, etc...
          * @return the prepared term.
          */
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) const = 0;
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const = 0;
 
         virtual sstring to_string() const = 0;
 
@@ -136,7 +134,7 @@ public:
 
     class multi_column_raw : public virtual raw {
     public:
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, const std::vector<shared_ptr<column_specification>>& receiver) const = 0;
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, const std::vector<lw_shared_ptr<column_specification>>& receiver) const = 0;
     };
 };
 
@@ -163,10 +161,6 @@ public:
         return static_pointer_cast<terminal>(this->shared_from_this());
     }
 
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override {
-        return false;
-    }
-
     // While some NonTerminal may not have bind markers, no Term can be Terminal
     // with a bind marker
     virtual bool contains_bind_marker() const override {
@@ -179,7 +173,7 @@ public:
     virtual cql3::raw_value get(const query_options& options) = 0;
 
     virtual cql3::raw_value_view bind_and_get(const query_options& options) override {
-        return options.make_temporary(get(options));
+        return raw_value_view::make_temporary(get(options));
     }
 
     virtual sstring to_string() const = 0;
@@ -209,14 +203,10 @@ public:
  */
 class non_terminal : public term {
 public:
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override {
-        return false;
-    }
-
     virtual cql3::raw_value_view bind_and_get(const query_options& options) override {
         auto t = bind(options);
         if (t) {
-            return options.make_temporary(t->get(options));
+            return cql3::raw_value_view::make_temporary(t->get(options));
         }
         return cql3::raw_value_view::make_null();
     };

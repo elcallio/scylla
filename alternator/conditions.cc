@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <list>
@@ -26,7 +15,7 @@
 #include "alternator/error.hh"
 #include "cql3/constants.hh"
 #include <unordered_map>
-#include "rjson.hh"
+#include "utils/rjson.hh"
 #include "serialization.hh"
 #include "base64.hh"
 #include <stdexcept>
@@ -34,7 +23,7 @@
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include "utils/overloaded_functor.hh"
 
-#include "expressions_eval.hh"
+#include "expressions.hh"
 
 namespace alternator {
 
@@ -57,57 +46,14 @@ comparison_operator_type get_comparison_operator(const rjson::value& comparison_
             {"NOT_CONTAINS", comparison_operator_type::NOT_CONTAINS},
     };
     if (!comparison_operator.IsString()) {
-        throw api_error("ValidationException", format("Invalid comparison operator definition {}", rjson::print(comparison_operator)));
+        throw api_error::validation(format("Invalid comparison operator definition {}", rjson::print(comparison_operator)));
     }
     std::string op = comparison_operator.GetString();
     auto it = ops.find(op);
     if (it == ops.end()) {
-        throw api_error("ValidationException", format("Unsupported comparison operator {}", op));
+        throw api_error::validation(format("Unsupported comparison operator {}", op));
     }
     return it->second;
-}
-
-static ::shared_ptr<cql3::restrictions::single_column_restriction::contains> make_map_element_restriction(const column_definition& cdef, std::string_view key, const rjson::value& value) {
-    bytes raw_key = utf8_type->from_string(sstring_view(key.data(), key.size()));
-    auto key_value = ::make_shared<cql3::constants::value>(cql3::raw_value::make_value(std::move(raw_key)));
-    bytes raw_value = serialize_item(value);
-    auto entry_value = ::make_shared<cql3::constants::value>(cql3::raw_value::make_value(std::move(raw_value)));
-    return make_shared<cql3::restrictions::single_column_restriction::contains>(cdef, std::move(key_value), std::move(entry_value));
-}
-
-static ::shared_ptr<cql3::restrictions::single_column_restriction::EQ> make_key_eq_restriction(const column_definition& cdef, const rjson::value& value) {
-    bytes raw_value = get_key_from_typed_value(value, cdef);
-    auto restriction_value = ::make_shared<cql3::constants::value>(cql3::raw_value::make_value(std::move(raw_value)));
-    return make_shared<cql3::restrictions::single_column_restriction::EQ>(cdef, std::move(restriction_value));
-}
-
-::shared_ptr<cql3::restrictions::statement_restrictions> get_filtering_restrictions(schema_ptr schema, const column_definition& attrs_col, const rjson::value& query_filter) {
-    clogger.trace("Getting filtering restrictions for: {}", rjson::print(query_filter));
-    auto filtering_restrictions = ::make_shared<cql3::restrictions::statement_restrictions>(schema, true);
-    for (auto it = query_filter.MemberBegin(); it != query_filter.MemberEnd(); ++it) {
-        std::string_view column_name(it->name.GetString(), it->name.GetStringLength());
-        const rjson::value& condition = it->value;
-
-        const rjson::value& comp_definition = rjson::get(condition, "ComparisonOperator");
-        const rjson::value& attr_list = rjson::get(condition, "AttributeValueList");
-        comparison_operator_type op = get_comparison_operator(comp_definition);
-
-        if (op != comparison_operator_type::EQ) {
-            throw api_error("ValidationException", "Filtering is currently implemented for EQ operator only");
-        }
-        if (attr_list.Size() != 1) {
-            throw api_error("ValidationException", format("EQ restriction needs exactly 1 attribute value: {}", rjson::print(attr_list)));
-        }
-        if (const column_definition* cdef = schema->get_column_definition(to_bytes(column_name.data()))) {
-            // Primary key restriction
-            filtering_restrictions->add_restriction(make_key_eq_restriction(*cdef, attr_list[0]), false, true);
-        } else {
-            // Regular column restriction
-            filtering_restrictions->add_restriction(make_map_element_restriction(attrs_col, column_name, attr_list[0]), false, true);
-        }
-
-    }
-    return filtering_restrictions;
 }
 
 namespace {
@@ -141,11 +87,16 @@ struct nonempty : public size_check {
 
 // Check that array has the expected number of elements
 static void verify_operand_count(const rjson::value* array, const size_check& expected, const rjson::value& op) {
+    if (!array && expected(0)) {
+        // If expected() allows an empty AttributeValueList, it is also fine
+        // that it is missing.
+        return;
+    }
     if (!array || !array->IsArray()) {
-        throw api_error("ValidationException", "With ComparisonOperator, AttributeValueList must be given and an array");
+        throw api_error::validation("With ComparisonOperator, AttributeValueList must be given and an array");
     }
     if (!expected(array->Size())) {
-        throw api_error("ValidationException",
+        throw api_error::validation(
                         format("{} operator requires AttributeValueList {}, instead found list size {}",
                                op, expected.what(), array->Size()));
     }
@@ -169,7 +120,7 @@ static bool check_EQ_for_sets(const rjson::value& set1, const rjson::value& set2
         set1_raw.insert(&*it);
     }
     for (const auto& a : set2.GetArray()) {
-        if (set1_raw.count(&a) == 0) {
+        if (!set1_raw.contains(&a)) {
             return false;
         }
     }
@@ -202,11 +153,11 @@ static bool check_BEGINS_WITH(const rjson::value* v1, const rjson::value& v2) {
     // binary - otherwise it's a validation error. However, problems with
     // the stored attribute (v1) will just return false (no match).
     if (!v2.IsObject() || v2.MemberCount() != 1) {
-        throw api_error("ValidationException", format("BEGINS_WITH operator encountered malformed AttributeValue: {}", v2));
+        throw api_error::validation(format("BEGINS_WITH operator encountered malformed AttributeValue: {}", v2));
     }
     auto it2 = v2.MemberBegin();
     if (it2->name != "S" && it2->name != "B") {
-        throw api_error("ValidationException", format("BEGINS_WITH operator requires String or Binary in AttributeValue, got {}", it2->name));
+        throw api_error::validation(format("BEGINS_WITH operator requires String or Binary type in AttributeValue, got {}", it2->name));
     }
 
 
@@ -218,15 +169,9 @@ static bool check_BEGINS_WITH(const rjson::value* v1, const rjson::value& v2) {
         return false;
     }
     if (it2->name == "S") {
-        std::string_view val1(it1->value.GetString(), it1->value.GetStringLength());
-        std::string_view val2(it2->value.GetString(), it2->value.GetStringLength());
-        return val1.substr(0, val2.size()) == val2;
+        return rjson::to_string_view(it1->value).starts_with(rjson::to_string_view(it2->value));
     } else /* it2->name == "B" */ {
-        // TODO (optimization): Check the begins_with condition directly on
-        // the base64-encoded string, without making a decoded copy.
-        bytes val1 = base64_decode(it1->value);
-        bytes val2 = base64_decode(it2->value);
-        return val1.substr(0, val2.size()) == val2;
+        return base64_begins_with(rjson::to_string_view(it1->value), rjson::to_string_view(it2->value));
     }
 }
 
@@ -241,11 +186,6 @@ bool check_CONTAINS(const rjson::value* v1, const rjson::value& v2) {
     }
     const auto& kv1 = *v1->MemberBegin();
     const auto& kv2 = *v2.MemberBegin();
-    if (kv2.name != "S" && kv2.name != "N" &&  kv2.name != "B") {
-        throw api_error("ValidationException",
-                        format("CONTAINS operator requires a single AttributeValue of type String, Number, or Binary, "
-                               "got {} instead", kv2.name));
-    }
     if (kv1.name == "S" && kv2.name == "S") {
         return rjson::to_string_view(kv1.value).find(rjson::to_string_view(kv2.value)) != std::string_view::npos;
     } else if (kv1.name == "B" && kv2.name == "B") {
@@ -282,12 +222,12 @@ static bool check_NOT_CONTAINS(const rjson::value* v1, const rjson::value& v2) {
 // Check if a JSON-encoded value equals any element of an array, which must have at least one element.
 static bool check_IN(const rjson::value* val, const rjson::value& array) {
     if (!array[0].IsObject() || array[0].MemberCount() != 1) {
-        throw api_error("ValidationException",
+        throw api_error::validation(
                         format("IN operator encountered malformed AttributeValue: {}", array[0]));
     }
     const auto& type = array[0].MemberBegin()->name;
     if (type != "S" && type != "N" && type != "B") {
-        throw api_error("ValidationException",
+        throw api_error::validation(
                         "IN operator requires AttributeValueList elements to be of type String, Number, or Binary ");
     }
     if (!val) {
@@ -296,7 +236,7 @@ static bool check_IN(const rjson::value* val, const rjson::value& array) {
     bool have_match = false;
     for (const auto& elem : array.GetArray()) {
         if (!elem.IsObject() || elem.MemberCount() != 1 || elem.MemberBegin()->name != type) {
-            throw api_error("ValidationException",
+            throw api_error::validation(
                             "IN operator requires all AttributeValueList elements to have the same type ");
         }
         if (!have_match && *val == elem) {
@@ -332,13 +272,13 @@ static bool check_NOT_NULL(const rjson::value* val) {
 template <typename Comparator>
 bool check_compare(const rjson::value* v1, const rjson::value& v2, const Comparator& cmp) {
     if (!v2.IsObject() || v2.MemberCount() != 1) {
-        throw api_error("ValidationException",
+        throw api_error::validation(
                         format("{} requires a single AttributeValue of type String, Number, or Binary",
                                cmp.diagnostic));
     }
     const auto& kv2 = *v2.MemberBegin();
     if (kv2.name != "S" && kv2.name != "N" && kv2.name != "B") {
-        throw api_error("ValidationException",
+        throw api_error::validation(
                         format("{} requires a single AttributeValue of type String, Number, or Binary",
                                cmp.diagnostic));
     }
@@ -365,32 +305,36 @@ bool check_compare(const rjson::value* v1, const rjson::value& v2, const Compara
 
 struct cmp_lt {
     template <typename T> bool operator()(const T& lhs, const T& rhs) const { return lhs < rhs; }
+    // We cannot use the normal comparison operators like "<" on the bytes
+    // type, because they treat individual bytes as signed but we need to
+    // compare them as *unsigned*. So we need a specialization for bytes.
+    bool operator()(const bytes& lhs, const bytes& rhs) const { return compare_unsigned(lhs, rhs) < 0; }
     static constexpr const char* diagnostic = "LT operator";
 };
 
 struct cmp_le {
-    // bytes only has <, so we cannot use <=.
-    template <typename T> bool operator()(const T& lhs, const T& rhs) const { return lhs < rhs || lhs == rhs; }
+    template <typename T> bool operator()(const T& lhs, const T& rhs) const { return lhs <= rhs; }
+    bool operator()(const bytes& lhs, const bytes& rhs) const { return compare_unsigned(lhs, rhs) <= 0; }
     static constexpr const char* diagnostic = "LE operator";
 };
 
 struct cmp_ge {
-    // bytes only has <, so we cannot use >=.
-    template <typename T> bool operator()(const T& lhs, const T& rhs) const { return rhs < lhs || lhs == rhs; }
+    template <typename T> bool operator()(const T& lhs, const T& rhs) const { return lhs >= rhs; }
+    bool operator()(const bytes& lhs, const bytes& rhs) const { return compare_unsigned(lhs, rhs) >= 0; }
     static constexpr const char* diagnostic = "GE operator";
 };
 
 struct cmp_gt {
-    // bytes only has <, so we cannot use >.
-    template <typename T> bool operator()(const T& lhs, const T& rhs) const { return rhs < lhs; }
+    template <typename T> bool operator()(const T& lhs, const T& rhs) const { return lhs > rhs; }
+    bool operator()(const bytes& lhs, const bytes& rhs) const { return compare_unsigned(lhs, rhs) > 0; }
     static constexpr const char* diagnostic = "GT operator";
 };
 
 // True if v is between lb and ub, inclusive.  Throws if lb > ub.
 template <typename T>
-bool check_BETWEEN(const T& v, const T& lb, const T& ub) {
-    if (ub < lb) {
-        throw api_error("ValidationException",
+static bool check_BETWEEN(const T& v, const T& lb, const T& ub) {
+    if (cmp_lt()(ub, lb)) {
+        throw api_error::validation(
                         format("BETWEEN operator requires lower_bound <= upper_bound, but {} > {}", lb, ub));
     }
     return cmp_ge()(v, lb) && cmp_le()(v, ub);
@@ -401,21 +345,20 @@ static bool check_BETWEEN(const rjson::value* v, const rjson::value& lb, const r
         return false;
     }
     if (!v->IsObject() || v->MemberCount() != 1) {
-        throw api_error("ValidationException", format("BETWEEN operator encountered malformed AttributeValue: {}", *v));
+        throw api_error::validation(format("BETWEEN operator encountered malformed AttributeValue: {}", *v));
     }
     if (!lb.IsObject() || lb.MemberCount() != 1) {
-        throw api_error("ValidationException", format("BETWEEN operator encountered malformed AttributeValue: {}", lb));
+        throw api_error::validation(format("BETWEEN operator encountered malformed AttributeValue: {}", lb));
     }
     if (!ub.IsObject() || ub.MemberCount() != 1) {
-        throw api_error("ValidationException", format("BETWEEN operator encountered malformed AttributeValue: {}", ub));
+        throw api_error::validation(format("BETWEEN operator encountered malformed AttributeValue: {}", ub));
     }
 
     const auto& kv_v = *v->MemberBegin();
     const auto& kv_lb = *lb.MemberBegin();
     const auto& kv_ub = *ub.MemberBegin();
     if (kv_lb.name != kv_ub.name) {
-        throw api_error(
-                "ValidationException",
+        throw api_error::validation(
                 format("BETWEEN operator requires the same type for lower and upper bound; instead got {} and {}",
                        kv_lb.name, kv_ub.name));
     }
@@ -434,7 +377,7 @@ static bool check_BETWEEN(const rjson::value* v, const rjson::value& lb, const r
     if (kv_v.name == "B") {
         return check_BETWEEN(base64_decode(kv_v.value), base64_decode(kv_lb.value), base64_decode(kv_ub.value));
     }
-    throw api_error("ValidationException",
+    throw api_error::validation(
         format("BETWEEN operator requires AttributeValueList elements to be of type String, Number, or Binary; instead got {}",
                kv_lb.name));
 }
@@ -454,24 +397,24 @@ static bool verify_expected_one(const rjson::value& condition, const rjson::valu
     // and requires a different combinations of parameters in the request
     if (value) {
         if (exists && (!exists->IsBool() || exists->GetBool() != true)) {
-            throw api_error("ValidationException", "Cannot combine Value with Exists!=true");
+            throw api_error::validation("Cannot combine Value with Exists!=true");
         }
         if (comparison_operator) {
-            throw api_error("ValidationException", "Cannot combine Value with ComparisonOperator");
+            throw api_error::validation("Cannot combine Value with ComparisonOperator");
         }
         return check_EQ(got, *value);
     } else if (exists) {
         if (comparison_operator) {
-            throw api_error("ValidationException", "Cannot combine Exists with ComparisonOperator");
+            throw api_error::validation("Cannot combine Exists with ComparisonOperator");
         }
         if (!exists->IsBool() || exists->GetBool() != false) {
-            throw api_error("ValidationException", "Exists!=false requires Value");
+            throw api_error::validation("Exists!=false requires Value");
         }
         // Remember Exists=false, so we're checking that the attribute does *not* exist:
         return !got;
     } else {
         if (!comparison_operator) {
-            throw api_error("ValidationException", "Missing ComparisonOperator, Value or Exists");
+            throw api_error::validation("Missing ComparisonOperator, Value or Exists");
         }
         comparison_operator_type op = get_comparison_operator(*comparison_operator);
         switch (op) {
@@ -509,13 +452,54 @@ static bool verify_expected_one(const rjson::value& condition, const rjson::valu
             verify_operand_count(attribute_value_list, exact_size(2), *comparison_operator);
             return check_BETWEEN(got, (*attribute_value_list)[0], (*attribute_value_list)[1]);
         case comparison_operator_type::CONTAINS:
-            verify_operand_count(attribute_value_list, exact_size(1), *comparison_operator);
-            return check_CONTAINS(got, (*attribute_value_list)[0]);
+            {
+                verify_operand_count(attribute_value_list, exact_size(1), *comparison_operator);
+                // Expected's "CONTAINS" has this artificial limitation.
+                // ConditionExpression's "contains()" does not...
+                const rjson::value& arg = (*attribute_value_list)[0];
+                const auto& argtype = (*arg.MemberBegin()).name;
+                if (argtype != "S" && argtype != "N" && argtype != "B") {
+                    throw api_error::validation(
+                            format("CONTAINS operator requires a single AttributeValue of type String, Number, or Binary, "
+                                    "got {} instead", argtype));
+                }
+                return check_CONTAINS(got, arg);
+            }
         case comparison_operator_type::NOT_CONTAINS:
-            verify_operand_count(attribute_value_list, exact_size(1), *comparison_operator);
-            return check_NOT_CONTAINS(got, (*attribute_value_list)[0]);
+            {
+                verify_operand_count(attribute_value_list, exact_size(1), *comparison_operator);
+                // Expected's "NOT_CONTAINS" has this artificial limitation.
+                // ConditionExpression's "contains()" does not...
+                const rjson::value& arg = (*attribute_value_list)[0];
+                const auto& argtype = (*arg.MemberBegin()).name;
+                if (argtype != "S" && argtype != "N" && argtype != "B") {
+                    throw api_error::validation(
+                            format("CONTAINS operator requires a single AttributeValue of type String, Number, or Binary, "
+                                    "got {} instead", argtype));
+                }
+                return check_NOT_CONTAINS(got, arg);
+            }
         }
         throw std::logic_error(format("Internal error: corrupted operator enum: {}", int(op)));
+    }
+}
+
+conditional_operator_type get_conditional_operator(const rjson::value& req) {
+    const rjson::value* conditional_operator = rjson::find(req, "ConditionalOperator");
+    if (!conditional_operator) {
+        return conditional_operator_type::MISSING;
+    }
+    if (!conditional_operator->IsString()) {
+        throw api_error::validation("'ConditionalOperator' parameter, if given, must be a string");
+    }
+    auto s = rjson::to_string_view(*conditional_operator);
+    if (s == "AND") {
+        return conditional_operator_type::AND;
+    } else if (s == "OR") {
+        return conditional_operator_type::OR;
+    } else {
+        throw api_error::validation(
+                format("'ConditionalOperator' parameter must be AND, OR or missing. Found {}.", s));
     }
 }
 
@@ -524,39 +508,28 @@ static bool verify_expected_one(const rjson::value& condition, const rjson::valu
 // (if they exist) in the request (an UpdateItem, PutItem or DeleteItem).
 // This function can throw an ValidationException API error if there
 // are errors in the format of the condition itself.
-bool verify_expected(const rjson::value& req, const std::unique_ptr<rjson::value>& previous_item) {
+bool verify_expected(const rjson::value& req, const rjson::value* previous_item) {
     const rjson::value* expected = rjson::find(req, "Expected");
+    auto conditional_operator = get_conditional_operator(req);
+    if (conditional_operator != conditional_operator_type::MISSING &&
+        (!expected || (expected->IsObject() && expected->GetObject().ObjectEmpty()))) {
+            throw api_error::validation("'ConditionalOperator' parameter cannot be specified for missing or empty Expression");
+    }
     if (!expected) {
         return true;
     }
     if (!expected->IsObject()) {
-        throw api_error("ValidationException", "'Expected' parameter, if given, must be an object");
+        throw api_error::validation("'Expected' parameter, if given, must be an object");
     }
-    // ConditionalOperator can be "AND" for requiring all conditions, or
-    // "OR" for requiring one condition, and defaults to "AND" if missing.
-    const rjson::value* conditional_operator = rjson::find(req, "ConditionalOperator");
-    bool require_all = true;
-    if (conditional_operator) {
-        if (!conditional_operator->IsString()) {
-            throw api_error("ValidationException", "'ConditionalOperator' parameter, if given, must be a string");
-        }
-        std::string_view s(conditional_operator->GetString(), conditional_operator->GetStringLength());
-        if (s == "AND") {
-            // require_all is already true
-        } else if (s == "OR") {
-            require_all = false;
-        } else {
-            throw api_error("ValidationException", "'ConditionalOperator' parameter must be AND, OR or missing");
-        }
-        if (expected->GetObject().ObjectEmpty()) {
-            throw api_error("ValidationException", "'ConditionalOperator' parameter cannot be specified for empty Expression");
-        }
-    }
+    bool require_all = conditional_operator != conditional_operator_type::OR;
+    return verify_condition(*expected, require_all, previous_item);
+}
 
-    for (auto it = expected->MemberBegin(); it != expected->MemberEnd(); ++it) {
+bool verify_condition(const rjson::value& condition, bool require_all, const rjson::value* previous_item) {
+    for (auto it = condition.MemberBegin(); it != condition.MemberEnd(); ++it) {
         const rjson::value* got = nullptr;
-        if (previous_item && previous_item->IsObject() && previous_item->HasMember("Item")) {
-            got = rjson::find((*previous_item)["Item"], rjson::to_string_view(it->name));
+        if (previous_item) {
+            got = rjson::find(*previous_item, rjson::to_string_view(it->name));
         }
         bool success = verify_expected_one(it->value, got);
         if (success && !require_all) {
@@ -572,12 +545,8 @@ bool verify_expected(const rjson::value& req, const std::unique_ptr<rjson::value
     return require_all;
 }
 
-bool calculate_primitive_condition(const parsed::primitive_condition& cond,
-        std::unordered_set<std::string>& used_attribute_values,
-        std::unordered_set<std::string>& used_attribute_names,
-        const rjson::value& req,
-        schema_ptr schema,
-        const std::unique_ptr<rjson::value>& previous_item) {
+static bool calculate_primitive_condition(const parsed::primitive_condition& cond,
+        const rjson::value* previous_item) {
     std::vector<rjson::value> calculated_values;
     calculated_values.reserve(cond._values.size());
     for (const parsed::value& v : cond._values) {
@@ -585,9 +554,7 @@ bool calculate_primitive_condition(const parsed::primitive_condition& cond,
                 cond._op == parsed::primitive_condition::type::VALUE ?
                         calculate_value_caller::ConditionExpressionAlone :
                         calculate_value_caller::ConditionExpression,
-                rjson::find(req, "ExpressionAttributeValues"),
-                used_attribute_names, used_attribute_values,
-                req, schema, previous_item));
+                previous_item));
     }
     switch (cond._op) {
     case parsed::primitive_condition::type::BETWEEN:
@@ -610,7 +577,7 @@ bool calculate_primitive_condition(const parsed::primitive_condition& cond,
                 return it->value.GetBool();
             }
         }
-        throw api_error("ValidationException",
+        throw api_error::validation(
                 format("ConditionExpression: condition results in a non-boolean value: {}",
                         calculated_values[0]));
     default:
@@ -643,23 +610,17 @@ bool calculate_primitive_condition(const parsed::primitive_condition& cond,
 // conditions given by the given parsed ConditionExpression.
 bool verify_condition_expression(
         const parsed::condition_expression& condition_expression,
-        std::unordered_set<std::string>& used_attribute_values,
-        std::unordered_set<std::string>& used_attribute_names,
-        const rjson::value& req,
-        schema_ptr schema,
-        const std::unique_ptr<rjson::value>& previous_item) {
+        const rjson::value* previous_item) {
     if (condition_expression.empty()) {
         return true;
     }
     bool ret = std::visit(overloaded_functor {
         [&] (const parsed::primitive_condition& cond) -> bool {
-            return calculate_primitive_condition(cond, used_attribute_values,
-                    used_attribute_names, req, schema, previous_item);
+            return calculate_primitive_condition(cond, previous_item);
         },
         [&] (const parsed::condition_expression::condition_list& list) -> bool {
             auto verify_condition = [&] (const parsed::condition_expression& e) {
-                return verify_condition_expression(e, used_attribute_values,
-                        used_attribute_names, req, schema, previous_item);
+                return verify_condition_expression(e, previous_item);
             };
             switch (list.op) {
             case '&':

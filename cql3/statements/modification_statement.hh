@@ -96,8 +96,8 @@ protected:
     cql_stats& _stats;
 private:
     // Separating normal and static conditions makes things somewhat easier
-    std::vector<::shared_ptr<column_condition>> _regular_conditions;
-    std::vector<::shared_ptr<column_condition>> _static_conditions;
+    std::vector<lw_shared_ptr<column_condition>> _regular_conditions;
+    std::vector<lw_shared_ptr<column_condition>> _static_conditions;
     const ks_selector _ks_sel;
 
     // True if this statement has _if_exists or _if_not_exists or other
@@ -132,8 +132,6 @@ public:
             schema_ptr schema_,
             std::unique_ptr<attributes> attrs_,
             cql_stats& stats_);
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
 
     virtual bool require_full_clustering_key() const = 0;
 
@@ -173,8 +171,11 @@ public:
     const restrictions::statement_restrictions& restrictions() const {
         return *_restrictions;
     }
+
+    bool is_conditional() const override;
+
 public:
-    void add_condition(::shared_ptr<column_condition> cond);
+    void add_condition(lw_shared_ptr<column_condition> cond);
 
     void set_if_not_exist_condition();
 
@@ -193,13 +194,7 @@ public:
     // CAS statement returns a result set. Prepare result set metadata
     // so that get_result_metadata() returns a meaningful value.
     void build_cas_result_set_metadata();
-    // Build a result set with prefetched rows, but return only
-    // the columns required by CAS. Static since reused by BATCH
-    // CAS.
-    static seastar::shared_ptr<cql_transport::messages::result_message>
-    build_cas_result_set(seastar::shared_ptr<cql3::metadata> metadata,
-            const column_set& mask, bool is_applied,
-            const update_parameters::prefetch_data& rows);
+
 public:
     virtual dht::partition_range_vector build_partition_keys(const query_options& options, const json_cache_opt& json_cache) const;
     virtual query::clustering_row_ranges create_clustering_ranges(const query_options& options, const json_cache_opt& json_cache) const;
@@ -228,7 +223,7 @@ public:
 
     // Build a read_command instance to fetch the previous mutation from storage. The mutation is
     // fetched if we need to check LWT conditions or apply updates to non-frozen list elements.
-    lw_shared_ptr<query::read_command> read_command(query::clustering_row_ranges ranges, db::consistency_level cl) const;
+    lw_shared_ptr<query::read_command> read_command(service::storage_proxy& proxy, query::clustering_row_ranges ranges, db::consistency_level cl) const;
     // Create a mutation object for the update operation represented by this modification statement.
     // A single mutation object for lightweight transactions, which can only span one partition, or a vector
     // of mutations, one per partition key, for statements which affect multiple partition keys,
@@ -292,6 +287,9 @@ protected:
      * @throws InvalidRequestException
      */
     virtual void validate_where_clause_for_conditions() const;
+
+    db::timeout_clock::duration get_timeout(const query_options& options) const;
+
     friend class raw::modification_statement;
 };
 

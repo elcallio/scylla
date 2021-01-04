@@ -1,19 +1,25 @@
 # Getting Started With ScyllaDB Alternator
----
+
 ## Installing Scylla
 Before you can start using ScyllaDB Alternator, you will have to have an up
 and running scylla cluster configured to expose the alternator port.
 This section will guide you through the steps for setting up the cluster:
 ### Get Scylla with alternator support from a docker:
-1. Because Alternator is still experimental and improves quickly, it is
-   recommended to run the latest nightly build. Make sure you have the latest
-   nightly image by running: `docker pull scylladb/scylla-nightly:latest`
+1. Because Alternator is still improving quickly, it is recommended to run
+   the latest nightly build. Make sure you have the latest nightly image by
+   running: `docker pull scylladb/scylla-nightly:latest`
 2. Follow the steps in the [Scylla official download web page](https://www.scylladb.com/download/open-source/#docker)
    add to every "docker run" command: `-p 8000:8000` before the image name
-   and `--alternator-port=8000` at the end. The "alternator-port" option
-   specifies on which port Scylla will listen for the (unencrypted) DynamoDB API.
+   and `--alternator-port=8000 --alternator-write-isolation=always` at the end.
+   The "alternator-port" option specifies on which port Scylla will listen for
+   the (unencrypted) DynamoDB API, and the "alternator-write-isolation" chooses
+   whether or not Alternator will use LWT for every write.
    For example,
-   `docker run --name scylla -d -p 8000:8000 scylladb/scylla-nightly:latest --alternator-port=8000
+   `docker run --name scylla -d -p 8000:8000 scylladb/scylla-nightly:latest --alternator-port=8000 --alternator-write-isolation=always`.
+   The `--alternator-https-port=...` option can also be used to enable
+   Alternator on an encrypted (HTTPS) port. Note that in this case, the files
+   `/etc/scylla/scylla.crt` and `/etc/scylla/scylla.key` must be inserted into
+   the image, containing the SSL certificate and key to use.
 
 ## Testing Scylla's DynamoDB API support:
 ### Running AWS Tic Tac Toe demo app to test the cluster:
@@ -27,7 +33,7 @@ which also contains drivers for DynamoDB:
 ```
 sudo pip install --upgrade boto3
 ```
-### Runnning some simple scripts:
+### Running some simple scripts:
 The following is a 3 scripts test that creates a table named _usertable_ writes the
 famous hello world record to it, and then, reads it back.
 

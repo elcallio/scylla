@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -33,6 +22,7 @@
 
 #include "auth/resource.hh"
 #include "seastarx.hh"
+#include "exceptions/exceptions.hh"
 
 namespace auth {
 
@@ -52,9 +42,9 @@ struct role_config_update final {
 ///
 /// A logical argument error for a role-management operation.
 ///
-class roles_argument_exception : public std::invalid_argument {
+class roles_argument_exception : public exceptions::invalid_request_exception {
 public:
-    using std::invalid_argument::invalid_argument;
+    using exceptions::invalid_request_exception::invalid_request_exception;
 };
 
 class role_already_exists : public roles_argument_exception {

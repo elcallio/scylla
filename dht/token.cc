@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <algorithm>
@@ -44,12 +33,12 @@ static const token min_token{ token::kind::before_all_keys, 0 };
 static const token max_token{ token::kind::after_all_keys, 0 };
 
 const token&
-minimum_token() {
+minimum_token() noexcept {
     return min_token;
 }
 
 const token&
-maximum_token() {
+maximum_token() noexcept {
     return max_token;
 }
 
@@ -59,13 +48,7 @@ int tri_compare(const token& t1, const token& t2) {
     } else if (t1._kind > t2._kind) {
             return 1;
     } else if (t1._kind == token_kind::key) {
-        auto l1 = long_token(t1);
-        auto l2 = long_token(t2);
-        if (l1 == l2) {
-            return 0;
-        } else {
-            return l1 < l2 ? -1 : 1;
-        }
+        return tri_compare_raw(long_token(t1), long_token(t2));
     }
     return 0;
 }
@@ -118,7 +101,12 @@ token token::midpoint(const token& t1, const token& t2) {
 }
 
 token token::get_random_token() {
-    return {kind::key, dht::get_random_number<int64_t>()};
+    static thread_local std::default_random_engine re{std::random_device{}()};
+    // std::numeric_limits<int64_t>::min() value is reserved and shouldn't
+    // be used for regular tokens.
+    static thread_local std::uniform_int_distribution<int64_t> dist(
+            std::numeric_limits<int64_t>::min() + 1);
+    return token(kind::key, dist(re));
 }
 
 token token::from_sstring(const sstring& t) {
@@ -274,11 +262,42 @@ token_for_next_shard(const std::vector<uint64_t>& shard_start, unsigned shard_co
 }
 
 int64_t token::to_int64(token t) {
-    return t._data;
+    return long_token(t);
 }
 
 dht::token token::from_int64(int64_t i) {
     return {kind::key, i};
+}
+
+static
+dht::token find_first_token_for_shard_in_not_wrap_around_range(const dht::sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
+    // Invariant start < end
+    // It is guaranteed that start is not MAX_INT64 because end is greater
+    auto t = dht::token::from_int64(dht::token::to_int64(start) + 1);
+    if (sharder.shard_of(t) != shard_idx) {
+        t = sharder.token_for_next_shard(t, shard_idx);
+    }
+    return std::min(t, end);
+}
+
+dht::token find_first_token_for_shard(
+        const dht::sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
+    if (start < end) { // Not a wrap around token range
+        return find_first_token_for_shard_in_not_wrap_around_range(sharder, start, end, shard_idx);
+    } else { // A wrap around token range
+        dht::token t;
+        if (dht::token::to_int64(start) != std::numeric_limits<int64_t>::max()) {
+            t = find_first_token_for_shard_in_not_wrap_around_range(sharder, start, dht::maximum_token(), shard_idx);
+            if (!t.is_maximum()) {
+                // This means we have found a token for shard shard_idx before 2^63
+                return t;
+            }
+        }
+        // No token owned by shard shard_idx was found in (start, 2^63 - 1]
+        // so we have to search in (-2^63, end]
+        return find_first_token_for_shard_in_not_wrap_around_range(
+                sharder, dht::minimum_token(), end, shard_idx);
+    }
 }
 
 } // namespace dht

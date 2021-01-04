@@ -16,15 +16,15 @@
 
 namespace cql3 {
 
-shared_ptr<column_specification>
+lw_shared_ptr<column_specification>
 sets::value_spec_of(const column_specification& column) {
-    return ::make_shared<column_specification>(column.ks_name, column.cf_name,
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
             ::make_shared<column_identifier>(format("value({})", *column.name), true),
             dynamic_pointer_cast<const set_type_impl>(column.type)->get_elements_type());
 }
 
 shared_ptr<term>
-sets::literal::prepare(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) const {
+sets::literal::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const {
     validate_assignable_to(db, keyspace, *receiver);
 
     if (_elements.empty()) {
@@ -87,17 +87,17 @@ sets::literal::validate_assignable_to(database& db, const sstring& keyspace, con
 
     auto&& value_spec = value_spec_of(receiver);
     for (shared_ptr<term::raw> rt : _elements) {
-        if (!is_assignable(rt->test_assignment(db, keyspace, value_spec))) {
+        if (!is_assignable(rt->test_assignment(db, keyspace, *value_spec))) {
             throw exceptions::invalid_request_exception(format("Invalid set literal for {}: value {} is not of type {}", *receiver.name, *rt, value_spec->type->as_cql3_type()));
         }
     }
 }
 
 assignment_testable::test_result
-sets::literal::test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) const {
-    if (!dynamic_pointer_cast<const set_type_impl>(receiver->type)) {
+sets::literal::test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const {
+    if (!dynamic_pointer_cast<const set_type_impl>(receiver.type)) {
         // We've parsed empty maps as a set literal to break the ambiguity so handle that case now
-        if (dynamic_pointer_cast<const map_type_impl>(receiver->type) && _elements.empty()) {
+        if (dynamic_pointer_cast<const map_type_impl>(receiver.type) && _elements.empty()) {
             return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
         }
 
@@ -109,10 +109,10 @@ sets::literal::test_assignment(database& db, const sstring& keyspace, shared_ptr
         return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
     }
 
-    auto&& value_spec = value_spec_of(*receiver);
+    auto&& value_spec = value_spec_of(receiver);
     // FIXME: make assignment_testable::test_all() accept ranges
     std::vector<shared_ptr<assignment_testable>> to_test(_elements.begin(), _elements.end());
-    return assignment_testable::test_all(db, keyspace, value_spec, to_test);
+    return assignment_testable::test_all(db, keyspace, *value_spec, to_test);
 }
 
 sstring
@@ -126,14 +126,12 @@ sets::value::from_serialized(const fragmented_temporary_buffer::view& val, const
         // Collections have this small hack that validate cannot be called on a serialized object,
         // but compose does the validation (so we're fine).
         // FIXME: deserializeForNativeProtocol?!
-      return with_linearized(val, [&] (bytes_view v) {
-        auto s = value_cast<set_type_impl::native_type>(type.deserialize(v, sf));
+        auto s = value_cast<set_type_impl::native_type>(type.deserialize(val, sf));
         std::set<bytes, serialized_compare> elements(type.get_elements_type()->as_less_comparator());
         for (auto&& element : s) {
             elements.insert(elements.end(), type.get_elements_type()->decompose(element));
         }
         return value(std::move(elements));
-      });
     } catch (marshal_exception& e) {
         throw exceptions::invalid_request_exception(e.what());
     }
@@ -213,7 +211,7 @@ sets::delayed_value::bind(const query_options& options) {
 }
 
 
-sets::marker::marker(int32_t bind_index, ::shared_ptr<column_specification> receiver)
+sets::marker::marker(int32_t bind_index, lw_shared_ptr<column_specification> receiver)
     : abstract_marker{bind_index, std::move(receiver)} {
         assert(dynamic_cast<const set_type_impl*>(_receiver->type.get()));
     }
@@ -228,13 +226,12 @@ sets::marker::bind(const query_options& options) {
     } else {
         auto& type = static_cast<const set_type_impl&>(*_receiver->type);
         try {
-            with_linearized(*value, [&] (bytes_view v) {
-                type.validate(v, options.get_cql_serialization_format());
-            });
+            type.validate(*value, options.get_cql_serialization_format());
         } catch (marshal_exception& e) {
-            throw exceptions::invalid_request_exception(e.what());
+            throw exceptions::invalid_request_exception(
+                    format("Exception while binding column {:s}: {:s}", _receiver->name->to_cql_string(), e.what()));
         }
-        return make_shared(value::from_serialized(*value, type, options.get_cql_serialization_format()));
+        return make_shared<cql3::sets::value>(value::from_serialized(*value, type, options.get_cql_serialization_format()));
     }
 }
 

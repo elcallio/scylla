@@ -177,14 +177,12 @@ std::string bytes_to_string(query::result_bytes_view v) {
 }
 
 namespace thrift {
-GCC6_CONCEPT(
 template<typename T>
-concept bool Aggregator =
+concept Aggregator =
     requires() { typename T::type; }
     && requires(T aggregator, typename T::type* aggregation, const bytes& name, const query::result_atomic_cell_view& cell) {
-        { aggregator.on_column(aggregation, name, cell) } -> void;
+        { aggregator.on_column(aggregation, name, cell) } -> std::same_as<void>;
     };
-)
 }
 
 enum class query_order { no, yes };
@@ -280,13 +278,14 @@ public:
             if (!column_parent.super_column.empty()) {
                 fail(unimplemented::cause::SUPER);
             }
-            auto cmd = slice_pred_to_read_cmd(*schema, predicate);
+            auto& proxy = service::get_local_storage_proxy();
+            auto cmd = slice_pred_to_read_cmd(proxy, *schema, predicate);
             auto cell_limit = predicate.__isset.slice_range ? static_cast<uint32_t>(predicate.slice_range.count) : std::numeric_limits<uint32_t>::max();
             auto pranges = make_partition_ranges(*schema, keys);
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
-            return f.then([this, schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
+            return f.then([this, &proxy, schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
                 auto timeout = db::timeout_clock::now() + _timeout_config.read_timeout;
-                return service::get_local_storage_proxy().query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level), {timeout, empty_service_permit(), _query_state.get_client_state()}).then(
+                return proxy.query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level), {timeout, empty_service_permit(), _query_state.get_client_state()}).then(
                         [schema, cmd, cell_limit, keys = std::move(keys)](service::storage_proxy::coordinator_query_result qr) {
                     return query::result_view::do_with(*qr.query_result, [schema, cmd, cell_limit, keys = std::move(keys)](query::result_view v) mutable {
                         if (schema->is_counter()) {
@@ -308,13 +307,14 @@ public:
             if (!column_parent.super_column.empty()) {
                 fail(unimplemented::cause::SUPER);
             }
-            auto cmd = slice_pred_to_read_cmd(*schema, predicate);
+            auto& proxy = service::get_local_storage_proxy();
+            auto cmd = slice_pred_to_read_cmd(proxy, *schema, predicate);
             auto cell_limit = predicate.__isset.slice_range ? static_cast<uint32_t>(predicate.slice_range.count) : std::numeric_limits<uint32_t>::max();
             auto pranges = make_partition_ranges(*schema, keys);
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
-            return f.then([this, schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
+            return f.then([this, &proxy, schema, cmd, pranges = std::move(pranges), cell_limit, consistency_level, keys]() mutable {
                 auto timeout = db::timeout_clock::now() + _timeout_config.read_timeout;
-                return service::get_local_storage_proxy().query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level), {timeout, empty_service_permit(), _query_state.get_client_state()}).then(
+                return proxy.query(schema, cmd, std::move(pranges), cl_from_thrift(consistency_level), {timeout, empty_service_permit(), _query_state.get_client_state()}).then(
                         [schema, cmd, cell_limit, keys = std::move(keys)](service::storage_proxy::coordinator_query_result qr) {
                     return query::result_view::do_with(*qr.query_result, [schema, cmd, cell_limit, keys = std::move(keys)](query::result_view v) mutable {
                         column_counter counter(*schema, cmd->slice, cell_limit, std::move(keys));
@@ -337,8 +337,9 @@ public:
             if (!column_parent.super_column.empty()) {
                 fail(unimplemented::cause::SUPER);
             }
+            auto& proxy = service::get_local_storage_proxy();
             auto&& prange = make_partition_range(*schema, range);
-            auto cmd = slice_pred_to_read_cmd(*schema, predicate);
+            auto cmd = slice_pred_to_read_cmd(proxy, *schema, predicate);
             // KeyRange::count is the number of thrift rows to return, while
             // SlicePredicte::slice_range::count limits the number of thrift colums.
             if (schema->thrift().is_dynamic()) {
@@ -346,12 +347,12 @@ public:
                 cmd->partition_limit = range.count;
             } else {
                 // For static CFs each thrift row maps to a CQL row.
-                cmd->row_limit = range.count;
+                cmd->set_row_limit(static_cast<uint64_t>(range.count));
             }
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
-            return f.then([this, schema, cmd, prange = std::move(prange), consistency_level] () mutable {
+            return f.then([this, &proxy, schema, cmd, prange = std::move(prange), consistency_level] () mutable {
                 auto timeout = db::timeout_clock::now() + _timeout_config.range_read_timeout;
-                return service::get_local_storage_proxy().query(schema, cmd, std::move(prange), cl_from_thrift(consistency_level), {timeout, empty_service_permit(), _query_state.get_client_state()}).then(
+                return proxy.query(schema, cmd, std::move(prange), cl_from_thrift(consistency_level), {timeout, empty_service_permit(), _query_state.get_client_state()}).then(
                         [schema, cmd](service::storage_proxy::coordinator_query_result qr) {
                     return query::result_view::do_with(*qr.query_result, [schema, cmd](query::result_view v) {
                         return to_key_slices(*schema, cmd->slice, v, std::numeric_limits<uint32_t>::max());
@@ -361,18 +362,18 @@ public:
         });
     }
 
-    static lw_shared_ptr<query::read_command> make_paged_read_cmd(const schema& s, uint32_t column_limit, const std::string* start_column, const dht::partition_range_vector& range) {
+    static lw_shared_ptr<query::read_command> make_paged_read_cmd(service::storage_proxy& proxy, const schema& s, uint32_t column_limit, const std::string* start_column, const dht::partition_range_vector& range) {
         auto opts = query_opts(s);
         std::vector<query::clustering_range> clustering_ranges;
         query::column_id_vector regular_columns;
-        uint32_t row_limit;
+        uint64_t row_limit;
         uint32_t partition_limit;
         std::unique_ptr<query::specific_ranges> specific_ranges = nullptr;
         // KeyRange::count is the number of thrift columns to return (unlike get_range_slices).
         if (s.thrift().is_dynamic()) {
             // For dynamic CFs we must limit the number of rows returned. We use the query::specific_ranges to constrain
             // the first partition, of which we are only interested in the columns after start_column.
-            row_limit = column_limit;
+            row_limit = static_cast<uint64_t>(column_limit);
             partition_limit = query::max_partitions;
             if (start_column) {
                 auto sr = query::specific_ranges(*range[0].start()->value().key(), {make_clustering_range_and_validate(s, *start_column, std::string())});
@@ -383,7 +384,7 @@ public:
             // For static CFs we must limit the number of columns returned. Since we don't implement a cell limit,
             // we ask for as many partitions as those that are capable of exhausting the limit and later filter out
             // any excess cells.
-            row_limit = query::max_rows;
+            row_limit = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
             partition_limit = (column_limit + s.regular_columns_count() - 1) / s.regular_columns_count();
             schema::const_iterator start_col = start_column
                                              ? s.regular_lower_bound(to_bytes(*start_column))
@@ -393,7 +394,8 @@ public:
         clustering_ranges.emplace_back(query::clustering_range::make_open_ended_both_sides());
         auto slice = query::partition_slice(std::move(clustering_ranges), { }, std::move(regular_columns), opts,
                 std::move(specific_ranges), cql_serialization_format::internal());
-        return make_lw_shared<query::read_command>(s.id(), s.version(), std::move(slice), row_limit, gc_clock::now(), std::nullopt, partition_limit);
+        return make_lw_shared<query::read_command>(s.id(), s.version(), std::move(slice), proxy.get_max_result_size(slice),
+                query::row_limit(row_limit), query::partition_limit(partition_limit));
     }
 
     static future<> do_get_paged_slice(
@@ -405,7 +407,8 @@ public:
             const ::timeout_config& timeout_config,
             std::vector<KeySlice>& output,
             service::query_state& qs) {
-        auto cmd = make_paged_read_cmd(*schema, column_limit, start_column, range);
+        auto& proxy = service::get_local_storage_proxy();
+        auto cmd = make_paged_read_cmd(proxy, *schema, column_limit, start_column, range);
         std::optional<partition_key> start_key;
         auto end = range[0].end();
         if (start_column && !schema->thrift().is_dynamic()) {
@@ -416,7 +419,7 @@ public:
         }
         auto range1 = range; // query() below accepts an rvalue, so need a copy to reuse later
         auto timeout = db::timeout_clock::now() + timeout_config.range_read_timeout;
-        return service::get_local_storage_proxy().query(schema, cmd, std::move(range), consistency_level, {timeout, empty_service_permit(), qs.get_client_state()}).then(
+        return proxy.query(schema, cmd, std::move(range), consistency_level, {timeout, empty_service_permit(), qs.get_client_state()}).then(
                 [schema, cmd, column_limit](service::storage_proxy::coordinator_query_result qr) {
             return query::result_view::do_with(*qr.query_result, [schema, cmd, column_limit](query::result_view v) {
                 return to_key_slices(*schema, cmd->slice, v, column_limit);
@@ -426,7 +429,7 @@ public:
                 return acc + ks.columns.size();
             });
             std::move(slices.begin(), slices.end(), std::back_inserter(output));
-            if (columns == 0 || columns == column_limit || (slices.size() < cmd->partition_limit && columns < cmd->row_limit)) {
+            if (columns == 0 || columns == column_limit || (slices.size() < cmd->partition_limit && columns < cmd->get_row_limit())) {
                 if (!output.empty() || !start_key) {
                     if (range.size() > 1 && columns < column_limit) {
                         range.erase(range.begin());
@@ -604,7 +607,7 @@ public:
                 throw make_exception<InvalidRequestException>("keyspace not set");
             }
 
-            return _query_state.get_client_state().has_column_family_access(current_keyspace(), cfname, auth::permission::MODIFY).then([=] {
+            return _query_state.get_client_state().has_column_family_access(_db.local(), current_keyspace(), cfname, auth::permission::MODIFY).then([this, cfname] {
                 if (_db.local().find_schema(current_keyspace(), cfname)->is_view()) {
                     throw make_exception<InvalidRequestException>("Cannot truncate Materialized Views");
                 }
@@ -630,7 +633,7 @@ public:
             query::column_id_vector regular_columns;
             std::vector<query::clustering_range> clustering_ranges;
             auto opts = query_opts(s);
-            uint32_t row_limit;
+            uint64_t row_limit;
             if (s.thrift().is_dynamic()) {
                 row_limit = request.count;
                 auto cmp = bound_view::compare(s);
@@ -645,7 +648,7 @@ public:
                     opts.set(query::partition_slice::option::reversed);
                 }
             } else {
-                row_limit = query::max_rows;
+                row_limit = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
                 clustering_ranges.emplace_back(query::clustering_range::make_open_ended_both_sides());
                 auto cmp = [&s](auto&& s1, auto&& s2) { return s.regular_column_name_type()->compare(s1, s2); };
                 auto ranges = make_non_overlapping_ranges<bytes>(std::move(request.column_slices), [](auto&& cslice) {
@@ -663,11 +666,13 @@ public:
                 }
             }
             auto slice = query::partition_slice(std::move(clustering_ranges), {}, std::move(regular_columns), opts, nullptr);
-            auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), row_limit);
+            auto& proxy = service::get_local_storage_proxy();
+            auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), proxy.get_max_result_size(slice),
+                    query::row_limit(row_limit));
             auto f = _query_state.get_client_state().has_schema_access(*schema, auth::permission::SELECT);
-            return f.then([this, dk = std::move(dk), cmd, schema, column_limit = request.count, cl = request.consistency_level] {
+            return f.then([this, &proxy, dk = std::move(dk), cmd, schema, column_limit = request.count, cl = request.consistency_level] {
                 auto timeout = db::timeout_clock::now() + _timeout_config.read_timeout;
-                return service::get_local_storage_proxy().query(schema, cmd, {dht::partition_range::make_singular(dk)}, cl_from_thrift(cl), {timeout, /* FIXME: pass real permit */empty_service_permit(), _query_state.get_client_state()}).then(
+                return proxy.query(schema, cmd, {dht::partition_range::make_singular(dk)}, cl_from_thrift(cl), {timeout, /* FIXME: pass real permit */empty_service_permit(), _query_state.get_client_state()}).then(
                         [schema, cmd, column_limit](service::storage_proxy::coordinator_query_result qr) {
                     return query::result_view::do_with(*qr.query_result, [schema, cmd, column_limit](query::result_view v) {
                         column_aggregator<query_order::no> aggregator(*schema, cmd->slice, column_limit, { });
@@ -829,7 +834,7 @@ public:
 
             auto s = schema_from_thrift(cf_def, cf_def.keyspace);
             return _query_state.get_client_state().has_keyspace_access(cf_def.keyspace, auth::permission::CREATE).then([this, s = std::move(s)] {
-                return service::get_local_migration_manager().announce_new_column_family(std::move(s), false).then([this] {
+                return service::get_local_migration_manager().announce_new_column_family(std::move(s)).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -837,7 +842,7 @@ public:
     }
     void system_drop_column_family(thrift_fn::function<void(std::string const& _return)> cob, thrift_fn::function<void(::apache::thrift::TDelayedException* _throw)> exn_cob, const std::string& column_family) {
         with_cob(std::move(cob), std::move(exn_cob), [&] {
-            return _query_state.get_client_state().has_column_family_access(current_keyspace(), column_family, auth::permission::DROP).then([=] {
+            return _query_state.get_client_state().has_column_family_access(_db.local(), current_keyspace(), column_family, auth::permission::DROP).then([this, column_family] {
                 auto& cf = _db.local().find_column_family(current_keyspace(), column_family);
                 if (cf.schema()->is_view()) {
                     throw make_exception<InvalidRequestException>("Cannot drop Materialized Views from Thrift");
@@ -845,7 +850,7 @@ public:
                 if (!cf.views().empty()) {
                     throw make_exception<InvalidRequestException>("Cannot drop table with Materialized Views %s", column_family);
                 }
-                return service::get_local_migration_manager().announce_column_family_drop(current_keyspace(), column_family, false).then([this] {
+                return service::get_local_migration_manager().announce_column_family_drop(current_keyspace(), column_family).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -856,7 +861,7 @@ public:
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             auto ksm = keyspace_from_thrift(ks_def);
             return _query_state.get_client_state().has_all_keyspaces_access(auth::permission::CREATE).then([this, ksm = std::move(ksm)] {
-                return service::get_local_migration_manager().announce_new_keyspace(std::move(ksm), false).then([this] {
+                return service::get_local_migration_manager().announce_new_keyspace(std::move(ksm)).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -870,8 +875,8 @@ public:
                 throw NotFoundException();
             }
 
-            return _query_state.get_client_state().has_keyspace_access(keyspace, auth::permission::DROP).then([=] {
-                return service::get_local_migration_manager().announce_keyspace_drop(keyspace, false).then([this] {
+            return _query_state.get_client_state().has_keyspace_access(keyspace, auth::permission::DROP).then([this, keyspace] {
+                return service::get_local_migration_manager().announce_keyspace_drop(keyspace).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -891,7 +896,7 @@ public:
 
             auto ksm = keyspace_from_thrift(ks_def);
             return _query_state.get_client_state().has_keyspace_access(ks_def.name, auth::permission::ALTER).then([this, ksm = std::move(ksm)] {
-                return service::get_local_migration_manager().announce_keyspace_update(std::move(ksm), false).then([this] {
+                return service::get_local_migration_manager().announce_keyspace_update(std::move(ksm)).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -922,7 +927,7 @@ public:
                 fail(unimplemented::cause::MIXED_CF);
             }
             return _query_state.get_client_state().has_schema_access(*schema, auth::permission::ALTER).then([this, s = std::move(s)] {
-                return service::get_local_migration_manager().announce_column_family_update(std::move(s), true, {}, false).then([this] {
+                return service::get_local_migration_manager().announce_column_family_update(std::move(s), true, {}).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -994,7 +999,7 @@ public:
         }
         virtual void visit(const cql_transport::messages::result_message::prepared::thrift& m) override {
             _result.__set_itemId(m.get_id());
-            auto& names = m.metadata()->names();
+            auto& names = m.metadata().names();
             _result.__set_count(names.size());
             std::vector<std::string> variable_types;
             std::vector<std::string> variable_names;
@@ -1358,7 +1363,7 @@ private:
         return partition_key::from_exploded(composite.values());
     }
     static db::consistency_level cl_from_thrift(const ConsistencyLevel::type consistency_level) {
-        switch(consistency_level) {
+        switch (consistency_level) {
         case ConsistencyLevel::type::ONE: return db::consistency_level::ONE;
         case ConsistencyLevel::type::QUORUM: return db::consistency_level::QUORUM;
         case ConsistencyLevel::type::LOCAL_QUORUM: return db::consistency_level::LOCAL_QUORUM;
@@ -1389,9 +1394,18 @@ private:
             return { };
         }
     }
+    static void validate_key(const schema& s, const clustering_key& ck, bytes_view v) {
+        auto ck_size = ck.size(s);
+        if (ck_size > s.clustering_key_size()) {
+            throw std::runtime_error(format("Cell name of {}.{} has too many components, expected {} but got {} in 0x{}",
+                s.ks_name(), s.cf_name(), s.clustering_key_size(), ck_size, to_hex(v)));
+        }
+    }
     static clustering_key_prefix make_clustering_prefix(const schema& s, bytes_view v) {
         auto composite = composite_view(v, s.thrift().has_compound_comparator());
-        return clustering_key_prefix::from_exploded(composite.values());
+        auto ck = clustering_key_prefix::from_exploded(composite.values());
+        validate_key(s, ck, v);
+        return ck;
     }
     static query::clustering_range::bound make_clustering_bound(const schema& s, bytes_view v, composite::eoc exclusiveness_marker) {
         auto composite = composite_view(v, s.thrift().has_compound_comparator());
@@ -1400,6 +1414,7 @@ private:
             last = c.second;
             return c.first;
         }));
+        validate_key(s, ck, v);
         return query::clustering_range::bound(std::move(ck), last != exclusiveness_marker);
     }
     static range<clustering_key_prefix> make_clustering_range(const schema& s, const std::string& start, const std::string& end) {
@@ -1464,11 +1479,20 @@ private:
         opts.set(query::partition_slice::option::send_partition_key);
         return opts;
     }
-    static lw_shared_ptr<query::read_command> slice_pred_to_read_cmd(const schema& s, const SlicePredicate& predicate) {
+    static void sort_ranges(const schema& s, std::vector<query::clustering_range>& ranges) {
+        position_in_partition::less_compare less(s);
+        std::sort(ranges.begin(), ranges.end(),
+            [&less] (const query::clustering_range& r1, const query::clustering_range& r2) {
+                return less(
+                    position_in_partition_view::for_range_start(r1),
+                    position_in_partition_view::for_range_start(r2));
+            });
+    }
+    static lw_shared_ptr<query::read_command> slice_pred_to_read_cmd(service::storage_proxy& proxy, const schema& s, const SlicePredicate& predicate) {
         auto opts = query_opts(s);
         std::vector<query::clustering_range> clustering_ranges;
         query::column_id_vector regular_columns;
-        uint32_t per_partition_row_limit = query::max_rows;
+        uint64_t per_partition_row_limit = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
         if (predicate.__isset.column_names) {
             thrift_validation::validate_column_names(predicate.column_names);
             auto unique_column_names = boost::copy_range<std::vector<std::string>>(predicate.column_names | boost::adaptors::uniqued);
@@ -1477,6 +1501,7 @@ private:
                     auto ckey = make_clustering_prefix(s, to_bytes(name));
                     clustering_ranges.emplace_back(query::clustering_range::make_singular(std::move(ckey)));
                 }
+                sort_ranges(s, clustering_ranges);
                 regular_columns.emplace_back(s.regular_begin()->id);
             } else {
                 clustering_ranges.emplace_back(query::clustering_range::make_open_ended_both_sides());
@@ -1495,7 +1520,7 @@ private:
                 std::swap(range.start, range.finish);
                 opts.set(query::partition_slice::option::reversed);
             }
-            per_partition_row_limit = static_cast<uint32_t>(range.count);
+            per_partition_row_limit = static_cast<uint64_t>(range.count);
             if (s.thrift().is_dynamic()) {
                 clustering_ranges.emplace_back(make_clustering_range_and_validate(s, range.start, range.finish));
                 regular_columns.emplace_back(s.regular_begin()->id);
@@ -1511,7 +1536,7 @@ private:
         }
         auto slice = query::partition_slice(std::move(clustering_ranges), {}, std::move(regular_columns), opts,
                 nullptr, cql_serialization_format::internal(), per_partition_row_limit);
-        return make_lw_shared<query::read_command>(s.id(), s.version(), std::move(slice));
+        return make_lw_shared<query::read_command>(s.id(), s.version(), std::move(slice), proxy.get_max_result_size(slice));
     }
     static ColumnParent column_path_to_column_parent(const ColumnPath& column_path) {
         ColumnParent ret;
@@ -1605,7 +1630,7 @@ private:
     };
 
     template<typename Aggregator, query_order QueryOrder>
-    GCC6_CONCEPT( requires thrift::Aggregator<Aggregator> )
+    requires thrift::Aggregator<Aggregator>
     class column_visitor : public Aggregator {
         const schema& _s;
         const query::partition_slice& _slice;
@@ -1695,13 +1720,8 @@ private:
                      ? dht::ring_position::ending_at(dht::maximum_token())
                      : partitioner.decorate_key(s, key_from_thrift(s, to_bytes(range.end_key)));
             if (end.less_compare(s, start)) {
-                if (partitioner.preserves_order()) {
-                    throw make_exception<InvalidRequestException>(
-                            "Start key must sort before (or equal to) finish key in the partitioner");
-                } else {
-                    throw make_exception<InvalidRequestException>(
-                            "Start key's token sorts after end key's token. This is not allowed; you probably should not specify end key at all except with an ordered partitioner");
-                }
+                throw make_exception<InvalidRequestException>(
+                        "Start key's token sorts after end key's token. This is not allowed; you probably should not specify end key at all except with an ordered partitioner");
             }
             return {{dht::partition_range::bound(std::move(start), true),
                      dht::partition_range::bound(std::move(end), true)}};

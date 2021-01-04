@@ -29,6 +29,8 @@
  */
 
 #include "cql3/statements/schema_altering_statement.hh"
+#include "locator/abstract_replication_strategy.hh"
+#include "database.hh"
 
 #include "transport/messages/result_message.hh"
 
@@ -54,11 +56,6 @@ future<> schema_altering_statement::grant_permissions_to_creator(const service::
     return make_ready_future<>();
 }
 
-bool schema_altering_statement::uses_function(const sstring& ks_name, const sstring& function_name) const
-{
-    return cf_statement::uses_function(ks_name, function_name);
-}
-
 bool schema_altering_statement::depends_on_keyspace(const sstring& ks_name) const
 {
     return false;
@@ -82,10 +79,10 @@ void schema_altering_statement::prepare_keyspace(const service::client_state& st
 }
 
 future<::shared_ptr<messages::result_message>>
-schema_altering_statement::execute0(service::storage_proxy& proxy, service::query_state& state, const query_options& options, bool is_local_only) const {
+schema_altering_statement::execute0(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const {
     // If an IF [NOT] EXISTS clause was used, this may not result in an actual schema change.  To avoid doing
     // extra work in the drivers to handle schema changes, we return an empty message in this case. (CASSANDRA-7600)
-    return announce_migration(proxy, is_local_only).then([this] (auto ce) {
+    return announce_migration(proxy).then([this] (auto ce) {
         ::shared_ptr<messages::result_message> result;
         if (!ce) {
             result = ::make_shared<messages::result_message::void_message>();
@@ -99,7 +96,20 @@ schema_altering_statement::execute0(service::storage_proxy& proxy, service::quer
 future<::shared_ptr<messages::result_message>>
 schema_altering_statement::execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const {
     bool internal = state.get_client_state().is_internal();
-    return execute0(proxy, state, options, internal).then([this, &state, internal](::shared_ptr<messages::result_message> result) {
+    if (internal) {
+        auto replication_type = locator::replication_strategy_type::everywhere_topology;
+        database& db = proxy.get_db().local();
+        if (_cf_name && _cf_name->has_keyspace()) {
+           const auto& ks = db.find_keyspace(_cf_name->get_keyspace());
+           replication_type = ks.get_replication_strategy().get_type();
+        }
+        if (replication_type != locator::replication_strategy_type::local) {
+            sstring info = _cf_name ? _cf_name->to_string() : "schema";
+            throw std::logic_error(format("Attempted to modify {} via internal query: such schema changes are not propagated and thus illegal", info));
+        }
+    }
+
+    return execute0(proxy, state, options).then([this, &state, internal](::shared_ptr<messages::result_message> result) {
         auto permissions_granted_fut = internal
                 ? make_ready_future<>()
                 : grant_permissions_to_creator(state.get_client_state());

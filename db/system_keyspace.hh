@@ -52,12 +52,17 @@ class storage_service;
 
 }
 
+namespace netw {
+    class messaging_service;
+}
+
 namespace cql3 {
     class query_processor;
 }
 
 namespace gms {
     class feature;
+    class feature_service;
 }
 
 bool is_system_keyspace(const sstring& ks_name);
@@ -154,13 +159,14 @@ schema_ptr aggregates();
 table_schema_version generate_schema_version(utils::UUID table_id, uint16_t offset = 0);
 
 // Only for testing.
-void minimal_setup(distributed<database>& db, distributed<cql3::query_processor>& qp);
+void minimal_setup(distributed<cql3::query_processor>& qp);
 
 future<> init_local_cache();
 future<> deinit_local_cache();
 future<> setup(distributed<database>& db,
                distributed<cql3::query_processor>& qp,
-               distributed<service::storage_service>& ss);
+               distributed<gms::feature_service>& feat,
+               sharded<netw::messaging_service>& ms);
 future<> update_schema_version(utils::UUID version);
 
 /*
@@ -186,28 +192,11 @@ future<> update_peer_info(gms::inet_address ep, sstring column_name, Value value
 
 future<> remove_endpoint(gms::inet_address ep);
 
-future<> update_hints_dropped(gms::inet_address ep, utils::UUID time_period, int value);
-
 future<> set_scylla_local_param(const sstring& key, const sstring& value);
 future<std::optional<sstring>> get_scylla_local_param(const sstring& key);
 
 std::vector<schema_ptr> all_tables();
 void make(database& db, bool durable, bool volatile_testing_only = false);
-
-future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-query_mutations(distributed<service::storage_proxy>& proxy, const sstring& cf_name);
-
-// Returns all data from given system table.
-// Intended to be used by code which is not performance critical.
-future<lw_shared_ptr<query::result_set>> query(distributed<service::storage_proxy>& proxy, const sstring& cf_name);
-
-// Returns a slice of given system table.
-// Intended to be used by code which is not performance critical.
-future<lw_shared_ptr<query::result_set>> query(
-    distributed<service::storage_proxy>& proxy,
-    const sstring& cf_name,
-    const dht::decorated_key& key,
-    query::clustering_range row_ranges = query::clustering_range::make_open_ended_both_sides());
 
 /// overloads
 
@@ -388,19 +377,15 @@ enum class bootstrap_state {
         std::unordered_map<int32_t, int64_t> rows_merged;
     };
 
-    future<> update_compaction_history(sstring ksname, sstring cfname, int64_t compacted_at, int64_t bytes_in, int64_t bytes_out,
+    future<> update_compaction_history(utils::UUID uuid, sstring ksname, sstring cfname, int64_t compacted_at, int64_t bytes_in, int64_t bytes_out,
                                        std::unordered_map<int32_t, int64_t> rows_merged);
     using compaction_history_consumer = noncopyable_function<future<>(const compaction_history_entry&)>;
     future<> get_compaction_history(compaction_history_consumer&& f);
 
     typedef std::vector<db::replay_position> replay_positions;
 
-    future<> migrate_truncation_records(const gms::feature& cluster_supports_truncation_table);
-    // for tests
-    future<> wait_for_truncation_record_migration_complete();
     future<> save_truncation_record(utils::UUID, db_clock::time_point truncated_at, db::replay_position);
     future<> save_truncation_record(const column_family&, db_clock::time_point truncated_at, db::replay_position);
-    future<> remove_truncation_record(utils::UUID);
     future<replay_positions> get_truncated_position(utils::UUID);
     future<db::replay_position> get_truncated_position(utils::UUID, uint32_t shard);
     future<db_clock::time_point> get_truncated_at(utils::UUID);
@@ -631,7 +616,7 @@ future<std::vector<view_name>> load_built_views();
 future<std::vector<view_build_progress>> load_view_build_progress();
 
 // Paxos related functions
-future<service::paxos::paxos_state> load_paxos_state(const partition_key& key, schema_ptr s, gc_clock::time_point now,
+future<service::paxos::paxos_state> load_paxos_state(partition_key_view key, schema_ptr s, gc_clock::time_point now,
         db::timeout_clock::time_point timeout);
 future<> save_paxos_promise(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout);
 future<> save_paxos_proposal(const schema& s, const service::paxos::proposal& proposal, db::timeout_clock::time_point timeout);

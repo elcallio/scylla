@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 
@@ -51,13 +40,11 @@ void test_mutation_source(sstables::test_env& env, sstable_writer_config cfg, ss
 
 
 SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source) {
-    return seastar::async([] {
-        auto wait_bg = seastar::defer([] { sstables::await_background_jobs().get(); });
+    return sstables::test_env::do_with_async([] (sstables::test_env& env) {
         storage_service_for_tests ssft;
-        sstables::test_env env;
         for (auto version : all_sstable_versions) {
             for (auto index_block_size : {1, 128, 64*1024}) {
-                sstable_writer_config cfg = test_sstables_manager.configure_writer();
+                sstable_writer_config cfg = env.manager().configure_writer();
                 cfg.promoted_index_block_size = index_block_size;
                 test_mutation_source(env, cfg, version);
             }

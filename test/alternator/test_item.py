@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for the CRUD item operations: PutItem, GetItem, UpdateItem, DeleteItem
 
@@ -591,41 +580,91 @@ def test_update_item_add(test_table_s):
             AttributeUpdates={'a': {'Action': 'ADD', 'Value': value}})
         assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': value}
 
-# DynamoDB Does not allow empty strings, empty byte arrays, or empty sets.
+# DynamoDB Does not allow empty sets.
 # Trying to ask UpdateItem to PUT one of these in an attribute should be
 # forbidden. Empty lists and maps *are* allowed.
 def test_update_item_empty_attribute(test_table_s):
     p = random_string()
-    # Empty string, byte array and set are *not* allowed
-    with pytest.raises(ClientError, match='ValidationException.*empty'):
-        test_table_s.update_item(Key={'p': p},
-            AttributeUpdates={'a': {'Action': 'PUT', 'Value': ''}})
-    with pytest.raises(ClientError, match='ValidationException.*empty'):
-        test_table_s.update_item(Key={'p': p},
-            AttributeUpdates={'b': {'Action': 'PUT', 'Value': bytearray('', 'utf-8')}})
+    # Empty sets are *not* allowed
     with pytest.raises(ClientError, match='ValidationException.*empty'):
         test_table_s.update_item(Key={'p': p},
             AttributeUpdates={'c': {'Action': 'PUT', 'Value': set([])}})
     assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
-    # But empty lists and maps *are* allowed:
+    # But empty lists, maps, strings and binary blobs *are* allowed:
     test_table_s.update_item(Key={'p': p},
         AttributeUpdates={'d': {'Action': 'PUT', 'Value': []}})
     test_table_s.update_item(Key={'p': p},
         AttributeUpdates={'e': {'Action': 'PUT', 'Value': {}}})
-    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'd': [], 'e': {}}
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'f': {'Action': 'PUT', 'Value': ''}})
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'g': {'Action': 'PUT', 'Value': bytearray('', 'utf-8')}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'd': [], 'e': {}, 'f': '', 'g': bytearray('', 'utf-8')}
 
-# Same as the above test (that we cannot create empty strings, blobs or
-# sets), but using PutItem
+# Test that empty strings are not accepted for keys
+def test_update_item_empty_key(test_table_s, test_table_b, test_table_ss, test_table_sb):
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_s.update_item(Key={'p': ''}, AttributeUpdates={'v': {'Action': 'PUT', 'Value': 'abc'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_b.update_item(Key={'p': bytearray('', 'utf-8')}, AttributeUpdates={'v': {'Action': 'PUT', 'Value': 'abc'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_ss.update_item(Key={'p': 'abc', 'c': ''}, AttributeUpdates={'v': {'Action': 'PUT', 'Value': 'abc'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_sb.update_item(Key={'p': 'abc', 'c': bytearray('', 'utf-8')}, AttributeUpdates={'v': {'Action': 'PUT', 'Value': 'abc'}})
+
+# Same as the above test (that we cannot create empty sets), but using PutItem
 def test_put_item_empty_attribute(test_table_s):
     p = random_string()
-    # Empty string, byte array and set are *not* allowed
-    with pytest.raises(ClientError, match='ValidationException.*empty'):
-        test_table_s.put_item(Item={'p': p, 'a': ''})
-    with pytest.raises(ClientError, match='ValidationException.*empty'):
-        test_table_s.put_item(Item={'p': p, 'a': bytearray('', 'utf-8')})
+    # Empty sets are *not* allowed
     with pytest.raises(ClientError, match='ValidationException.*empty'):
         test_table_s.put_item(Item={'p': p, 'a': set([])})
     assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
-    # But empty lists and maps *are* allowed:
-    test_table_s.put_item(Item={'p': p, 'a': [], 'b': {}})
-    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': [], 'b': {}}
+    # But empty lists, maps, strings and binary blobs *are* allowed:
+    test_table_s.put_item(Item={'p': p, 'a': [], 'b': {}, 'c': '', 'd': bytearray('', 'utf-8')})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': [], 'b': {}, 'c': '', 'd': bytearray('', 'utf-8')}
+
+# Test that empty strings are not accepted for keys
+def test_put_item_empty_key(test_table_s, test_table_b, test_table_ss, test_table_sb):
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_s.put_item(Item={'p': '', 'v': 'something'})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_b.put_item(Item={'p': bytearray('', 'utf-8'), 'v': 'something'})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_ss.put_item(Item={'p': 'abc', 'c': '', 'v': 'something'})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_sb.put_item(Item={'p': 'abc', 'c': bytearray('', 'utf-8'), 'v': 'something'})
+
+# In many other tests, we tested that ExpressionAttributeNames/Values
+# entries which aren't used in an the different kinds of expressions, are
+# detected and cause an error. Here we verify that also if there is no
+# expression at all, ExpressionAttributeNames/Values must not be present.
+def test_unused_entries_no_expression(test_table_s):
+    p = random_string()
+    # PutItem:
+    with pytest.raises(ClientError, match='ValidationException.*ExpressionAttributeNames'):
+        test_table_s.put_item(Item={'p': p, 'a': 'dog'},
+            ExpressionAttributeNames={'#name1': 'x'})
+    with pytest.raises(ClientError, match='ValidationException.*ExpressionAttributeValues'):
+        test_table_s.put_item(Item={'p': p, 'a': 'dog'},
+            ExpressionAttributeValues={':val1': 1})
+    # DeleteItem:
+    with pytest.raises(ClientError, match='ValidationException.*ExpressionAttributeNames'):
+        test_table_s.delete_item(Key={'p': p},
+            ExpressionAttributeNames={'#name1': 'x'})
+    with pytest.raises(ClientError, match='ValidationException.*ExpressionAttributeValues'):
+        test_table_s.delete_item(Key={'p': p},
+            ExpressionAttributeValues={':val1': 1})
+    # UpdateItem:
+    with pytest.raises(ClientError, match='ValidationException.*ExpressionAttributeNames'):
+        test_table_s.update_item(Key={'p': p},
+            AttributeUpdates={'a': {'Value': 'dog', 'Action': 'PUT'}},
+            ExpressionAttributeNames={'#name1': 'x'})
+    with pytest.raises(ClientError, match='ValidationException.*ExpressionAttributeValues'):
+        test_table_s.update_item(Key={'p': p},
+            AttributeUpdates={'a': {'Value': 'dog', 'Action': 'PUT'}},
+            ExpressionAttributeValues={':val1': 1})
+    # GetItem. We can't test ExpressionAttributeValues with boto3 (which
+    # doesn't allow this parameter to get_item().
+    with pytest.raises(ClientError, match='ValidationException.*ExpressionAttributeNames'):
+        test_table_s.get_item(Key={'p': p},
+            ExpressionAttributeNames={'#name1': 'x'})

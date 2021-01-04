@@ -386,7 +386,7 @@ int kmip_host::impl::connection::io_callback(KMIP *kmip, void *cb_arg, int op, v
 }
 
 void kmip_host::impl::connection::attach(KMIP_CMD* cmd) {
-    kmip_log.trace("{} Attach: {}", *this, cmd);
+    kmip_log.trace("{} Attach: {}", *this, reinterpret_cast<void*>(cmd));
     if (cmd == nullptr) {
         return;
     }
@@ -709,7 +709,7 @@ std::tuple<kmip_host::impl::kmip_data_list, unsigned int> kmip_host::impl::make_
 }
 
 future<kmip_host::impl::key_and_id_type> kmip_host::impl::create_key(const kmip_key_info& info) {
-    if (engine().cpu_id() == 0) {
+    if (this_shard_id() == 0) {
         // #1039 First try looking for existing keys on server
         return find_matching_keys(info, 1).then([this, info](std::vector<id_type> ids) {
             if (!ids.empty()) {
@@ -721,7 +721,9 @@ future<kmip_host::impl::key_and_id_type> kmip_host::impl::create_key(const kmip_
 
             kmip_log.debug("{}: Creating key {}", _name, info);
 
-            auto [kdl_attrs, crypt_alg] = make_attributes(info);
+            auto kdl_attrs_crypt_alg = make_attributes(info);
+            auto&& kdl_attrs = std::get<0>(kdl_attrs_crypt_alg);
+            auto&& crypt_alg = std::get<1>(kdl_attrs_crypt_alg);
 
             // TODO: this is inefficient. We can probably put this in a single batch.
             kmip_cmd cmd;
@@ -830,7 +832,7 @@ future<std::vector<kmip_host::id_type>> kmip_host::impl::find_matching_keys(cons
 }
 
 future<shared_ptr<symmetric_key>> kmip_host::impl::find_key(const id_type& id) {
-    if (engine().cpu_id() == 0) {
+    if (this_shard_id() == 0) {
         kmip_cmd cmd;
         KMIP_CMD_set_ctx(cmd, const_cast<char *>("Find key"));
 

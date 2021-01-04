@@ -196,6 +196,12 @@ public:
             service::query_state& query_state,
             query_options& options);
 
+    // NOTICE: Internal queries should be used with care, as they are expected
+    // to be used for local tables (e.g. from the `system` keyspace).
+    // Data modifications will usually be performed with consistency level ONE
+    // and schema changes will not be announced to other nodes.
+    // Because of that, changing global schema state (e.g. modifying non-local tables,
+    // creating namespaces, etc) is explicitly forbidden via this interface.
     future<::shared_ptr<untyped_result_set>>
     execute_internal(const sstring& query_string, const std::initializer_list<data_value>& values = { }) {
         return execute_internal(query_string, db::consistency_level::ONE,
@@ -279,7 +285,6 @@ public:
             const sstring& query_string,
             noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f);
 
-
     /*
      * Invokes `execute` (not `execute_internal`!) of the CQL statement with internal `client_state` and without
      * invoking `check_access` of the statement. This side-steps access-control for the statement being executed.
@@ -296,6 +301,12 @@ public:
     /*
      * See \ref process_internal.
      */
+    // NOTICE: Internal queries should be used with care, as they are expected
+    // to be used for local tables (e.g. from the `system` keyspace).
+    // Data modifications will usually be performed with consistency level ONE
+    // and schema changes will not be announced to other nodes.
+    // Because of that, changing global schema state (e.g. modifying non-local tables,
+    // creating namespaces, etc) is explicitly forbidden via this interface.
     future<::shared_ptr<untyped_result_set>> execute_internal(
             const sstring& query_string,
             db::consistency_level,
@@ -413,37 +424,16 @@ private:
                 }
                 assert(bound_terms == prepared->bound_names.size());
                 return make_ready_future<std::unique_ptr<statements::prepared_statement>>(std::move(prepared));
-            }).then([&key, &id_getter] (auto prep_ptr) {
+            }).then([&key, &id_getter, &client_state] (auto prep_ptr) {
                 return make_ready_future<::shared_ptr<cql_transport::messages::result_message::prepared>>(
-                        ::make_shared<ResultMsgType>(id_getter(key), std::move(prep_ptr)));
+                        ::make_shared<ResultMsgType>(id_getter(key), std::move(prep_ptr),
+                            client_state.is_protocol_extension_set(cql_transport::cql_protocol_extension::LWT_ADD_METADATA_MARK)));
             }).handle_exception_type([&query_string] (typename prepared_statements_cache::statement_is_too_big&) {
                 return make_exception_future<::shared_ptr<cql_transport::messages::result_message::prepared>>(
                         prepared_statement_is_too_big(query_string));
             });
         });
     };
-
-    template <typename ResultMsgType, typename KeyGenerator, typename IdGetter>
-    ::shared_ptr<cql_transport::messages::result_message::prepared>
-    get_stored_prepared_statement_one(
-            const std::string_view& query_string,
-            const sstring& keyspace,
-            KeyGenerator&& key_gen,
-            IdGetter&& id_getter) {
-        auto cache_key = key_gen(query_string, keyspace);
-        auto it = _prepared_cache.find(cache_key);
-        if (it == _prepared_cache.end()) {
-            return ::shared_ptr<cql_transport::messages::result_message::prepared>();
-        }
-
-        return ::make_shared<ResultMsgType>(id_getter(cache_key), *it);
-    }
-
-    ::shared_ptr<cql_transport::messages::result_message::prepared>
-    get_stored_prepared_statement(
-            const std::string_view& query_string,
-            const sstring& keyspace,
-            bool for_thrift);
 };
 
 class query_processor::migration_subscriber : public service::migration_listener {
@@ -481,15 +471,5 @@ private:
             std::optional<sstring> cf_name,
             ::shared_ptr<cql_statement> statement);
 };
-
-extern seastar::sharded<query_processor> _the_query_processor;
-
-inline seastar::sharded<query_processor>& get_query_processor() {
-    return _the_query_processor;
-}
-
-inline query_processor& get_local_query_processor() {
-    return _the_query_processor.local();
-}
 
 }

@@ -29,18 +29,16 @@ namespace cql3 {
 
 namespace util {
 
+
+void do_with_parser_impl(const sstring_view& cql, noncopyable_function<void (cql3_parser::CqlParser& p)> func);
+
 template <typename Func, typename Result = std::result_of_t<Func(cql3_parser::CqlParser&)>>
 Result do_with_parser(const sstring_view& cql, Func&& f) {
-    cql3_parser::CqlLexer::collector_type lexer_error_collector(cql);
-    cql3_parser::CqlParser::collector_type parser_error_collector(cql);
-    cql3_parser::CqlLexer::InputStreamType input{reinterpret_cast<const ANTLR_UINT8*>(cql.begin()), ANTLR_ENC_UTF8, static_cast<ANTLR_UINT32>(cql.size()), nullptr};
-    cql3_parser::CqlLexer lexer{&input};
-    lexer.set_error_listener(lexer_error_collector);
-    cql3_parser::CqlParser::TokenStreamType tstream(ANTLR_SIZE_HINT, lexer.get_tokSource());
-    cql3_parser::CqlParser parser{&tstream};
-    parser.set_error_listener(parser_error_collector);
-    auto result = f(parser);
-    return result;
+    std::optional<Result> ret;
+    do_with_parser_impl(cql, [&] (cql3_parser::CqlParser& parser) {
+        ret.emplace(f(parser));
+    });
+    return std::move(*ret);
 }
 
 template<typename Range> // Range<cql3::relation_ptr>
@@ -79,6 +77,10 @@ std::unique_ptr<cql3::statements::raw::select_statement> build_select_statement(
 /// Quoting involves wrapping the string in double-quotes ("). A double-quote
 /// character itself is quoted by doubling it.
 sstring maybe_quote(const sstring& s);
+
+// Check whether timestamp is not too far in the future as this probably
+// indicates its incorrectness (for example using other units than microseconds).
+void validate_timestamp(const query_options& options, const std::unique_ptr<attributes>& attrs);
 
 } // namespace util
 

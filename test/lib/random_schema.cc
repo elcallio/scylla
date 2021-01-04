@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <boost/algorithm/string/join.hpp>
@@ -135,7 +124,7 @@ private:
         unsigned id;
         do {
             id = id_dist(engine);
-        } while (used_ids.count(id));
+        } while (used_ids.contains(id));
 
         used_ids.insert(id);
         return id;
@@ -210,17 +199,6 @@ std::unique_ptr<random_schema_specification> make_random_schema_specification(
 
 namespace {
 
-// Picks a random subset of size `m` from the set {0, ..., `n` - 1}.
-std::vector<unsigned> random_subset(unsigned n, unsigned m, std::mt19937& engine) {
-    assert(m <= n);
-
-    std::vector<unsigned> the_set(n);
-    std::iota(the_set.begin(), the_set.end(), 0u);
-    std::shuffle(the_set.begin(), the_set.end(), engine);
-
-    return {the_set.begin(), the_set.begin() + m};
-}
-
 utils::multiprecision_int generate_multiprecision_integer_value(std::mt19937& engine, size_t max_size_in_bytes) {
     using utils::multiprecision_int;
 
@@ -280,7 +258,7 @@ data_model::mutation_description::collection generate_user_value(std::mt19937& e
 
     // Non-null fields.
     auto fields_num = std::uniform_int_distribution<size_t>(1, type.size())(engine);
-    auto field_idxs = random_subset(type.size(), fields_num, engine);
+    auto field_idxs = random::random_subset<unsigned>(type.size(), fields_num, engine);
     std::sort(field_idxs.begin(), field_idxs.end());
 
     md::collection collection;

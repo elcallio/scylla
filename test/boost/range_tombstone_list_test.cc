@@ -19,6 +19,8 @@
 #include "test/boost/range_tombstone_list_assertions.hh"
 #include "test/lib/log.hh"
 
+#include <seastar/util/defer.hh>
+
 static thread_local schema_ptr s = schema_builder("ks", "cf")
         .with_column("pk", int32_type, column_kind::partition_key)
         .with_column("ck1", int32_type, column_kind::clustering_key)
@@ -409,43 +411,58 @@ static std::uniform_int_distribution<int32_t> dist(0, 50);
 
 static std::vector<range_tombstone> make_random() {
     std::vector<range_tombstone> rts;
+    bound_view::compare less(*s);
+    position_in_partition::tri_compare cmp(*s);
 
-    int32_t prev_end = 0;
-    bool prev_end_incl = false;
+    auto make_random_ckey = [] {
+        if (dist(gen) % 2 == 0) {
+            return key({dist(gen)});
+        } else {
+            return key({dist(gen), dist(gen)});
+        }
+    };
+
     int32_t size = dist(gen) + 7;
     for (int32_t i = 0; i < size; ++i) {
-        int32_t next_start = prev_end + dist(gen);
-        int32_t next_end = next_start + dist(gen);
+        clustering_key_prefix start_key = make_random_ckey();
+        clustering_key_prefix end_key = make_random_ckey();
 
         bool start_incl = dist(gen) > 25;
         bool end_incl = dist(gen) > 25;
 
-        if (prev_end == next_start) {
-            start_incl = !prev_end_incl;
+        auto x = cmp(start_key, end_key);
+        if (x == 0) {
+            start_incl = end_incl = true;
+        } else if (x > 0) {
+            std::swap(start_key, end_key);
         }
 
-        if (next_start == next_end) {
-            if (start_incl) {
-                end_incl = true;
-            } else {
-                next_end += 1;
+        bound_view start_b = bound_view(start_key, start_incl ? bound_kind::incl_start : bound_kind::excl_start);
+        bound_view end_b = bound_view(end_key, end_incl ? bound_kind::incl_end : bound_kind::excl_end);
+        if (less(end_b, start_b)) {
+            /*
+             * Despite the start key is less (or equal) than the end one there's still
+             * a chance to get the invalid range like this
+             *
+             *  { k0 ; excl } ... { k0.k1 ; anything }
+             *
+             * The guy is fixable by making the start bound inclusive.
+             */
+            start_b = bound_view(start_key, bound_kind::incl_start);
+            if (less(end_b, start_b)) {
+                std::cout << "Unfixable slice " << start_b << " ... " << end_b << std::endl;
+                std::abort();
             }
         }
 
-        rts.emplace_back(key({next_start}),
-                start_incl ? bound_kind::incl_start: bound_kind::excl_start,
-                key({next_end}),
-                end_incl ? bound_kind::incl_end: bound_kind::excl_end,
-                tombstone(dist(gen), gc_now));
-
-        prev_end = next_end;
-        prev_end_incl = end_incl;
+        rts.emplace_back(std::move(start_b), std::move(end_b), tombstone(dist(gen), gc_now));
     }
+
     return rts;
 }
 
-BOOST_AUTO_TEST_CASE(test_add_random) {
-    for (uint32_t i = 0; i < 1000; ++i) {
+BOOST_AUTO_TEST_CASE(test_random_list_is_not_overlapped) {
+    for (uint32_t i = 0; i < 2000; ++i) {
         auto input = make_random();
         range_tombstone_list l(*s);
         for (auto&& rt : input) {
@@ -826,33 +843,26 @@ BOOST_AUTO_TEST_CASE(test_exception_safety) {
     expected.apply(*s, to_apply);
 
     // test apply_monotonically()
-    auto&& injector = memory::local_failure_injector();
-    uint64_t i = 0;
-    do {
+    memory::with_allocation_failures([&] () {
         auto list = original;
-        try {
-            injector.fail_after(i++);
-            list.apply_monotonically(*s, to_apply);
-            injector.cancel();
-            assert_that(*s, list).is_equal_to(expected);
-        } catch (const std::bad_alloc&) { // expected
+        auto d = defer([&] {
+            memory::scoped_critical_alloc_section dfg;
             assert_that(*s, list).has_no_less_information_than(original);
-        }
-    } while (injector.failed());
+        });
+        list.apply_monotonically(*s, to_apply);
+        assert_that(*s, list).is_equal_to(expected);
+    });
 
     // test apply_reversibly()
-    i = 0;
-    do {
+    memory::with_allocation_failures([&] () {
         auto list = original;
-        try {
-            injector.fail_after(i++);
-            list.apply_reversibly(*s, to_apply).cancel();
-            injector.cancel();
-            assert_that(*s, list).is_equal_to(expected);
-        } catch (const std::bad_alloc&) { // expected
+        auto d = defer([&] () {
+            memory::scoped_critical_alloc_section dfg;
             assert_that(*s, list).is_equal_to_either(original, expected);
-        }
-    } while (injector.failed());
+        });
+        list.apply_reversibly(*s, to_apply).cancel();
+        assert_that(*s, list).is_equal_to(expected);
+    });
 }
 
 BOOST_AUTO_TEST_CASE(test_accumulator) {

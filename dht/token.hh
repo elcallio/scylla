@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -81,11 +70,11 @@ public:
         }
     }
 
-    bool is_minimum() const {
+    bool is_minimum() const noexcept {
         return _kind == kind::before_all_keys;
     }
 
-    bool is_maximum() const {
+    bool is_maximum() const noexcept {
         return _kind == kind::after_all_keys;
     }
 
@@ -160,10 +149,61 @@ public:
         return 0;  // hardcoded for now; unlikely to change
     }
 
+    int64_t raw() const noexcept {
+        if (is_minimum()) {
+            return std::numeric_limits<int64_t>::min();
+        }
+        if (is_maximum()) {
+            return std::numeric_limits<int64_t>::max();
+        }
+
+        return _data;
+    }
 };
 
-const token& minimum_token();
-const token& maximum_token();
+static inline int tri_compare_raw(const int64_t l1, const int64_t l2) noexcept {
+    if (l1 == l2) {
+        return 0;
+    } else {
+        return l1 < l2 ? -1 : 1;
+    }
+}
+
+template <typename T>
+concept TokenCarrier = requires (const T& v) {
+    { v.token() } noexcept -> std::same_as<const token&>;
+};
+
+struct raw_token_less_comparator {
+    bool operator()(const int64_t k1, const int64_t k2) const noexcept {
+        return dht::tri_compare_raw(k1, k2) < 0;
+    }
+
+    template <typename Key>
+    requires TokenCarrier<Key>
+    bool operator()(const Key& k1, const int64_t k2) const noexcept {
+        return dht::tri_compare_raw(k1.token().raw(), k2) < 0;
+    }
+
+    template <typename Key>
+    requires TokenCarrier<Key>
+    bool operator()(const int64_t k1, const Key& k2) const noexcept {
+        return dht::tri_compare_raw(k1, k2.token().raw()) < 0;
+    }
+
+    template <typename Key>
+    requires TokenCarrier<Key>
+    int64_t simplify_key(const Key& k) const noexcept {
+        return k.token().raw();
+    }
+
+    int64_t simplify_key(int64_t k) const noexcept {
+        return k;
+    }
+};
+
+const token& minimum_token() noexcept;
+const token& maximum_token() noexcept;
 int tri_compare(const token& t1, const token& t2);
 inline bool operator==(const token& t1, const token& t2) { return tri_compare(t1, t2) == 0; }
 inline bool operator<(const token& t1, const token& t2) { return tri_compare(t1, t2) < 0; }

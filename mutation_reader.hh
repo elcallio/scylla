@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -30,21 +19,6 @@
 #include "tracing/trace_state.hh"
 #include "flat_mutation_reader.hh"
 #include "reader_concurrency_semaphore.hh"
-
-namespace mutation_reader {
-    // mutation_reader::forwarding determines whether fast_forward_to() may
-    // be used on the mutation reader to change the partition range being
-    // read. Enabling forwarding also changes read policy: forwarding::no
-    // means we will stop reading from disk at the end of the given range,
-    // but with forwarding::yes we may read ahead, anticipating the user to
-    // make a small skip with fast_forward_to() and continuing to read.
-    //
-    // Note that mutation_reader::forwarding is similarly name but different
-    // from streamed_mutation::forwarding - the former is about skipping to
-    // a different partition range, while the latter is about skipping
-    // inside a large partition.
-    using forwarding = flat_mutation_reader::partition_range_forwarding;
-}
 
 class reader_selector {
 protected:
@@ -69,32 +43,33 @@ public:
 // Returns mutation of the same schema only when all readers return mutations
 // of the same schema.
 flat_mutation_reader make_combined_reader(schema_ptr schema,
+        reader_permit permit,
         std::vector<flat_mutation_reader>,
         streamed_mutation::forwarding fwd_sm = streamed_mutation::forwarding::no,
         mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
 flat_mutation_reader make_combined_reader(schema_ptr schema,
+        reader_permit permit,
         std::unique_ptr<reader_selector>,
         streamed_mutation::forwarding,
         mutation_reader::forwarding);
 flat_mutation_reader make_combined_reader(schema_ptr schema,
+        reader_permit permit,
         flat_mutation_reader&& a,
         flat_mutation_reader&& b,
         streamed_mutation::forwarding fwd_sm = streamed_mutation::forwarding::no,
         mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
 
 template <typename MutationFilter>
-GCC6_CONCEPT(
-    requires requires(MutationFilter mf, const dht::decorated_key& dk) {
-        { mf(dk) } -> bool;
-    }
-)
+requires requires(MutationFilter mf, const dht::decorated_key& dk) {
+    { mf(dk) } -> std::same_as<bool>;
+}
 class filtering_reader : public flat_mutation_reader::impl {
     flat_mutation_reader _rd;
     MutationFilter _filter;
     static_assert(std::is_same<bool, std::result_of_t<MutationFilter(const dht::decorated_key&)>>::value, "bad MutationFilter signature");
 public:
     filtering_reader(flat_mutation_reader rd, MutationFilter&& filter)
-        : impl(rd.schema())
+        : impl(rd.schema(), rd.permit())
         , _rd(std::move(rd))
         , _filter(std::forward<MutationFilter>(filter)) {
     }
@@ -132,9 +107,6 @@ public:
         forward_buffer_to(pr.start());
         _end_of_stream = false;
         return _rd.fast_forward_to(std::move(pr), timeout);
-    }
-    virtual size_t buffer_size() const override {
-        return flat_mutation_reader::impl::buffer_size() + _rd.buffer_size();
     }
 };
 
@@ -188,8 +160,8 @@ private:
     friend class optimized_optional<mutation_source>;
 public:
     mutation_source(flat_reader_factory_type fn, std::function<partition_presence_checker()> pcf = [] { return make_default_partition_presence_checker(); })
-        : _fn(make_lw_shared(std::move(fn)))
-        , _presence_checker_factory(make_lw_shared(std::move(pcf)))
+        : _fn(make_lw_shared<flat_reader_factory_type>(std::move(fn)))
+        , _presence_checker_factory(make_lw_shared<std::function<partition_presence_checker()>>(std::move(pcf)))
     { }
 
     // For sources which don't care about the mutation_reader::forwarding flag (always fast forwardable)
@@ -268,7 +240,7 @@ public:
     flat_mutation_reader
     make_reader(
         schema_ptr s,
-        reader_permit permit = no_reader_permit(),
+        reader_permit permit,
         partition_range range = query::full_partition_range) const
     {
         auto& full_slice = s->full_slice();
@@ -306,6 +278,8 @@ public:
 mutation_source make_empty_mutation_source();
 snapshot_source make_empty_snapshot_source();
 
+extern const ssize_t new_reader_base_cost;
+
 // Creates a restricted reader whose resource usages will be tracked
 // during it's lifetime. If there are not enough resources (dues to
 // existing readers) to create the new reader, it's construction will
@@ -315,9 +289,10 @@ snapshot_source make_empty_snapshot_source();
 // a semaphore to track and limit the memory usage of readers. It also
 // contains a timeout and a maximum queue size for inactive readers
 // whose construction is blocked.
-flat_mutation_reader make_restricted_flat_reader(reader_concurrency_semaphore& semaphore,
+flat_mutation_reader make_restricted_flat_reader(
         mutation_source ms,
         schema_ptr s,
+        reader_permit permit,
         const dht::partition_range& range,
         const query::partition_slice& slice,
         const io_priority_class& pc = default_priority_class(),
@@ -325,12 +300,13 @@ flat_mutation_reader make_restricted_flat_reader(reader_concurrency_semaphore& s
         streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
         mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
 
-inline flat_mutation_reader make_restricted_flat_reader(reader_concurrency_semaphore& semaphore,
+inline flat_mutation_reader make_restricted_flat_reader(
                                               mutation_source ms,
                                               schema_ptr s,
+                                              reader_permit permit,
                                               const dht::partition_range& range = query::full_partition_range) {
     auto& full_slice = s->full_slice();
-    return make_restricted_flat_reader(semaphore, std::move(ms), std::move(s), range, full_slice);
+    return make_restricted_flat_reader(std::move(ms), std::move(s), std::move(permit), range, full_slice);
 }
 
 using mutation_source_opt = optimized_optional<mutation_source>;
@@ -369,8 +345,67 @@ stable_flattened_mutations_consumer<FlattenedConsumer> make_stable_flattened_mut
 /// is called) there is no need to wrap it in foreign_reader, just return it as
 /// is.
 flat_mutation_reader make_foreign_reader(schema_ptr schema,
+        reader_permit permit,
         foreign_ptr<std::unique_ptr<flat_mutation_reader>> reader,
         streamed_mutation::forwarding fwd_sm = streamed_mutation::forwarding::no);
+
+/// Make an auto-paused evictable reader.
+///
+/// The reader is paused after each use, that is after each call to any of its
+/// members that cause actual reading to be done (`fill_buffer()` and
+/// `fast_forward_to()`). When paused, the reader is made evictable, that it is
+/// it is registered with reader concurrency semaphore as an inactive read.
+/// The reader is resumed automatically on the next use. If it was evicted, it
+/// will be recreated at the position it left off reading. This is all
+/// transparent to its user.
+/// Parameters passed by reference have to be kept alive while the reader is
+/// alive.
+flat_mutation_reader make_auto_paused_evictable_reader(
+        mutation_source ms,
+        schema_ptr schema,
+        reader_permit permit,
+        const dht::partition_range& pr,
+        const query::partition_slice& ps,
+        const io_priority_class& pc,
+        tracing::trace_state_ptr trace_state,
+        mutation_reader::forwarding fwd_mr);
+
+class evictable_reader;
+
+class evictable_reader_handle {
+    friend std::pair<flat_mutation_reader, evictable_reader_handle> make_manually_paused_evictable_reader(mutation_source, schema_ptr, reader_permit,
+            const dht::partition_range&, const query::partition_slice&, const io_priority_class&, tracing::trace_state_ptr, mutation_reader::forwarding);
+
+private:
+    evictable_reader* _r;
+
+private:
+    explicit evictable_reader_handle(evictable_reader& r);
+
+public:
+    void pause();
+};
+
+/// Make a manually-paused evictable reader.
+///
+/// The reader can be paused via the evictable reader handle when desired. The
+/// intended usage is subsequent reads done in bursts, after which the reader is
+/// not used for some time. When paused, the reader is made evictable, that is,
+/// it is registered with reader concurrency semaphore as an inactive read.
+/// The reader is resumed automatically on the next use. If it was evicted, it
+/// will be recreated at the position it left off reading. This is all
+/// transparent to its user.
+/// Parameters passed by reference have to be kept alive while the reader is
+/// alive.
+std::pair<flat_mutation_reader, evictable_reader_handle> make_manually_paused_evictable_reader(
+        mutation_source ms,
+        schema_ptr schema,
+        reader_permit permit,
+        const dht::partition_range& pr,
+        const query::partition_slice& ps,
+        const io_priority_class& pc,
+        tracing::trace_state_ptr trace_state,
+        mutation_reader::forwarding fwd_mr);
 
 /// Reader lifecycle policy for the mulitshard combining reader.
 ///
@@ -389,7 +424,7 @@ class reader_lifecycle_policy {
 public:
     struct stopped_reader {
         foreign_ptr<std::unique_ptr<reader_concurrency_semaphore::inactive_read_handle>> handle;
-        circular_buffer<mutation_fragment> unconsumed_fragments;
+        flat_mutation_reader::tracked_buffer unconsumed_fragments;
         bool has_pending_next_partition;
     };
 
@@ -409,6 +444,7 @@ public:
     /// remote shard stay alive, during the lifetime of the created reader.
     virtual flat_mutation_reader create_reader(
             schema_ptr schema,
+            reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
             const io_priority_class& pc,
@@ -485,6 +521,7 @@ public:
 flat_mutation_reader make_multishard_combining_reader(
         shared_ptr<reader_lifecycle_policy> lifecycle_policy,
         schema_ptr schema,
+        reader_permit permit,
         const dht::partition_range& pr,
         const query::partition_slice& ps,
         const io_priority_class& pc,
@@ -495,6 +532,7 @@ flat_mutation_reader make_multishard_combining_reader_for_tests(
         const dht::sharder& sharder,
         shared_ptr<reader_lifecycle_policy> lifecycle_policy,
         schema_ptr schema,
+        reader_permit permit,
         const dht::partition_range& pr,
         const query::partition_slice& ps,
         const io_priority_class& pc,
@@ -508,7 +546,7 @@ class queue_reader;
 /// `push_end_of_stream()` is called, the reader and the handle can be destroyed
 /// in any order. The reader can be destroyed at any time.
 class queue_reader_handle {
-    friend std::pair<flat_mutation_reader, queue_reader_handle> make_queue_reader(schema_ptr s);
+    friend std::pair<flat_mutation_reader, queue_reader_handle> make_queue_reader(schema_ptr, reader_permit);
     friend class queue_reader;
 
 private:
@@ -536,9 +574,12 @@ public:
     ///
     /// All future operations on the handle or the reader will raise `ep`.
     void abort(std::exception_ptr ep);
+
+    /// Checks if the queue is already terminated with either a success or failure (abort)
+    bool is_terminated() const;
 };
 
-std::pair<flat_mutation_reader, queue_reader_handle> make_queue_reader(schema_ptr s);
+std::pair<flat_mutation_reader, queue_reader_handle> make_queue_reader(schema_ptr s, reader_permit permit);
 
 /// Creates a compacting reader.
 ///
@@ -557,3 +598,65 @@ std::pair<flat_mutation_reader, queue_reader_handle> make_queue_reader(schema_pt
 /// supported.
 flat_mutation_reader make_compacting_reader(flat_mutation_reader source, gc_clock::time_point compaction_time,
         std::function<api::timestamp_type(const dht::decorated_key&)> get_max_purgeable);
+
+// A mutation reader together with an upper bound on the set of positions of fragments
+// that the reader will return. The upper bound does not need to be exact.
+struct reader_and_upper_bound {
+    flat_mutation_reader reader;
+    position_in_partition upper_bound;
+
+    reader_and_upper_bound(flat_mutation_reader r, position_in_partition bound)
+        : reader(std::move(r)), upper_bound(std::move(bound)) {}
+};
+
+// A queue of mutation readers returning fragments with the same schema from the same single partition.
+//
+// Intuitively, the order of returned readers is such that the positions of the first fragments
+// returned by the readers inside the partition (after `partition_start`) are ``mostly increasing''.
+//
+// More formally:
+// 1. The queue contains a sequence of readers.
+//    Each call to `pop` consumes a batch of readers from the sequence.
+// 2. Each position-in-partition `b` corresponds to a prefix of the sequence of readers in the queue.
+//    Let's call it `pref(b)`.
+// 3. If `b1 <= b2`, then `pref(b1)` is a prefix of `pref(b2)`.
+// 4. `pref(position_in_partition::after_all_clustered_rows())` is the entire sequence.
+// 5. For each `b`, `pop(b)` returns only readers from `pref(b)`.
+// 6. For each `b`, all readers that lie in the sequence after `pref(b)`
+//    satisfy the following property:
+//        the first fragment returned by the reader has a position greater than `b`.
+//    In other words, if `pop(b)` returns no readers, then we can be sure that all readers
+//    returned later by the queue return fragments with positions greater than `b`.
+//
+// Considering the above properties, a simple legal implementation of this interface would
+// return all readers on the first call to `pop(after_all_clustered_rows())` and would not return
+// any readers on `pop(b)` for `b < after_all_clustered_rows()`.
+//
+// Better implementations may use information about positions returned by the readers
+// to return some readers earlier, but they must not break property 6.
+// For example, the following scenario is illegal:
+// 1. pop(for_key(10)) returns r1
+// 2. pop(for_key(10)) returns no readers => all readers from pref(for_key(10)) have been popped
+// 3. pop(for_key(20)) returns r2 => due to the previous step we know that r2 is not in pref(for_key(10))
+// 4. the first fragment (excluding partition_start) returned by r2 has position for_key(10)
+//        => illegal, because for_key(10) is not greater than for_key(10).
+//        The first position returned by r2 must be after_key(10) or higher.
+//
+// With each reader also comes an upper bound on the set of positions of fragments that the reader will return.
+class position_reader_queue {
+public:
+    virtual ~position_reader_queue() = 0;
+
+    // `empty(b)` <=>
+    //      we have popped all readers from `pref(b)` so `pop(b)`
+    //      will not return any more readers.
+    virtual bool empty(position_in_partition_view bound) const = 0;
+
+    // Return the next batch of readers from `pref(b)`.
+    virtual std::vector<reader_and_upper_bound> pop(position_in_partition_view bound) = 0;
+};
+
+flat_mutation_reader make_clustering_combined_reader(schema_ptr schema,
+        reader_permit,
+        streamed_mutation::forwarding,
+        std::unique_ptr<position_reader_queue>);

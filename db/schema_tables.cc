@@ -30,7 +30,7 @@
 #include "db/schema_tables.hh"
 
 #include "service/migration_manager.hh"
-#include "service/storage_service.hh"
+#include "gms/feature_service.hh"
 #include "partition_slice_builder.hh"
 #include "dht/i_partitioner.hh"
 #include "system_keyspace.hh"
@@ -42,12 +42,12 @@
 #include "utils/UUID_gen.hh"
 #include <seastar/core/do_with.hh>
 #include <seastar/core/thread.hh>
-#include "json.hh"
 #include "log.hh"
 #include "frozen_schema.hh"
 #include "schema_registry.hh"
 #include "mutation_query.hh"
 #include "system_keyspace.hh"
+#include "system_distributed_keyspace.hh"
 #include "cql3/cql3_type.hh"
 #include "cql3/functions/functions.hh"
 #include "cql3/util.hh"
@@ -78,14 +78,26 @@
 #include "user_types_metadata.hh"
 
 #include "index/target_parser.hh"
-#include "service/storage_service.hh"
 #include "lua.hh"
+
+#include "db/query_context.hh"
+#include "serializer.hh"
+#include "idl/mutation.dist.hh"
+#include "serializer_impl.hh"
+#include "idl/mutation.dist.impl.hh"
+#include "db/system_keyspace.hh"
+#include "cql3/untyped_result_set.hh"
 
 using namespace db::system_keyspace;
 using namespace std::chrono_literals;
 
 
 static logging::logger diff_logger("schema_diff");
+
+static bool is_extra_durable(const sstring& ks_name, const sstring& cf_name) {
+    return (is_system_keyspace(ks_name) && db::system_keyspace::is_extra_durable(cf_name))
+        || (ks_name == db::system_distributed_keyspace::NAME && db::system_distributed_keyspace::is_extra_durable(cf_name));
+}
 
 
 /** system.schema_* tables used to store keyspace/table/type attributes prior to C* 3.0 */
@@ -94,6 +106,7 @@ namespace db {
 schema_ctxt::schema_ctxt(const db::config& cfg)
     : _extensions(cfg.extensions())
     , _murmur3_partitioner_ignore_msb_bits(cfg.murmur3_partitioner_ignore_msb_bits())
+    , _schema_registry_grace_period(cfg.schema_registry_grace_period())
 {}
 
 schema_ctxt::schema_ctxt(const database& db)
@@ -202,24 +215,24 @@ using namespace v3;
 
 using days = std::chrono::duration<int, std::ratio<24 * 3600>>;
 
-future<> save_system_schema(const sstring & ksname) {
-    auto& ks = db::qctx->db().find_keyspace(ksname);
+future<> save_system_schema(cql3::query_processor& qp, const sstring & ksname) {
+    auto& ks = qp.db().find_keyspace(ksname);
     auto ksm = ks.metadata();
 
     // delete old, possibly obsolete entries in schema tables
     return parallel_for_each(all_table_names(schema_features::full()), [ksm] (sstring cf) {
         auto deletion_timestamp = schema_creation_timestamp() - 1;
-        return db::execute_cql(format("DELETE FROM {}.{} USING TIMESTAMP {} WHERE keyspace_name = ?", NAME, cf,
+        return qctx->execute_cql(format("DELETE FROM {}.{} USING TIMESTAMP {} WHERE keyspace_name = ?", NAME, cf,
             deletion_timestamp), ksm->name()).discard_result();
-    }).then([ksm] {
+    }).then([ksm, &qp] {
         auto mvec  = make_create_keyspace_mutations(ksm, schema_creation_timestamp(), true);
-        return qctx->proxy().mutate_locally(std::move(mvec));
+        return qp.proxy().mutate_locally(std::move(mvec), tracing::trace_state_ptr());
     });
 }
 
 /** add entries to system_schema.* for the hardcoded system definitions */
-future<> save_system_keyspace_schema() {
-    return save_system_schema(NAME);
+future<> save_system_keyspace_schema(cql3::query_processor& qp) {
+    return save_system_schema(qp, NAME);
 }
 
 namespace v3 {
@@ -228,7 +241,7 @@ static constexpr auto schema_gc_grace = std::chrono::duration_cast<std::chrono::
 
 schema_ptr keyspaces() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, KEYSPACES), NAME, KEYSPACES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, KEYSPACES), NAME, KEYSPACES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -244,7 +257,7 @@ schema_ptr keyspaces() {
         utf8_type,
         // comment
         "keyspace definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build();
@@ -254,7 +267,7 @@ schema_ptr keyspaces() {
 
 schema_ptr tables() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, TABLES), NAME, TABLES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, TABLES), NAME, TABLES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -285,7 +298,7 @@ schema_ptr tables() {
         utf8_type,
         // comment
         "table definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build();
@@ -349,7 +362,7 @@ schema_ptr scylla_tables(schema_features features) {
 // VIEW" would list them - while it should only list real, selected, columns.
 
 static schema_ptr columns_schema(const char* columns_table_name) {
-    schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, columns_table_name), NAME, columns_table_name,
+    schema_builder builder(make_shared_schema(generate_legacy_id(NAME, columns_table_name), NAME, columns_table_name,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -368,7 +381,7 @@ static schema_ptr columns_schema(const char* columns_table_name) {
         utf8_type,
         // comment
         "column definitions"
-        )));
+        ));
     builder.set_gc_grace_seconds(schema_gc_grace);
     builder.with_version(generate_schema_version(builder.uuid()));
     return builder.build();
@@ -390,7 +403,7 @@ schema_ptr view_virtual_columns() {
 // is defined in column_computation.hh and system_schema docs.
 //
 static schema_ptr computed_columns_schema(const char* columns_table_name) {
-    schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, columns_table_name), NAME, columns_table_name,
+    schema_builder builder(make_shared_schema(generate_legacy_id(NAME, columns_table_name), NAME, columns_table_name,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -403,7 +416,7 @@ static schema_ptr computed_columns_schema(const char* columns_table_name) {
         utf8_type,
         // comment
         "computed columns"
-        )));
+        ));
     builder.set_gc_grace_seconds(schema_gc_grace);
     builder.with_version(generate_schema_version(builder.uuid()));
     return builder.build();
@@ -416,7 +429,7 @@ schema_ptr computed_columns() {
 
 schema_ptr dropped_columns() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, DROPPED_COLUMNS), NAME, DROPPED_COLUMNS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, DROPPED_COLUMNS), NAME, DROPPED_COLUMNS,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -432,7 +445,7 @@ schema_ptr dropped_columns() {
         utf8_type,
         // comment
         "dropped column registry"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build();
@@ -442,7 +455,7 @@ schema_ptr dropped_columns() {
 
 schema_ptr triggers() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, TRIGGERS), NAME, TRIGGERS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, TRIGGERS), NAME, TRIGGERS,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -457,7 +470,7 @@ schema_ptr triggers() {
         utf8_type,
         // comment
         "trigger definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build();
@@ -467,7 +480,7 @@ schema_ptr triggers() {
 
 schema_ptr views() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, VIEWS), NAME, VIEWS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, VIEWS), NAME, VIEWS,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -501,7 +514,7 @@ schema_ptr views() {
         utf8_type,
         // comment
         "view definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build();
@@ -511,7 +524,7 @@ schema_ptr views() {
 
 schema_ptr indexes() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, INDEXES), NAME, INDEXES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, INDEXES), NAME, INDEXES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -527,7 +540,7 @@ schema_ptr indexes() {
         utf8_type,
         // comment
         "secondary index definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build();
@@ -537,7 +550,7 @@ schema_ptr indexes() {
 
 schema_ptr types() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, TYPES), NAME, TYPES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, TYPES), NAME, TYPES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -553,7 +566,7 @@ schema_ptr types() {
         utf8_type,
         // comment
         "user defined type definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build();
@@ -563,7 +576,7 @@ schema_ptr types() {
 
 schema_ptr functions() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, FUNCTIONS), NAME, FUNCTIONS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, FUNCTIONS), NAME, FUNCTIONS,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -582,7 +595,7 @@ schema_ptr functions() {
         utf8_type,
         // comment
         "user defined function definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build();
@@ -592,7 +605,7 @@ schema_ptr functions() {
 
 schema_ptr aggregates() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, AGGREGATES), NAME, AGGREGATES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, AGGREGATES), NAME, AGGREGATES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -611,12 +624,44 @@ schema_ptr aggregates() {
         utf8_type,
         // comment
         "user defined aggregate definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build();
     }();
     return schema;
+}
+
+schema_ptr scylla_table_schema_history() {
+    static thread_local auto s = [] {
+        schema_builder builder(make_lw_shared(schema(
+            generate_legacy_id(db::system_keyspace::NAME, SCYLLA_TABLE_SCHEMA_HISTORY), db::system_keyspace::NAME, SCYLLA_TABLE_SCHEMA_HISTORY,
+            // partition key
+            {{"cf_id", uuid_type}},
+            // clustering key
+            {{"schema_version", uuid_type}, {"column_name", utf8_type}},
+            // regular columns
+            // mirrors the structure of the "columns" table which is essentially
+            // needed to represent a column mapping in serialized form
+            {
+                {"clustering_order", utf8_type},
+                {"column_name_bytes", bytes_type},
+                {"kind", utf8_type},
+                {"position", int32_type},
+                {"type", utf8_type},
+            },
+            // static columns
+            {},
+            // regular column name type
+            utf8_type,
+            // comment
+            "Scylla specific table to store a history of column mappings "
+            "for each table schema version upon an CREATE TABLE/ALTER TABLE operations"
+        )));
+        builder.with_version(generate_schema_version(builder.uuid()));
+        return builder.build(schema_builder::compact_storage::no);
+    }();
+    return s;
 }
 
 }
@@ -748,7 +793,7 @@ future<mutation> query_partition_mutation(service::storage_proxy& proxy,
 {
     auto dk = dht::decorate_key(*s, pkey);
     return do_with(dht::partition_range::make_singular(dk), [&proxy, dk, s = std::move(s), cmd = std::move(cmd)] (auto& range) {
-        return proxy.query_mutations_locally(s, std::move(cmd), range, db::no_timeout)
+        return proxy.query_mutations_locally(s, std::move(cmd), range, db::no_timeout, tracing::trace_state_ptr{})
                 .then([dk = std::move(dk), s](rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> res_hit_rate) {
                     auto&& [res, hit_rate] = res_hit_rate;
                     auto&& partitions = res->partitions();
@@ -783,7 +828,8 @@ read_schema_partition_for_table(distributed<service::storage_proxy>& proxy, sche
     auto slice = partition_slice_builder(*schema)
             .with_range(std::move(clustering_range))
             .build();
-    auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), query::max_rows);
+    auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), proxy.local().get_max_result_size(slice),
+            query::row_limit(query::max_rows));
     return query_partition_mutation(proxy.local(), std::move(schema), std::move(cmd), std::move(keyspace_key));
 }
 
@@ -791,7 +837,8 @@ future<mutation>
 read_keyspace_mutation(distributed<service::storage_proxy>& proxy, const sstring& keyspace_name) {
     schema_ptr s = keyspaces();
     auto key = partition_key::from_singular(*s, keyspace_name);
-    auto cmd = make_lw_shared<query::read_command>(s->id(), s->version(), s->full_slice());
+    auto slice = s->full_slice();
+    auto cmd = make_lw_shared<query::read_command>(s->id(), s->version(), std::move(slice), proxy.local().get_max_result_size(slice));
     return query_partition_mutation(proxy.local(), std::move(s), std::move(cmd), std::move(key));
 }
 
@@ -803,6 +850,19 @@ future<> merge_lock() {
 
 future<> merge_unlock() {
     return smp::submit_to(0, [] { the_merge_lock.signal(); });
+}
+
+static
+future<> update_schema_version_and_announce(distributed<service::storage_proxy>& proxy, schema_features features) {
+    return calculate_schema_digest(proxy, features).then([&proxy] (utils::UUID uuid) {
+        return db::system_keyspace::update_schema_version(uuid).then([&proxy, uuid] {
+            return proxy.local().get_db().invoke_on_all([uuid] (database& db) {
+                db.update_version(uuid);
+            });
+        }).then([uuid] {
+            slogger.info("Schema version changed to {}", uuid);
+        });
+    });
 }
 
 /**
@@ -820,6 +880,14 @@ future<> merge_schema(distributed<service::storage_proxy>& proxy, gms::feature_s
         return do_merge_schema(proxy, std::move(mutations), true).then([&proxy, &feat] {
             return update_schema_version_and_announce(proxy, feat.cluster_schema_features());
         });
+    }).finally([] {
+        return merge_unlock();
+    });
+}
+
+future<> recalculate_schema_version(distributed<service::storage_proxy>& proxy, gms::feature_service& feat) {
+    return merge_lock().then([&proxy, &feat] {
+        return update_schema_version_and_announce(proxy, feat.cluster_schema_features());
     }).finally([] {
         return merge_unlock();
     });
@@ -903,6 +971,64 @@ static void delete_schema_version(mutation& m) {
     }
 }
 
+/// Helper function which fills a given mutation with column information
+/// provided the corresponding column_definition object.
+static void fill_column_info(const schema& table,
+                             const clustering_key& ckey,
+                             const column_definition& column,
+                             api::timestamp_type timestamp,
+                             ttl_opt ttl,
+                             mutation& m) {
+    auto order = "NONE";
+    if (column.is_clustering_key()) {
+        order = "ASC";
+    }
+    auto type = column.type;
+    if (type->is_reversed()) {
+        type = type->underlying_type();
+        if (column.is_clustering_key()) {
+            order = "DESC";
+        }
+    }
+    int32_t pos = -1;
+    if (column.is_primary_key()) {
+        pos = table.position(column);
+    }
+
+    m.set_clustered_cell(ckey, "column_name_bytes", data_value(column.name()), timestamp, ttl);
+    m.set_clustered_cell(ckey, "kind", serialize_kind(column.kind), timestamp, ttl);
+    m.set_clustered_cell(ckey, "position", pos, timestamp, ttl);
+    m.set_clustered_cell(ckey, "clustering_order", sstring(order), timestamp, ttl);
+    m.set_clustered_cell(ckey, "type", type->as_cql3_type().to_string(), timestamp, ttl);
+}
+
+future<> store_column_mapping(distributed<service::storage_proxy>& proxy, schema_ptr s, bool with_ttl) {
+    // Skip "system*" tables -- only user-related tables are relevant
+    if (static_cast<std::string_view>(s->ks_name()).starts_with(db::system_keyspace::NAME)) {
+        return make_ready_future<>();
+    }
+    schema_ptr history_tbl = scylla_table_schema_history();
+
+    // Insert the new column mapping for a given schema version (without TTL)
+    std::vector<mutation> muts;
+    partition_key pk = partition_key::from_exploded(*history_tbl, {uuid_type->decompose(s->id())});
+
+    ttl_opt ttl;
+    if (with_ttl) {
+        ttl = gc_clock::duration(DEFAULT_GC_GRACE_SECONDS);
+    }
+    // Use one timestamp for all mutations for the ease of debugging
+    const auto ts = api::new_timestamp();
+    for (const auto& cdef : boost::range::join(s->static_columns(), s->regular_columns())) {
+        mutation m(history_tbl, pk);
+        auto ckey = clustering_key::from_exploded(*history_tbl, {uuid_type->decompose(s->version()),
+                                                                 utf8_type->decompose(cdef.name_as_text())});
+        fill_column_info(*s, ckey, cdef, ts, ttl, m);
+        muts.emplace_back(std::move(m));
+    }
+    return proxy.local().mutate_locally(std::move(muts), tracing::trace_state_ptr());
+}
+
 static future<> do_merge_schema(distributed<service::storage_proxy>& proxy, std::vector<mutation> mutations, bool do_flush)
 {
    return seastar::async([&proxy, mutations = std::move(mutations), do_flush] () mutable {
@@ -929,7 +1055,7 @@ static future<> do_merge_schema(distributed<service::storage_proxy>& proxy, std:
        /*auto& old_aggregates = */read_schema_for_keyspaces(proxy, AGGREGATES, keyspaces).get0();
 #endif
 
-       proxy.local().mutate_locally(std::move(mutations)).get0();
+       proxy.local().mutate_locally(std::move(mutations), tracing::trace_state_ptr()).get0();
 
        if (do_flush) {
            proxy.local().get_db().invoke_on_all([s, cfs = std::move(column_families)] (database& db) {
@@ -1030,8 +1156,13 @@ struct schema_diff {
         }};
     };
 
+    struct altered_schema {
+        global_schema_ptr old_schema;
+        global_schema_ptr new_schema;
+    };
+
     std::vector<global_schema_ptr> created;
-    std::vector<global_schema_ptr> altered;
+    std::vector<altered_schema> altered;
     std::vector<dropped_schema> dropped;
 
     size_t size() const {
@@ -1057,9 +1188,10 @@ static schema_diff diff_table_or_view(distributed<service::storage_proxy>& proxy
         d.created.emplace_back(s);
     }
     for (auto&& key : diff.entries_differing) {
+        auto s_before = create_schema(std::move(before.at(key)));
         auto s = create_schema(std::move(after.at(key)));
         slogger.info("Altering {}.{} id={} version={}", s->ks_name(), s->cf_name(), s->id(), s->version());
-        d.altered.emplace_back(s);
+        d.altered.emplace_back(schema_diff::altered_schema{s_before, s});
     }
     return d;
 }
@@ -1095,7 +1227,7 @@ static void merge_tables_and_views(distributed<service::storage_proxy>& proxy,
                 auto& s = *dt.schema.get();
                 return db.drop_column_family(s.ks_name(), s.cf_name(), [&] { return dt.jp.value(); });
             }).get();
-            
+
             // In order to avoid possible races we first create the tables and only then the views.
             // That way if a view seeks information about its base table it's guarantied to find it.
             parallel_for_each(tables_diff.created, [&] (global_schema_ptr& gs) {
@@ -1109,8 +1241,8 @@ static void merge_tables_and_views(distributed<service::storage_proxy>& proxy,
             }
             std::vector<bool> columns_changed;
             columns_changed.reserve(tables_diff.altered.size() + views_diff.altered.size());
-            for (auto&& gs : boost::range::join(tables_diff.altered, views_diff.altered)) {
-                columns_changed.push_back(db.update_column_family(gs));
+            for (auto&& altered : boost::range::join(tables_diff.altered, views_diff.altered)) {
+                columns_changed.push_back(db.update_column_family(altered.new_schema));
             }
 
             auto it = columns_changed.begin();
@@ -1125,10 +1257,35 @@ static void merge_tables_and_views(distributed<service::storage_proxy>& proxy,
             notify(tables_diff.created, [&] (auto&& gs) { return db.get_notifier().create_column_family(gs); });
             notify(views_diff.created, [&] (auto&& gs) { return db.get_notifier().create_view(view_ptr(gs)); });
             // Table altering is notified first, in case new base columns appear
-            notify(tables_diff.altered, [&] (auto&& gs) { return db.get_notifier().update_column_family(gs, *it++); });
-            notify(views_diff.altered, [&] (auto&& gs) { return db.get_notifier().update_view(view_ptr(gs), *it++); });
+            notify(tables_diff.altered, [&] (auto&& altered) { return db.get_notifier().update_column_family(altered.new_schema, *it++); });
+            notify(views_diff.altered, [&] (auto&& altered) { return db.get_notifier().update_view(view_ptr(altered.new_schema), *it++); });
         });
     }).get();
+
+    // Insert column_mapping into history table for altered and created tables.
+    //
+    // Entries for new tables are inserted without TTL, which means that the most
+    // recent schema version should always be available.
+    //
+    // For altered tables we both insert a new column mapping without TTL and
+    // overwrite the previous version entries with TTL to expire them eventually.
+    //
+    // Drop column mapping entries for dropped tables since these will not be TTLed automatically
+    // and will stay there forever if we don't clean them up manually
+    when_all_succeed(
+        parallel_for_each(tables_diff.created, [&proxy] (global_schema_ptr& gs) {
+            return store_column_mapping(proxy, gs.get(), false);
+        }),
+        parallel_for_each(tables_diff.altered, [&proxy] (schema_diff::altered_schema& altered) {
+            return when_all_succeed(
+                store_column_mapping(proxy, altered.old_schema.get(), true),
+                store_column_mapping(proxy, altered.new_schema.get(), false)).discard_result();
+        }),
+        parallel_for_each(tables_diff.dropped, [&proxy] (schema_diff::dropped_schema& dropped) {
+            schema_ptr s = dropped.schema.get();
+            return drop_column_mapping(s->id(), s->version());
+        })
+    ).get();
 }
 
 static std::vector<const query::result_set_row*> collect_rows(const std::set<sstring>& keys, const schema_result& result) {
@@ -1220,7 +1377,7 @@ template <typename T> static std::vector<user_type> create_types(keyspace_metada
     // recreate them.
     for (const auto& p : ks.user_types().get_all_types()) {
         const user_type& t = p.second;
-        if (names.count(t->_name) != 0) {
+        if (names.contains(t->_name)) {
             continue;
         }
         for (const auto& name : names) {
@@ -1901,6 +2058,7 @@ static schema_mutations make_view_mutations(view_ptr view, api::timestamp_type t
 static void make_drop_table_or_view_mutations(schema_ptr schema_table, schema_ptr table_or_view, api::timestamp_type timestamp, std::vector<mutation>& mutations);
 
 static void make_update_indices_mutations(
+        database& db,
         schema_ptr old_table,
         schema_ptr new_table,
         api::timestamp_type timestamp,
@@ -1909,13 +2067,14 @@ static void make_update_indices_mutations(
     mutation indices_mutation(indexes(), partition_key::from_singular(*indexes(), old_table->ks_name()));
 
     auto diff = difference(old_table->all_indices(), new_table->all_indices());
+    bool new_token_column_computation = db.features().cluster_supports_correct_idx_token_in_secondary_index();
 
     // indices that are no longer needed
     for (auto&& name : diff.entries_only_on_left) {
         const index_metadata& index = old_table->all_indices().at(name);
         drop_index_from_schema_mutation(old_table, index, timestamp, mutations);
-        auto& cf = service::get_storage_proxy().local().get_db().local().find_column_family(old_table);
-        auto view = cf.get_index_manager().create_view_for_index(index);
+        auto& cf = db.find_column_family(old_table);
+        auto view = cf.get_index_manager().create_view_for_index(index, new_token_column_computation);
         make_drop_table_or_view_mutations(views(), view, timestamp, mutations);
     }
 
@@ -1923,8 +2082,8 @@ static void make_update_indices_mutations(
     for (auto&& name : boost::range::join(diff.entries_differing, diff.entries_only_on_right)) {
         const index_metadata& index = new_table->all_indices().at(name);
         add_index_to_schema_mutation(new_table, index, timestamp, indices_mutation);
-        auto& cf = service::get_storage_proxy().local().get_db().local().find_column_family(new_table);
-        auto view = cf.get_index_manager().create_view_for_index(index);
+        auto& cf = db.find_column_family(new_table);
+        auto view = cf.get_index_manager().create_view_for_index(index, new_token_column_computation);
         auto view_mutations = make_view_mutations(view, timestamp, true);
         view_mutations.copy_to(mutations);
     }
@@ -1997,7 +2156,8 @@ static void make_update_columns_mutations(schema_ptr old_table,
     }
 }
 
-std::vector<mutation> make_update_table_mutations(lw_shared_ptr<keyspace_metadata> keyspace,
+std::vector<mutation> make_update_table_mutations(database& db,
+    lw_shared_ptr<keyspace_metadata> keyspace,
     schema_ptr old_table,
     schema_ptr new_table,
     api::timestamp_type timestamp,
@@ -2005,7 +2165,7 @@ std::vector<mutation> make_update_table_mutations(lw_shared_ptr<keyspace_metadat
 {
     std::vector<mutation> mutations;
     add_table_or_view_to_schema_mutation(new_table, timestamp, false, mutations);
-    make_update_indices_mutations(old_table, new_table, timestamp, mutations);
+    make_update_indices_mutations(db, old_table, new_table, timestamp, mutations);
     make_update_columns_mutations(std::move(old_table), std::move(new_table), timestamp, from_thrift, mutations);
 
     warn(unimplemented::cause::TRIGGERS);
@@ -2079,7 +2239,7 @@ static future<schema_mutations> read_table_mutations(distributed<service::storag
         read_schema_partition_for_table(proxy, computed_columns(), table.keyspace_name, table.table_name),
         read_schema_partition_for_table(proxy, dropped_columns(), table.keyspace_name, table.table_name),
         read_schema_partition_for_table(proxy, indexes(), table.keyspace_name, table.table_name),
-        read_schema_partition_for_table(proxy, scylla_tables(), table.keyspace_name, table.table_name)).then(
+        read_schema_partition_for_table(proxy, scylla_tables(), table.keyspace_name, table.table_name)).then_unpack(
             [] (mutation cf_m, mutation col_m, mutation vv_col_m, mutation c_col_m, mutation dropped_m, mutation idx_m, mutation st_m) {
                 return schema_mutations{std::move(cf_m), std::move(col_m), std::move(vv_col_m), std::move(c_col_m), std::move(idx_m), std::move(dropped_m), std::move(st_m)};
             });
@@ -2172,22 +2332,22 @@ static void prepare_builder_from_table_row(const schema_ctxt& ctxt, schema_build
                 builder.set_compaction_strategy(sstables::compaction_strategy::type(i->second));
                 map.erase(i);
             } catch (const exceptions::configuration_exception& e) {
-                // If compaction strategy class isn't supported, fallback to size tiered.
-                slogger.warn("Falling back to size-tiered compaction strategy after the problem: {}", e.what());
-                builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+                // If compaction strategy class isn't supported, fallback to incremental.
+                slogger.warn("Falling back to incremental compaction strategy after the problem: {}", e.what());
+                builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
             }
         }
-        if (map.count("max_threshold")) {
+        if (map.contains("max_threshold")) {
             builder.set_max_compaction_threshold(std::stoi(map["max_threshold"]));
         }
-        if (map.count("min_threshold")) {
+        if (map.contains("min_threshold")) {
             builder.set_min_compaction_threshold(std::stoi(map["min_threshold"]));
         }
-        if (map.count("enabled")) {
+        if (map.contains("enabled")) {
             builder.set_compaction_enabled(boost::algorithm::iequals(map["enabled"], "true"));
         }
 
-        builder.set_compaction_strategy_options(map);
+        builder.set_compaction_strategy_options(std::move(map));
     }
 
     if (auto map = get_map<sstring, sstring>(table_row, "compression")) {
@@ -2361,7 +2521,7 @@ schema_ptr create_table_from_mutations(const schema_ctxt& ctxt, schema_mutations
         builder.with_sharder(smp::count, ctxt.murmur3_partitioner_ignore_msb_bits());
     }
 
-    if (is_system_keyspace(ks_name) && is_extra_durable(cf_name)) {
+    if (is_extra_durable(ks_name, cf_name)) {
         builder.set_wait_for_sync_to_commitlog(true);
     }
 
@@ -2379,28 +2539,7 @@ static void add_column_to_schema_mutation(schema_ptr table,
 {
     auto ckey = clustering_key::from_exploded(*m.schema(), {utf8_type->decompose(table->cf_name()),
                                                             utf8_type->decompose(column.name_as_text())});
-
-    auto order = "NONE";
-    if (column.is_clustering_key()) {
-        order = "ASC";
-    }
-    auto type = column.type;
-    if (type->is_reversed()) {
-        type = type->underlying_type();
-        if (column.is_clustering_key()) {
-            order = "DESC";
-        }
-    }
-    auto pos = -1;
-    if (column.is_primary_key()) {
-        pos = int32_t(table->position(column));
-    }
-
-    m.set_clustered_cell(ckey, "column_name_bytes", data_value(column.name()), timestamp);
-    m.set_clustered_cell(ckey, "kind", serialize_kind(column.kind), timestamp);
-    m.set_clustered_cell(ckey, "position", pos, timestamp);
-    m.set_clustered_cell(ckey, "clustering_order", sstring(order), timestamp);
-    m.set_clustered_cell(ckey, "type", type->as_cql3_type().to_string(), timestamp);
+    fill_column_info(*table, ckey, column, timestamp, std::nullopt, m);
 }
 
 static void add_computed_column_to_schema_mutation(schema_ptr table,
@@ -2585,12 +2724,12 @@ view_ptr create_view_from_mutations(const schema_ctxt& ctxt, schema_mutations sm
     auto computed_columns = get_computed_columns(sm);
     auto column_defs = create_columns_from_column_rows(query::result_set(sm.columns_mutation()), ks_name, cf_name, false, column_view_virtual::no, computed_columns);
     for (auto&& cdef : column_defs) {
-        builder.with_column(cdef);
+        builder.with_column_ordered(cdef);
     }
     if (sm.view_virtual_columns_mutation()) {
         column_defs = create_columns_from_column_rows(query::result_set(*sm.view_virtual_columns_mutation()), ks_name, cf_name, false, column_view_virtual::yes, computed_columns);
         for (auto&& cdef : column_defs) {
-            builder.with_column(cdef);
+            builder.with_column_ordered(cdef);
         }
     }
 
@@ -2918,10 +3057,6 @@ future<> maybe_update_legacy_secondary_index_mv_schema(service::migration_manage
     // format, where "token" is not marked as computed. Once we're sure that all indexes have their
     // columns marked as computed (because they were either created on a node that supports computed
     // columns or were fixed by this utility function), it's safe to remove this function altogether.
-    if (!db.features().cluster_supports_computed_columns()) {
-        return make_ready_future<>();
-    }
-
     if (v->clustering_key_size() == 0) {
         return make_ready_future<>();
     }
@@ -2935,10 +3070,10 @@ future<> maybe_update_legacy_secondary_index_mv_schema(service::migration_manage
     // If the first clustering key part of a view is a column with name not found in base schema,
     // it implies it might be backing an index created before computed columns were introduced,
     // and as such it must be recreated properly.
-    if (base_schema->columns_by_name().count(first_view_ck.name()) == 0) {
+    if (!base_schema->columns_by_name().contains(first_view_ck.name())) {
         schema_builder builder{schema_ptr(v)};
-        builder.mark_column_computed(first_view_ck.name(), std::make_unique<token_column_computation>());
-        return mm.announce_view_update(view_ptr(builder.build()), true);
+        builder.mark_column_computed(first_view_ck.name(), std::make_unique<legacy_token_column_computation>());
+        return mm.announce_view_update(view_ptr(builder.build()));
     }
     return make_ready_future<>();
 }
@@ -2966,6 +3101,74 @@ future<schema_mutations> read_table_mutations(distributed<service::storage_proxy
 }
 
 } // namespace legacy
+
+static auto GET_COLUMN_MAPPING_QUERY = format("SELECT column_name, clustering_order, column_name_bytes, kind, position, type FROM system.{} WHERE cf_id = ? AND schema_version = ?",
+    db::schema_tables::SCYLLA_TABLE_SCHEMA_HISTORY);
+
+future<column_mapping> get_column_mapping(utils::UUID table_id, table_schema_version version) {
+    auto cm_fut = qctx->qp().execute_internal(
+        GET_COLUMN_MAPPING_QUERY,
+        db::consistency_level::LOCAL_ONE,
+        infinite_timeout_config,
+        {table_id, version}
+    );
+    return cm_fut.then([version] (shared_ptr<cql3::untyped_result_set> results) {
+        if (results->empty()) {
+            // If we don't have a stored column_mapping for an obsolete schema version
+            // then it means it's way too old and been cleaned up already.
+            // Fail the whole learn stage in this case.
+            return make_exception_future<column_mapping>(std::runtime_error(
+                format("Failed to look up column mapping for schema version {}",
+                    version)));
+        }
+        std::vector<column_definition>  static_columns, regular_columns;
+        for (const auto& row : *results) {
+            auto kind = deserialize_kind(row.get_as<sstring>("kind"));
+            auto type = cql_type_parser::parse("" /*unused*/, row.get_as<sstring>("type"));
+            auto name_bytes = row.get_blob("column_name_bytes");
+            column_id position = row.get_as<int32_t>("position");
+
+            auto order = row.get_as<sstring>("clustering_order");
+            std::transform(order.begin(), order.end(), order.begin(), ::toupper);
+            if (order == "DESC") {
+                type = reversed_type_impl::get_instance(type);
+            }
+            if (kind == column_kind::static_column) {
+                static_columns.emplace_back(name_bytes, type, kind, position);
+            } else if (kind == column_kind::regular_column) {
+                regular_columns.emplace_back(name_bytes, type, kind, position);
+            }
+        }
+        std::vector<column_mapping_entry> cm_columns;
+        for (const column_definition& def : boost::range::join(static_columns, regular_columns)) {
+            cm_columns.emplace_back(column_mapping_entry{def.name(), def.type});
+        }
+        column_mapping cm(std::move(cm_columns), static_columns.size());
+        return make_ready_future<column_mapping>(std::move(cm));
+    });
+}
+
+future<bool> column_mapping_exists(utils::UUID table_id, table_schema_version version) {
+    return qctx->qp().execute_internal(
+        GET_COLUMN_MAPPING_QUERY,
+        db::consistency_level::LOCAL_ONE,
+        infinite_timeout_config,
+        {table_id, version}
+    ).then([] (shared_ptr<cql3::untyped_result_set> results) {
+        return !results->empty();
+    });
+}
+
+future<> drop_column_mapping(utils::UUID table_id, table_schema_version version) {
+    const static sstring DEL_COLUMN_MAPPING_QUERY =
+        format("DELETE FROM system.{} WHERE cf_id = ? and schema_version = ?",
+            db::schema_tables::SCYLLA_TABLE_SCHEMA_HISTORY);
+    return qctx->qp().execute_internal(
+        DEL_COLUMN_MAPPING_QUERY,
+        db::consistency_level::LOCAL_ONE,
+        infinite_timeout_config,
+        {table_id, version}).discard_result();
+}
 
 } // namespace schema_tables
 } // namespace schema

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -40,12 +29,17 @@
 
 namespace data {
 
-template<typename T>
-class value_writer;
-
 struct cell {
-    static constexpr size_t maximum_internal_storage_length = value_view::maximum_internal_storage_length;
-    static constexpr size_t maximum_external_chunk_length = value_view::maximum_external_chunk_length;
+    // We make the internal storage 1KB smaller for 2 reasons:
+    // * To ensure the cell storage doesn't exceed 8KB in total (and hence
+    //   reverts to a 16KB allocation, wasting a lot of space).
+    // * To make sure we can distinguish between external and internal storage
+    //   values based on size. External storage will practically store less than
+    //   8KB in chunks due to chunk header overhead. So in order to be able to
+    //   decide on size alone we need to leave sufficient room between the two.
+    static constexpr size_t maximum_internal_storage_length = 7 * 1024;
+    static constexpr size_t maximum_external_chunk_length = 8 * 1024;
+
 
     struct tags {
         class cell;
@@ -88,6 +82,133 @@ struct cell {
         tags::external_data
     >;
 
+    using fixed_value = imr::buffer<tags::fixed_value>;
+
+    using variable_value_data_variant = imr::variant<tags::value_data,
+        imr::member<tags::pointer, imr::tagged_type<tags::pointer, imr::pod<uint8_t*>>>,
+        imr::member<tags::data, imr::buffer<tags::data>>
+    >;
+
+    using variable_value_structure = imr::structure<
+        imr::member<tags::value_size, imr::pod<uint32_t>>,
+        imr::member<tags::value_data, variable_value_data_variant>
+    >;
+
+    /// Cell value
+    ///
+    /// The cell value can be either a deletion time (if the cell is dead),
+    /// a delta (counter update cell), fixed-size value or variable-sized value.
+    using value_variant = imr::variant<tags::value,
+        imr::member<tags::dead, imr::pod<int64_t>>,
+        imr::member<tags::counter_update, imr::pod<int64_t>>,
+        imr::member<tags::fixed_value, fixed_value>,
+        imr::member<tags::variable_value, variable_value_structure>
+    >;
+
+    template<typename FragmentRange>
+    class value_writer {
+        FragmentRange _value;
+
+        typename FragmentRange::const_iterator _value_it;
+        typename FragmentRange::const_iterator _value_end;
+        bytes_view _value_current;
+
+        size_t _value_size;
+        bool _force_internal;
+    private:
+        // Distinguishes between cell::make_live_uninitialized() and other
+        // cell::make_live*() variants.
+        static constexpr bool initialize_value() {
+            return !std::is_same_v<FragmentRange, empty_fragment_range>;
+        }
+
+        auto write_all_to_destination() {
+            if constexpr (initialize_value()) {
+                return [this] (uint8_t* out) noexcept {
+                    auto dst = reinterpret_cast<bytes_mutable_view::pointer>(out);
+                    while (_value_it != _value_end) {
+                        _value_current = *_value_it++;
+                        dst = std::copy_n(_value_current.data(), _value_current.size(), dst);
+                    }
+                };
+            } else {
+                return [] (uint8_t*) noexcept { };
+            }
+        }
+
+        auto write_to_destination(size_t n) {
+            if constexpr (initialize_value()) {
+                return [this, n] (uint8_t* out) mutable noexcept {
+                    auto dst = reinterpret_cast<bytes_mutable_view::pointer>(out);
+                    while (n) {
+                        if (_value_current.empty()) {
+                            ++_value_it;
+                            _value_current = *_value_it;
+                        }
+                        auto this_size = std::min(_value_current.size(), n);
+                        dst = std::copy_n(_value_current.data(), this_size, dst);
+                        _value_current.remove_prefix(this_size);
+                        n -= this_size;
+                    }
+                };
+            } else {
+                return [] (uint8_t*) noexcept { };
+            }
+        }
+    public:
+        value_writer(FragmentRange value, size_t value_size, bool force_internal)
+            : _value(std::move(value))
+            , _value_it(_value.begin())
+            , _value_end(_value.end())
+            , _value_current(_value.empty() ? bytes_view() : *_value_it)
+            , _value_size(value_size)
+            , _force_internal(force_internal)
+        { }
+
+        template<typename Serializer, typename Allocator>
+        requires (imr::is_sizer_for_v<variable_value_structure, Serializer>
+                && std::is_same_v<Allocator, imr::alloc::object_allocator::sizer>)
+            || (imr::is_serializer_for_v<variable_value_structure, Serializer>
+                && std::is_same_v<Allocator, imr::alloc::object_allocator::serializer>)
+        auto operator()(Serializer serializer, Allocator allocations) {
+            auto after_size = serializer.serialize(_value_size);
+            if (_force_internal || _value_size <= cell::maximum_internal_storage_length) {
+                return after_size
+                    .template serialize_as<cell::tags::data>(_value_size, write_all_to_destination())
+                    .done();
+            }
+
+            imr::placeholder<imr::pod<uint8_t*>> next_pointer_phldr;
+            auto next_pointer_position = after_size.position();
+            auto cell_ser = after_size.template serialize_as<cell::tags::pointer>(next_pointer_phldr);
+
+            auto offset = 0;
+            auto migrate_fn_ptr = &cell::lsa_chunk_migrate_fn;
+            while (_value_size - offset > cell::effective_external_chunk_length) {
+                imr::placeholder<imr::pod<uint8_t*>> phldr;
+                auto chunk_ser = allocations.template allocate_nested<cell::external_chunk>(migrate_fn_ptr)
+                        .serialize(next_pointer_position);
+                next_pointer_position = chunk_ser.position();
+                next_pointer_phldr.serialize(
+                    chunk_ser.serialize(phldr)
+                            .serialize(cell::effective_external_chunk_length, write_to_destination(cell::effective_external_chunk_length))
+                            .done()
+                );
+                next_pointer_phldr = phldr;
+                offset += cell::effective_external_chunk_length;
+            }
+
+            size_t left = _value_size - offset;
+            auto ptr = allocations.template allocate_nested<cell::external_last_chunk>(&cell::lsa_last_chunk_migrate_fn)
+                    .serialize(next_pointer_position)
+                    .serialize(left)
+                    .serialize(left, write_to_destination(left))
+                    .done();
+            next_pointer_phldr.serialize(ptr);
+            return cell_ser.done();
+        }
+    };
+
     /// Variable-length cell value
     ///
     /// This is a definition of the IMR structure of a variable-length value.
@@ -96,15 +217,8 @@ struct cell {
     /// smaller or equal maximum_internal_storage_length or externally if it
     /// larger.
     struct variable_value {
-        using data_variant = imr::variant<tags::value_data,
-            imr::member<tags::pointer, imr::tagged_type<tags::pointer, imr::pod<uint8_t*>>>,
-            imr::member<tags::data, imr::buffer<tags::data>>
-        >;
-
-        using structure = imr::structure<
-            imr::member<tags::value_size, imr::pod<uint32_t>>,
-            imr::member<tags::value_data, data_variant>
-        >;
+        using data_variant = variable_value_data_variant;
+        using structure = variable_value_structure;
 
         /// Create writer of a variable-size value
         ///
@@ -156,17 +270,6 @@ struct cell {
         }
     };
 
-    using fixed_value = imr::buffer<tags::fixed_value>;
-    /// Cell value
-    ///
-    /// The cell value can be either a deletion time (if the cell is dead),
-    /// a delta (counter update cell), fixed-size value or variable-sized value.
-    using value_variant = imr::variant<tags::value,
-        imr::member<tags::dead, imr::pod<int64_t>>,
-        imr::member<tags::counter_update, imr::pod<int64_t>>,
-        imr::member<tags::fixed_value, fixed_value>,
-        imr::member<tags::variable_value, variable_value::structure>
-    >;
     /// Atomic cell
     ///
     /// Atomic cells can be either regular cells or counters. Moreover, the
@@ -204,14 +307,16 @@ struct cell {
     /// If a cell value size is above maximum_internal_storage_length it is
     /// stored externally. Moreover, in order to avoid stressing the memory
     /// allocators with large allocations values are fragmented in chunks
-    /// no larger than maximum_external_chunk_length. The size of all chunks,
-    /// but the last one is always maximum_external_chunk_length.
+    /// no larger than maximum_external_chunk_length. The gross size (including
+    /// the chunk header) of all chunks, but the last one is always
+    /// maximum_external_chunk_length.
     using external_chunk = imr::structure<
         imr::member<tags::chunk_back_pointer, imr::tagged_type<tags::chunk_back_pointer, imr::pod<uint8_t*>>>,
         imr::member<tags::chunk_next, imr::pod<uint8_t*>>,
         imr::member<tags::chunk_data, imr::buffer<tags::chunk_data>>
     >;
     static constexpr size_t external_chunk_overhead = sizeof(uint8_t*) * 2;
+    static constexpr size_t effective_external_chunk_length = maximum_external_chunk_length - external_chunk_overhead;
 
     using external_last_chunk_size = imr::pod<uint16_t>;
     /// The last fragment of an externally stored value
@@ -239,7 +344,7 @@ struct cell {
 
         template<typename Tag>
         static constexpr size_t size_of() noexcept {
-            return cell::maximum_external_chunk_length;
+            return cell::effective_external_chunk_length;
         }
         template<typename Tag, typename... Args>
         auto context_for(Args&&...) const noexcept {
@@ -292,12 +397,10 @@ public:
     /// \arg data needs to remain valid as long as the writer is in use.
     /// \returns imr::WriterAllocator for cell::structure.
     template<typename FragmentRange, typename = std::enable_if_t<is_fragment_range_v<std::decay_t<FragmentRange>>>>
-    GCC6_CONCEPT(
-        requires std::is_nothrow_move_constructible_v<std::decay_t<FragmentRange>> &&
-                std::is_nothrow_copy_constructible_v<std::decay_t<FragmentRange>> &&
-                std::is_nothrow_copy_assignable_v<std::decay_t<FragmentRange>> &&
-                std::is_nothrow_move_assignable_v<std::decay_t<FragmentRange>>
-    )
+    requires std::is_nothrow_move_constructible_v<std::decay_t<FragmentRange>> &&
+            std::is_nothrow_copy_constructible_v<std::decay_t<FragmentRange>> &&
+            std::is_nothrow_copy_assignable_v<std::decay_t<FragmentRange>> &&
+            std::is_nothrow_move_assignable_v<std::decay_t<FragmentRange>>
     static auto make_collection(FragmentRange data) noexcept {
         return [data = std::move(data)] (auto&& serializer, auto&& allocations) noexcept {
             return serializer
@@ -664,7 +767,7 @@ public:
     }
 
     bool is_value_fragmented() const noexcept {
-        return flags_view().template get<tags::external_data>() && value_size() > maximum_external_chunk_length;
+        return flags_view().template get<tags::external_data>() && value_size() > cell::effective_external_chunk_length;
     }
 };
 
@@ -707,15 +810,15 @@ inline cell::mutable_atomic_cell_view cell::make_atomic_cell_view(const type_inf
 /// When a cell value is stored externally as a list of fragments we need to
 /// know when we reach the last fragment. The way to do that is to read the
 /// total value size from the parent cell object and use the fact that the size
-/// of all fragments except the last one is cell::maximum_external_chunk_length.
+/// of all fragments except the last one is cell::effective_external_chunk_length.
 class fragment_chain_destructor_context : public imr::no_context_t {
     size_t _total_length;
 public:
     explicit fragment_chain_destructor_context(size_t total_length) noexcept
             : _total_length(total_length) { }
 
-    void next_chunk() noexcept { _total_length -= data::cell::maximum_external_chunk_length; }
-    bool is_last_chunk() const noexcept { return _total_length <= data::cell::maximum_external_chunk_length; }
+    void next_chunk() noexcept { _total_length -= data::cell::effective_external_chunk_length; }
+    bool is_last_chunk() const noexcept { return _total_length <= data::cell::effective_external_chunk_length; }
 };
 
 }

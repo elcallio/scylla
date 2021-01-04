@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for the various operations (GetItem, Query, Scan) with a
 # ProjectionExpression parameter.
@@ -147,6 +136,7 @@ def test_projection_expression_path(test_table_s):
     # structured the same was as in the original item:
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a.b[0],a.b[1]')['Item'] == {'a': {'b': [2, 4]}}
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a.b[0],a.c')['Item'] == {'a': {'b': [2], 'c': 5}}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a.c,b')['Item'] == {'a': {'c': 5}, 'b': 'hello'}
     # It is not allowed to read the same path multiple times. The error from
     # DynamoDB looks like: "Invalid ProjectionExpression: Two document paths
     # overlap with each other; must remove or rewrite one of these paths;
@@ -159,6 +149,59 @@ def test_projection_expression_path(test_table_s):
     with pytest.raises(ClientError, match='ValidationException'):
         test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a,a.b[0]')['Item']
 
+# Above in test_projection_expression_toplevel_syntax() we tested how
+# name references (#name) work in top-level attributes. In the following
+# two tests we test how they work in more elaborate paths:
+# 1. Multiple path components can make multiple references, e.g., "#a.#b"
+# 2. Conversely, a single reference, e.g., "#a", is always a single path
+#    component. Even if "#a" is "a.b", this refers to the literal attribute
+#    "a.b" - with a dot in its name - and not to the b element in a.
+@pytest.mark.xfail(reason="ProjectionExpression does not yet support attribute paths")
+def test_projection_expression_path_references(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a': {'b': 1, 'c': 2}, 'b': 'hi'})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a.b')['Item'] == {'a': {'b': 1}}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#n1.b', ExpressionAttributeNames={'#n1': 'a'})['Item'] == {'a': {'b': 1}}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a.#n2', ExpressionAttributeNames={'#n2': 'b'})['Item'] == {'a': {'b': 1}}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#n1.#n2', ExpressionAttributeNames={'#n1': 'a', '#n2': 'b'})['Item'] == {'a': {'b': 1}}
+    # Missing or unused names in ExpressionAttributeNames are errors:
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a.#n2', ExpressionAttributeNames={'#wrong': 'b'})
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a.#n2', ExpressionAttributeNames={'#n2': 'b', '#unused': 'x'})
+
+@pytest.mark.xfail(reason="ProjectionExpression does not yet support attribute paths")
+def test_projection_expression_path_dot(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a.b': 'hi', 'a': {'b': 'yo'}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='a.b')['Item'] == {'a': {'b': 'yo'}}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#name', ExpressionAttributeNames={'#name': 'a.b'})['Item'] == {'a.b': 'hi'}
+
+# DynamoDB does not allow "overlapping" paths to be listed in
+# ProjectionExpression. This includes both identical paths, and paths where
+# one is a sub-path of the other - e.g. "a.b" and "a.b.c". As we already saw
+# above, paths with just a common *prefix* - e.g., "a.b, a.c" - are fine.
+@pytest.mark.xfail(reason="ProjectionExpression does not yet support attribute paths")
+def test_projection_expression_path_overlap(test_table_s):
+    # The overlap is tested symbolically, on the given paths, without any
+    # relation to what the item contains, or whether it even exists. So we
+    # don't even need to create an item for this test. We still need a
+    # key for the GetItem call :-)
+    p = random_string()
+    for expr in ['a, a',
+                 'a.b, a.b',
+                 'a[1], a[1]',
+                 'a, a.b',
+                 'a.b, a',
+                 'a.b, a.b[2]',
+                 'a.b, a.b.c',
+                 'a, a.b[2].c',
+                ]:
+        with pytest.raises(ClientError, match='ValidationException.* overlap'):
+            test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression=expr)
+
+# Above we nested paths in ProjectionExpression, but just for the GetItem
+# request. Let's verify they also work in Query and Scan requests:
 @pytest.mark.xfail(reason="ProjectionExpression does not yet support attribute paths")
 def test_query_projection_expression_path(test_table):
     p = random_string()
@@ -185,6 +228,22 @@ def test_scan_projection_expression_path(test_table):
     expected_items = [{'p': p, 'a': {'x': x['a']['x']}} for x in items]
     assert multiset(expected_items) == multiset(got_items)
 
+# BatchGetItem also supports ProjectionExpression, let's test that it
+# applies to all items, and that it correctly suports document paths as well.
+@pytest.mark.xfail(reason="ProjectionExpression does not yet support attribute paths")
+def test_batch_get_item_projection_expression_path(test_table_s):
+    items = [{'p': random_string(), 'a': {'b': random_string()}, 'c': random_string()} for i in range(3)]
+    with test_table_s.batch_writer() as batch:
+        for item in items:
+            batch.put_item(item)
+    got_items = test_table_s.meta.client.batch_get_item(
+        RequestItems = {test_table_s.name: {
+            'Keys': [{'p': item['p']} for item in items],
+            'ProjectionExpression': 'a.b',
+            'ConsistentRead': True}})['Responses'][test_table_s.name]
+    expected_items = [{'a': {'b': item['a']['b']}} for item in items]
+    assert multiset(got_items) == multiset(expected_items)
+
 # It is not allowed to use both ProjectionExpression and its older cousin,
 # AttributesToGet, together. If trying to do this, DynamoDB produces an error
 # like "Can not use both expression and non-expression parameters in the same
@@ -199,3 +258,19 @@ def test_projection_expression_and_attributes_to_get(test_table_s):
         full_scan(test_table_s,  ProjectionExpression='a', AttributesToGet=['a'])
     with pytest.raises(ClientError, match='ValidationException.*both'):
         full_query(test_table_s, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ProjectionExpression='a', AttributesToGet=['a'])
+
+# above in test_projection_expression_toplevel_syntax among other things
+# we noted how spurious entries in ExpressionAttributeNames, not needed
+# the the ProjectionExpression, cause an error. Sometimes we have two
+# expressions in the same request, for example, both a ProjectionExpression
+# and a KeyConditionExpression. It's only an error if a name is not
+# needed by both of these expressions
+def test_projection_expression_and_key_condition_expression(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a': 'hello', 'b': 'hi'})
+    got_items = full_query(test_table_s,
+        KeyConditionExpression='#name1 = :val1',
+        ProjectionExpression='#name2',
+        ExpressionAttributeNames={'#name1': 'p', '#name2': 'a'},
+        ExpressionAttributeValues={':val1': p});
+    assert got_items == [{'a': 'hello'}]

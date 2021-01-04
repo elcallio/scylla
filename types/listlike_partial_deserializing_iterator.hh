@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -30,8 +19,14 @@ bytes_view read_collection_value(bytes_view& in, cql_serialization_format sf);
 
 // iterator that takes a set or list in serialized form, and emits
 // each element, still in serialized form
-class listlike_partial_deserializing_iterator
-          : public std::iterator<std::input_iterator_tag, bytes_view> {
+class listlike_partial_deserializing_iterator {
+public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = bytes_view;
+    using difference_type = std::ptrdiff_t;
+    using pointer = bytes_view*;
+    using reference = bytes_view&;
+private:
     bytes_view* _in;
     int _remain;
     bytes_view _cur;

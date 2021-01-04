@@ -50,7 +50,7 @@ enum class bound_weight : int8_t {
 
 inline
 bound_weight position_weight(bound_kind k) {
-    switch(k) {
+    switch (k) {
     case bound_kind::excl_end:
     case bound_kind::incl_start:
         return bound_weight::before_all_prefixed;
@@ -150,6 +150,11 @@ public:
 
     static position_in_partition_view before_key(const clustering_key& ck) {
         return {partition_region::clustered, bound_weight::before_all_prefixed, &ck};
+    }
+
+    // Returns a view to before_key(pos._ck) if pos.is_clustering_row() else returns pos as-is.
+    static position_in_partition_view before_key(position_in_partition_view pos) {
+        return {partition_region::clustered, pos._bound_weight == bound_weight::equal ? bound_weight::before_all_prefixed : pos._bound_weight, pos._ck};
     }
 
     partition_region region() const { return _type; }
@@ -333,6 +338,10 @@ public:
     }
     operator position_in_partition_view() const {
         return { _type, _bound_weight, _ck ? &*_ck : nullptr };
+    }
+
+    size_t external_memory_usage() const {
+        return _ck ? _ck->external_memory_usage() : 0;
     }
 
     // Defines total order on the union of position_and_partition and composite objects.
@@ -573,6 +582,7 @@ public:
     position_in_partition&& end() && { return std::move(_end); }
     bool contains(const schema& s, position_in_partition_view pos) const;
     bool overlaps(const schema& s, position_in_partition_view start, position_in_partition_view end) const;
+    bool is_all_clustered_rows(const schema&) const;
 
     friend std::ostream& operator<<(std::ostream&, const position_range&);
 };
@@ -589,4 +599,9 @@ inline
 bool position_range::overlaps(const schema& s, position_in_partition_view start, position_in_partition_view end) const {
     position_in_partition::less_compare less(s);
     return !less(end, _start) && less(start, _end);
+}
+
+inline
+bool position_range::is_all_clustered_rows(const schema& s) const {
+    return _start.is_before_all_clustered_rows(s) && _end.is_after_all_clustered_rows(s);
 }

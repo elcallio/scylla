@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for the DescribeTable operation.
 # Some attributes used only by a specific major feature will be tested
@@ -146,13 +135,11 @@ def test_describe_table_arn(test_table):
     assert 'TableArn' in got and got['TableArn'].startswith('arn:')
 
 # Test that the table has a TableId.
-# TODO: Figure out what is this TableId supposed to be, it is just a
-# unique id that is created with the table and never changes? Or anything
-# else?
-@pytest.mark.xfail(reason="DescribeTable does not return TableId")
+# DynamoDB documentation states that this id must look like a UUID.
 def test_describe_table_id(test_table):
     got = test_table.meta.client.describe_table(TableName=test_table.name)['Table']
     assert 'TableId' in got
+    assert re.fullmatch('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', got['TableId'])
 
 # DescribeTable error path: trying to describe a non-existent table should
 # result in a ResourceNotFoundException.

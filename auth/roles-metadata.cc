@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "auth/roles-metadata.hh"
@@ -45,16 +34,13 @@ std::string_view creation_query() {
             "  member_of set<text>,"
             "  salted_hash text"
             ")",
-            qualified_name(),
+            qualified_name,
             role_col_name);
 
     return instance;
 }
 
-std::string_view qualified_name() noexcept {
-    static const sstring instance = AUTH_KS + "." + sstring(name);
-    return instance;
-}
+constexpr std::string_view qualified_name("system_auth.roles");
 
 }
 
@@ -64,7 +50,7 @@ future<bool> default_role_row_satisfies(
         cql3::query_processor& qp,
         std::function<bool(const cql3::untyped_result_set_row&)> p) {
     static const sstring query = format("SELECT * FROM {} WHERE {} = ?",
-            meta::roles_table::qualified_name(),
+            meta::roles_table::qualified_name,
             meta::roles_table::role_col_name);
 
     return do_with(std::move(p), [&qp](const auto& p) {
@@ -97,7 +83,7 @@ future<bool> default_role_row_satisfies(
 future<bool> any_nondefault_role_row_satisfies(
         cql3::query_processor& qp,
         std::function<bool(const cql3::untyped_result_set_row&)> p) {
-    static const sstring query = format("SELECT * FROM {}", meta::roles_table::qualified_name());
+    static const sstring query = format("SELECT * FROM {}", meta::roles_table::qualified_name);
 
     return do_with(std::move(p), [&qp](const auto& p) {
         return qp.execute_internal(

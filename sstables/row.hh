@@ -6,18 +6,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -128,6 +117,8 @@ public:
     // Called when the reader is fast forwarded to given element.
     virtual void reset(sstables::indexable_element) = 0;
 
+    virtual position_in_partition_view position() = 0;
+
     // Under which priority class to place I/O coming from this consumer
     const io_priority_class& io_priority() const {
         return _pc;
@@ -222,6 +213,8 @@ public:
     // Called when the reader is fast forwarded to given element.
     virtual void reset(sstables::indexable_element) = 0;
 
+    virtual position_in_partition_view position() = 0;
+
     // Under which priority class to place I/O coming from this consumer
     const io_priority_class& io_priority() const {
         return _pc;
@@ -290,7 +283,7 @@ public:
                 || (_state == state::STOP_THEN_ATOM_START)
                 || (_state == state::COUNTER_CELL_2)
                 || (_state == state::RANGE_TOMBSTONE_4)
-                || (_state == state::EXPIRING_CELL_3)) && (_prestate == prestate::NONE));
+                || (_state == state::EXPIRING_CELL_3)));
     }
 
     // process() feeds the given data into the state machine.
@@ -324,7 +317,7 @@ private:
             return row_consumer::proceed::yes;
         }
 #endif
-        sstlog.trace("data_consume_row_context {}: state={}, size={}", this, static_cast<int>(_state), data.size());
+        sstlog.trace("data_consume_row_context {}: state={}, size={}", fmt::ptr(this), static_cast<int>(_state), data.size());
         switch (_state) {
         case state::ROW_START:
             if (read_short_length_bytes(data, _key) != read_status::ready) {
@@ -535,7 +528,7 @@ public:
             _consumer.consume_row_end();
             return;
         }
-        if (_state != state::ROW_START || _prestate != prestate::NONE) {
+        if (_state != state::ROW_START || primitive_consumer::active()) {
             throw malformed_sstable_exception("end of input, but not end of row");
         }
     }
@@ -769,7 +762,7 @@ public:
                 || _state == state::COLUMN_TIMESTAMP
                 || _state == state::COLUMN_DELETION_TIME_2
                 || _state == state::COLUMN_TTL_2
-                || _state == state::COLUMN_END) && (_prestate == prestate::NONE);
+                || _state == state::COLUMN_END);
     }
 
     data_consumer::processing_result process_state(temporary_buffer<char>& data) {
@@ -1368,7 +1361,7 @@ public:
         // and proceeding to attempt to parse the next partition, since state::DELETION_TIME
         // is the first state corresponding to the contents of a new partition.
         if (_state != state::DELETION_TIME
-                && (_state != state::PARTITION_START || _prestate != prestate::NONE)) {
+                && (_state != state::PARTITION_START || primitive_consumer::active())) {
             throw malformed_sstable_exception("end of input, but not end of partition");
         }
     }

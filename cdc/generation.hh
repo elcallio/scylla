@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 
@@ -40,6 +29,7 @@
 #include "database_fwd.hh"
 #include "db_clock.hh"
 #include "dht/token.hh"
+#include "locator/token_metadata.hh"
 
 namespace seastar {
     class abort_source;
@@ -55,28 +45,31 @@ namespace gms {
     class gossiper;
 } // namespace gms
 
-namespace locator {
-    class token_metadata;
-} // namespace locator
-
 namespace cdc {
 
 class stream_id final {
     bytes _value;
 public:
+    static constexpr uint8_t version_1 = 1;
+
     stream_id() = default;
-    stream_id(int64_t, int64_t);
     stream_id(bytes);
+
     bool is_set() const;
     bool operator==(const stream_id&) const;
+    bool operator!=(const stream_id&) const;
     bool operator<(const stream_id&) const;
 
-    int64_t first() const;
-    int64_t second() const;
-
+    uint8_t version() const;
+    size_t index() const;
     const bytes& to_bytes() const;
+    dht::token token() const;
 
     partition_key to_partition_key(const schema& log_schema) const;
+    static int64_t token_from_bytes(bytes_view);
+private:
+    friend class topology_description_generator;
+    stream_id(dht::token, size_t);
 };
 
 /* Describes a mapping of tokens to CDC streams in a token range.
@@ -112,6 +105,23 @@ public:
     const std::vector<token_range_description>& entries() const;
 };
 
+/**
+ * The set of streams for a single topology version/generation
+ * I.e. the stream ids at a given time. 
+ */ 
+class streams_version {
+public:
+    std::vector<stream_id> streams;
+    db_clock::time_point timestamp;
+    std::optional<db_clock::time_point> expired;
+
+    streams_version(std::vector<stream_id> s, db_clock::time_point ts, std::optional<db_clock::time_point> exp)
+        : streams(std::move(s))
+        , timestamp(ts)
+        , expired(std::move(exp))
+    {}
+};
+
 /* Should be called when we're restarting and we noticed that we didn't save any streams timestamp in our local tables,
  * which means that we're probably upgrading from a non-CDC/old CDC version (another reason could be
  * that there's a bug, or the user messed with our local tables).
@@ -129,8 +139,8 @@ bool should_propose_first_generation(const gms::inet_address& me, const gms::gos
  */
 future<db_clock::time_point> get_local_streams_timestamp();
 
-/* Generate a new set of CDC streams and insert it into the distributed cdc_topology_description table.
- * Returns the timestamp of this new generation.
+/* Generate a new set of CDC streams and insert it into the distributed cdc_generation_descriptions table.
+ * Returns the timestamp of this new generation
  *
  * Should be called when starting the node for the first time (i.e., joining the ring).
  *
@@ -144,11 +154,11 @@ future<db_clock::time_point> get_local_streams_timestamp();
 db_clock::time_point make_new_cdc_generation(
         const db::config& cfg,
         const std::unordered_set<dht::token>& bootstrap_tokens,
-        const locator::token_metadata& tm,
+        const locator::token_metadata_ptr tmptr,
         const gms::gossiper& g,
         db::system_distributed_keyspace& sys_dist_ks,
         std::chrono::milliseconds ring_delay,
-        bool for_testing);
+        bool add_delay);
 
 /* Retrieves CDC streams generation timestamp from the given endpoint's application state (broadcasted through gossip).
  * We might be during a rolling upgrade, so the timestamp might not be there (if the other node didn't upgrade yet),
@@ -158,9 +168,9 @@ db_clock::time_point make_new_cdc_generation(
 std::optional<db_clock::time_point> get_streams_timestamp_for(const gms::inet_address& endpoint, const gms::gossiper&);
 
 /* Inform CDC users about a generation of streams (identified by the given timestamp)
- * by inserting it into the cdc_description table.
+ * by inserting it into the cdc_streams table.
  *
- * Assumes that the cdc_topology_description table contains this generation.
+ * Assumes that the cdc_generation_descriptions table contains this generation.
  *
  * Returning from this function does not mean that the table update was successful: the function
  * might run an asynchronous task in the background.

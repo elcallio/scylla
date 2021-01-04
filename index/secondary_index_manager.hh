@@ -32,7 +32,8 @@
 
 #include "schema.hh"
 
-#include "cql3/operator.hh"
+#include "cql3/expr/expression.hh"
+#include "database_fwd.hh"
 
 #include <vector>
 #include <set>
@@ -54,7 +55,7 @@ class index {
 public:
     index(const sstring& target_column, const index_metadata& im);
     bool depends_on(const column_definition& cdef) const;
-    bool supports_expression(const column_definition& cdef, const cql3::operator_type& op) const;
+    bool supports_expression(const column_definition& cdef, const cql3::expr::oper_t op) const;
     const index_metadata& metadata() const;
     const sstring& target_column() const {
         return _target_column;
@@ -68,7 +69,7 @@ class secondary_index_manager {
 public:
     secondary_index_manager(column_family& cf);
     void reload();
-    view_ptr create_view_for_index(const index_metadata& index) const;
+    view_ptr create_view_for_index(const index_metadata& index, bool new_token_column_computation) const;
     std::vector<index_metadata> get_dependent_indices(const column_definition& cdef) const;
     std::vector<index> list_indexes() const;
     bool is_index(view_ptr) const;

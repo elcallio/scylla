@@ -33,6 +33,7 @@
 #include "cql3/statements/raw/modification_statement.hh"
 #include "cql3/statements/prepared_statement.hh"
 #include "cql3/restrictions/single_column_restriction.hh"
+#include "cql3/util.hh"
 #include "validation.hh"
 #include "db/consistency_level_validations.hh"
 #include <seastar/core/shared_ptr.hh>
@@ -40,7 +41,6 @@
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/adaptor/indirected.hpp>
 #include "db/config.hh"
-#include "service/storage_service.hh"
 #include "transport/messages/result_message.hh"
 #include "database.hh"
 #include <seastar/core/execution_stage.hh>
@@ -63,6 +63,10 @@ modification_statement_timeout(const schema& s) {
     }
 }
 
+db::timeout_clock::duration modification_statement::get_timeout(const query_options& options) const {
+    return attrs->is_timeout_set() ? attrs->get_timeout(options) : options.get_timeout_config().*get_timeout_config_selector();
+}
+
 modification_statement::modification_statement(statement_type type_, uint32_t bound_terms, schema_ptr schema_, std::unique_ptr<attributes> attrs_, cql_stats& stats_)
     : cql_statement_opt_metadata(modification_statement_timeout(*schema_))
     , type{type_}
@@ -75,31 +79,6 @@ modification_statement::modification_statement(statement_type type_, uint32_t bo
     , _stats(stats_)
     , _ks_sel(::is_system_keyspace(schema_->ks_name()) ? ks_selector::SYSTEM : ks_selector::NONSYSTEM)
 { }
-
-bool modification_statement::uses_function(const sstring& ks_name, const sstring& function_name) const {
-    if (attrs->uses_function(ks_name, function_name)) {
-        return true;
-    }
-    if (_restrictions->uses_function(ks_name, function_name)) {
-        return true;
-    }
-    for (auto&& operation : _column_operations) {
-        if (operation && operation->uses_function(ks_name, function_name)) {
-            return true;
-        }
-    }
-    for (auto&& condition : _regular_conditions) {
-        if (condition && condition->uses_function(ks_name, function_name)) {
-            return true;
-        }
-    }
-    for (auto&& condition : _static_conditions) {
-        if (condition && condition->uses_function(ks_name, function_name)) {
-            return true;
-        }
-    }
-    return false;
-}
 
 uint32_t modification_statement::get_bound_terms() const {
     return _bound_terms;
@@ -134,10 +113,11 @@ gc_clock::duration modification_statement::get_time_to_live(const query_options&
 }
 
 future<> modification_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
-    auto f = state.has_column_family_access(keyspace(), column_family(), auth::permission::MODIFY);
+    const database& db = proxy.local_db();
+    auto f = state.has_column_family_access(db, keyspace(), column_family(), auth::permission::MODIFY);
     if (has_conditions()) {
-        f = f.then([this, &state] {
-           return state.has_column_family_access(keyspace(), column_family(), auth::permission::SELECT);
+        f = f.then([this, &state, &db] {
+           return state.has_column_family_access(db, keyspace(), column_family(), auth::permission::SELECT);
         });
     }
     return f;
@@ -158,7 +138,7 @@ modification_statement::get_mutations(service::storage_proxy& proxy, const query
     }
 
     if (requires_read()) {
-        lw_shared_ptr<query::read_command> cmd = read_command(ranges, cl);
+        lw_shared_ptr<query::read_command> cmd = read_command(proxy, ranges, cl);
         // FIXME: ignoring "local"
         f = proxy.query(s, cmd, dht::partition_range_vector(keys), cl,
                 {timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()}).then(
@@ -202,7 +182,7 @@ bool modification_statement::applies_to(const update_parameters::prefetch_data::
         return row == nullptr;
     }
 
-    auto condition_applies = [&row, &options](const shared_ptr<column_condition>& cond) {
+    auto condition_applies = [&row, &options](const lw_shared_ptr<column_condition>& cond) {
         const data_value* value = nullptr;
         if (row != nullptr) {
             auto it = row->cells.find(cond->column.ordinal_id);
@@ -236,14 +216,15 @@ std::vector<mutation> modification_statement::apply_updates(
 }
 
 lw_shared_ptr<query::read_command>
-modification_statement::read_command(query::clustering_row_ranges ranges, db::consistency_level cl) const {
+modification_statement::read_command(service::storage_proxy& proxy, query::clustering_row_ranges ranges, db::consistency_level cl) const {
     try {
         validate_for_read(cl);
     } catch (exceptions::invalid_request_exception& e) {
         throw exceptions::invalid_request_exception(format("Write operation require a read but consistency {} is not supported on reads", cl));
     }
     query::partition_slice ps(std::move(ranges), *s, columns_to_read(), update_parameters::options);
-    return make_lw_shared<query::read_command>(s->id(), s->version(), std::move(ps));
+    const auto max_result_size = proxy.get_max_result_size(ps);
+    return make_lw_shared<query::read_command>(s->id(), s->version(), std::move(ps), query::max_result_size(max_result_size));
 }
 
 std::vector<query::clustering_range>
@@ -255,7 +236,7 @@ dht::partition_range_vector
 modification_statement::build_partition_keys(const query_options& options, const json_cache_opt& json_cache) const {
     auto keys = _restrictions->get_partition_key_restrictions()->bounds_ranges(options);
     for (auto const& k : keys) {
-        validation::validate_cql_key(s, *k.start()->value().key());
+        validation::validate_cql_key(*s, *k.start()->value().key());
     }
     return keys;
 }
@@ -272,6 +253,7 @@ static thread_local inheriting_concrete_execution_stage<
 
 future<::shared_ptr<cql_transport::messages::result_message>>
 modification_statement::execute(service::storage_proxy& proxy, service::query_state& qs, const query_options& options) const {
+    cql3::util::validate_timestamp(options, attrs);
     return modify_stage(this, seastar::ref(proxy), seastar::ref(qs), seastar::cref(options));
 }
 
@@ -298,7 +280,7 @@ modification_statement::do_execute(service::storage_proxy& proxy, service::query
 future<>
 modification_statement::execute_without_condition(service::storage_proxy& proxy, service::query_state& qs, const query_options& options) const {
     auto cl = options.get_consistency();
-    auto timeout = db::timeout_clock::now() + options.get_timeout_config().*get_timeout_config_selector();
+    auto timeout = db::timeout_clock::now() + get_timeout(options);
     return get_mutations(proxy, options, timeout, false, options.get_timestamp(qs), qs).then([this, cl, timeout, &proxy, &qs] (auto mutations) {
         if (mutations.empty()) {
             return now();
@@ -341,65 +323,18 @@ modification_statement::execute_with_condition(service::storage_proxy& proxy, se
                 make_shared<cql_transport::messages::result_message::bounce_to_shard>(shard));
     }
 
-    return proxy.cas(s, request, request->read_command(), request->key(),
+    return proxy.cas(s, request, request->read_command(proxy), request->key(),
             {read_timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()},
             cl_for_paxos, cl_for_learn, statement_timeout, cas_timeout).then([this, request] (bool is_applied) {
-        return build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied, request->rows());
+        return request->build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied);
     });
-}
-
-seastar::shared_ptr<cql_transport::messages::result_message>
-modification_statement::build_cas_result_set(seastar::shared_ptr<cql3::metadata> metadata,
-        const column_set& columns,
-        bool is_applied,
-        const update_parameters::prefetch_data& rows) {
-
-    auto result_set = std::make_unique<cql3::result_set>(metadata);
-    for (const auto& it : rows.rows) {
-        const update_parameters::prefetch_data::row& cell_map = it.second;
-        if (!cell_map.is_in_cas_result_set) {
-            continue;
-        }
-        std::vector<bytes_opt> row;
-        row.reserve(metadata->value_count());
-        row.emplace_back(boolean_type->decompose(is_applied));
-        for (ordinal_column_id id = columns.find_first(); id != column_set::npos; id = columns.find_next(id)) {
-            const auto it = cell_map.cells.find(id);
-            if (it == cell_map.cells.end()) {
-                row.emplace_back(bytes_opt{});
-            } else {
-                const data_value& cell = it->second;
-                const abstract_type& cell_type = *cell.type();
-                const abstract_type& column_type = *rows.schema->column_at(id).type;
-
-                if (column_type.is_listlike() && cell_type.is_map()) {
-                    // List/sets are fetched as maps, but need to be stored as sets.
-                    const listlike_collection_type_impl& list_type = static_cast<const listlike_collection_type_impl&>(column_type);
-                    const map_type_impl& map_type = static_cast<const map_type_impl&>(cell_type);
-                    row.emplace_back(list_type.serialize_map(map_type, cell));
-                } else {
-                    row.emplace_back(cell_type.decompose(cell));
-                }
-            }
-        }
-        result_set->add_row(std::move(row));
-    }
-    if (result_set->empty()) {
-        // Is the case when, e.g., IF EXISTS or IF NOT EXISTS finds no row.
-        std::vector<bytes_opt> row;
-        row.emplace_back(boolean_type->decompose(is_applied));
-        row.resize(metadata->value_count());
-        result_set->add_row(std::move(row));
-    }
-    cql3::result result(std::move(result_set));
-    return seastar::make_shared<cql_transport::messages::result_message::rows>(std::move(result));
 }
 
 void modification_statement::build_cas_result_set_metadata() {
 
-    std::vector<shared_ptr<column_specification>> columns;
+    std::vector<lw_shared_ptr<column_specification>> columns;
     // Add the mandatory [applied] column to result set metadata
-    auto applied = seastar::make_shared<cql3::column_specification>(s->ks_name(), s->cf_name(),
+    auto applied = make_lw_shared<cql3::column_specification>(s->ks_name(), s->cf_name(),
             make_shared<cql3::column_identifier>("[applied]", false), boolean_type);
 
     columns.push_back(applied);
@@ -456,9 +391,9 @@ modification_statement::process_where_clause(database& db, std::vector<relation_
             _has_regular_column_conditions = true;
         }
     }
-    if (_restrictions->get_partition_key_restrictions()->is_on_token()) {
+    if (has_token(_restrictions->get_partition_key_restrictions()->expression)) {
         throw exceptions::invalid_request_exception(format("The token function cannot be used in WHERE clauses for UPDATE and DELETE statements: {}",
-                _restrictions->get_partition_key_restrictions()->to_string()));
+                to_string(_restrictions->get_partition_key_restrictions()->expression)));
     }
     if (!_restrictions->get_non_pk_restriction().empty()) {
         auto column_names = ::join(", ", _restrictions->get_non_pk_restriction()
@@ -468,8 +403,9 @@ modification_statement::process_where_clause(database& db, std::vector<relation_
         throw exceptions::invalid_request_exception(format("Invalid where clause contains non PRIMARY KEY columns: {}", column_names));
     }
     auto ck_restrictions = _restrictions->get_clustering_columns_restrictions();
-    if (ck_restrictions->is_slice() && !allow_clustering_key_slices()) {
-        throw exceptions::invalid_request_exception(format("Invalid operator in where clause {}", ck_restrictions->to_string()));
+    if (has_slice(ck_restrictions->expression) && !allow_clustering_key_slices()) {
+        throw exceptions::invalid_request_exception(
+                format("Invalid operator in where clause {}", to_string(ck_restrictions->expression)));
     }
     if (_restrictions->has_unrestricted_clustering_columns() && !applies_only_to_static_columns() && !s->is_dense()) {
         // Tomek: Origin had "&& s->comparator->is_composite()" in the condition below.
@@ -487,7 +423,7 @@ modification_statement::process_where_clause(database& db, std::vector<relation_
         }
         // In general, we can't modify specific columns if not all clustering columns have been specified.
         // However, if we modify only static columns, it's fine since we won't really use the prefix anyway.
-        if (!ck_restrictions->is_slice()) {
+        if (!has_slice(ck_restrictions->expression)) {
             auto& col = s->column_at(column_kind::clustering_key, ck_restrictions->size());
             for (auto&& op : _column_operations) {
                 if (!op->column.is_static()) {
@@ -640,7 +576,11 @@ void modification_statement::inc_cql_stats(bool is_internal) const {
     ++_stats.query_cnt(src_sel, _ks_sel, cond_sel, type);
 }
 
-void modification_statement::add_condition(::shared_ptr<column_condition> cond) {
+bool modification_statement::is_conditional() const {
+    return has_conditions();
+}
+
+void modification_statement::add_condition(lw_shared_ptr<column_condition> cond) {
     if (cond->column.is_static()) {
         _has_static_column_conditions = true;
         _static_conditions.emplace_back(std::move(cond));

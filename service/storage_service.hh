@@ -23,28 +23,15 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
 
-#include "auth/service.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
 #include "locator/token_metadata.hh"
 #include "gms/gossiper.hh"
-#include "utils/UUID_gen.hh"
 #include <seastar/core/distributed.hh>
 #include "dht/i_partitioner.hh"
 #include "dht/token_range_endpoints.hh"
@@ -59,13 +46,20 @@
 #include "streaming/stream_state.hh"
 #include <seastar/core/distributed.hh>
 #include "utils/disk-error-handler.hh"
-#include "gms/feature.hh"
 #include "service/migration_listener.hh"
 #include "gms/feature_service.hh"
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/rwlock.hh>
 #include "sstables/version.hh"
 #include "cdc/metadata.hh"
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/lowres_clock.hh>
+
+class node_ops_cmd_request;
+class node_ops_cmd_response;
+class node_ops_info;
+
+namespace cql_transport { class controller; }
 
 namespace db {
 class system_distributed_keyspace;
@@ -73,11 +67,6 @@ namespace view {
 class view_update_generator;
 }
 }
-
-namespace cql_transport {
-    class cql_server;
-}
-class thrift_server;
 
 namespace dht {
 class boot_strapper;
@@ -104,28 +93,35 @@ inline storage_service& get_local_storage_service() {
     return _the_storage_service.local();
 }
 
-int get_generation_number();
-
 enum class disk_error { regular, commit };
 
 struct bind_messaging_port_tag {};
 using bind_messaging_port = bool_class<bind_messaging_port_tag>;
 
-class feature_enabled_listener : public gms::feature::listener {
-    storage_service& _s;
-    seastar::named_semaphore& _sem;
-    sstables::sstable_version_types _format;
-public:
-    feature_enabled_listener(storage_service& s, seastar::named_semaphore& sem, sstables::sstable_version_types format)
-        : _s(s)
-        , _sem(sem)
-        , _format(format)
-    { }
-    void on_enabled() override;
-};
-
 struct storage_service_config {
     size_t available_memory;
+};
+
+class node_ops_meta_data {
+    utils::UUID _ops_uuid;
+    gms::inet_address _coordinator;
+    std::function<future<> ()> _abort;
+    std::function<void ()> _signal;
+    shared_ptr<node_ops_info> _ops;
+    seastar::timer<lowres_clock> _watchdog;
+    std::chrono::seconds _watchdog_interval{30};
+    bool _aborted = false;
+public:
+    explicit node_ops_meta_data(
+            utils::UUID ops_uuid,
+            gms::inet_address coordinator,
+            shared_ptr<node_ops_info> ops,
+            std::function<future<> ()> abort_func,
+            std::function<void ()> signal_func);
+    shared_ptr<node_ops_info> get_ops_info();
+    future<> abort();
+    void update_watchdog();
+    void cancel_watchdog();
 };
 
 /**
@@ -134,20 +130,18 @@ struct storage_service_config {
  * This class will also maintain histograms of the load information
  * of other nodes in the cluster.
  */
-class storage_service : public service::migration_listener, public gms::i_endpoint_state_change_subscriber, public seastar::async_sharded_service<storage_service> {
-public:
-    struct snapshot_details {
-        int64_t live;
-        int64_t total;
-        sstring cf;
-        sstring ks;
-    };
+class storage_service : public service::migration_listener, public gms::i_endpoint_state_change_subscriber,
+        public seastar::async_sharded_service<storage_service>, public seastar::peering_sharded_service<storage_service> {
 private:
     using token = dht::token;
     using token_range_endpoints = dht::token_range_endpoints;
     using endpoint_details = dht::endpoint_details;
     using boot_strapper = dht::boot_strapper;
     using token_metadata = locator::token_metadata;
+    using shared_token_metadata = locator::shared_token_metadata;
+    using token_metadata_ptr = locator::token_metadata_ptr;
+    using mutable_token_metadata_ptr = locator::mutable_token_metadata_ptr;
+    using token_metadata_lock = locator::token_metadata_lock;
     using application_state = gms::application_state;
     using inet_address = gms::inet_address;
     using versioned_value = gms::versioned_value;
@@ -156,8 +150,8 @@ private:
     gms::feature_service& _feature_service;
     distributed<database>& _db;
     gms::gossiper& _gossiper;
-    sharded<auth::service>& _auth_service;
     sharded<service::migration_notifier>& _mnotifier;
+    sharded<netw::messaging_service>& _messaging;
     sharded<qos::service_level_controller>& _sl_controller;
     // Note that this is obviously only valid for the current shard. Users of
     // this facility should elect a shard to be the coordinator based on any
@@ -166,8 +160,7 @@ private:
     // It shouldn't be impossible to actively serialize two callers if the need
     // ever arise.
     bool _loading_new_sstables = false;
-    std::unique_ptr<distributed<cql_transport::cql_server>> _cql_server;
-    std::unique_ptr<distributed<thrift_server>> _thrift_server;
+    friend class cql_transport::controller;
     sstring _operation_in_progress;
     bool _force_remove_completion = false;
     bool _ms_stopped = false;
@@ -177,6 +170,8 @@ private:
     semaphore _service_memory_limiter;
     using client_shutdown_hook = noncopyable_function<void()>;
     std::vector<std::pair<std::string, client_shutdown_hook>> _client_shutdown_hooks;
+    std::vector<std::any> _listeners;
+    gms::feature::listener_registration _workload_prioritization_registration;
 
     /* For unit tests only.
      *
@@ -186,10 +181,19 @@ private:
      * and would only slow down tests (by having them wait).
      */
     bool _for_testing;
+
+    std::unordered_map<utils::UUID, node_ops_meta_data> _node_ops;
+    std::list<std::optional<utils::UUID>> _node_ops_abort_queue;
+    seastar::condition_variable _node_ops_abort_cond;
+    named_semaphore _node_ops_abort_sem{1, named_semaphore_exception_factory{"node_ops_abort_sem"}};
+    future<> _node_ops_abort_thread;
+    void node_ops_update_heartbeat(utils::UUID ops_uuid);
+    void node_ops_done(utils::UUID ops_uuid);
+    void node_ops_abort(utils::UUID ops_uuid);
+    void node_ops_singal_abort(std::optional<utils::UUID> ops_uuid);
+    future<> node_ops_abort_thread();
 public:
-    storage_service(abort_source& as, distributed<database>& db, gms::gossiper& gossiper, sharded<auth::service>&, sharded<db::system_distributed_keyspace>&, sharded<db::view::view_update_generator>&, gms::feature_service& feature_service, storage_service_config config, sharded<service::migration_notifier>& mn, locator::token_metadata& tm, sharded<qos::service_level_controller>&, /* only for tests */ bool for_testing = false);
-    void isolate_on_error();
-    void isolate_on_commit_error();
+    storage_service(abort_source& as, distributed<database>& db, gms::gossiper& gossiper, sharded<db::system_distributed_keyspace>&, sharded<db::view::view_update_generator>&, gms::feature_service& feature_service, storage_service_config config, sharded<service::migration_notifier>& mn, locator::shared_token_metadata& stm, sharded<netw::messaging_service>& ms, sharded<qos::service_level_controller>&, /* only for tests */ bool for_testing = false);
 
     // Needed by distributed<>
     future<> stop();
@@ -197,24 +201,39 @@ public:
     future<> uninit_messaging_service();
 
 private:
-    future<> do_update_pending_ranges();
-    void register_metrics();
+    future<token_metadata_lock> get_token_metadata_lock() noexcept;
+    future<> with_token_metadata_lock(std::function<future<> ()>) noexcept;
 
-public:
+    // Acquire the token_metadata lock and get a mutable_token_metadata_ptr.
+    // Pass that ptr to \c func, and when successfully done,
+    // replicate it to all cores.
+    // Note: must be called on shard 0.
+    future<> mutate_token_metadata(std::function<future<> (mutable_token_metadata_ptr)> func) noexcept;
+
+    // Update pending ranges locally and then replicate to all cores.
+    // Should be serialized under token_metadata_lock.
+    // Must be called on shard 0.
+    future<> update_pending_ranges(mutable_token_metadata_ptr tmptr, sstring reason);
+    future<> update_pending_ranges(sstring reason);
     future<> keyspace_changed(const sstring& ks_name);
-    future<> update_pending_ranges();
-    void update_pending_ranges_nowait(inet_address endpoint);
+    void register_metrics();
+    future<> publish_schema_version();
+    void install_schema_version_change_listener();
 
-    auth::service& get_local_auth_service() {
-        return _auth_service.local();
+    future<mutable_token_metadata_ptr> get_mutable_token_metadata_ptr() noexcept {
+        return _shared_token_metadata.get()->clone_async().then([] (token_metadata tm) {
+            return make_ready_future<mutable_token_metadata_ptr>(make_token_metadata_ptr(std::move(tm)));
+        });
+    }
+public:
+    static future<> update_topology(inet_address endpoint);
+
+    token_metadata_ptr get_token_metadata_ptr() const noexcept {
+        return _shared_token_metadata.get();
     }
 
-    const locator::token_metadata& get_token_metadata() const {
-        return _token_metadata;
-    }
-
-    locator::token_metadata& get_token_metadata() {
-        return _token_metadata;
+    const locator::token_metadata& get_token_metadata() const noexcept {
+        return *_shared_token_metadata.get();
     }
 
     cdc::metadata& get_cdc_metadata() {
@@ -249,17 +268,14 @@ private:
         return utils::fb_utilities::get_broadcast_address();
     }
     /* This abstraction maintains the token/endpoint metadata information */
-    token_metadata& _token_metadata;
+    mutable_token_metadata_ptr _pending_token_metadata_ptr;
+    shared_token_metadata& _shared_token_metadata;
 
     // Maintains the set of known CDC generations used to pick streams for log writes (i.e., the partition keys of these log writes).
     // Updated in response to certain gossip events (see the handle_cdc_generation function).
     cdc::metadata _cdc_metadata;
 public:
     std::chrono::milliseconds get_ring_delay();
-    gms::versioned_value::factory value_factory;
-    dht::token_range_vector get_local_ranges(const sstring& keyspace_name) const {
-        return get_ranges_for_endpoint(keyspace_name, get_broadcast_address());
-    }
 private:
 
     std::unordered_set<inet_address> _replicating_nodes;
@@ -273,26 +289,11 @@ private:
 
     bool _joined = false;
 
-    seastar::rwlock _snapshot_lock;
-    seastar::gate _snapshot_ops;
-
-    template <typename Func>
-    static std::result_of_t<Func()> run_snapshot_modify_operation(Func&&);
-
-    template <typename Func>
-    static std::result_of_t<Func()> run_snapshot_list_operation(Func&&);
 public:
     enum class mode { STARTING, NORMAL, JOINING, LEAVING, DECOMMISSIONED, MOVING, DRAINING, DRAINED };
-
-    future<> snapshots_close() {
-        return _snapshot_ops.close();
-    }
-
 private:
     mode _operation_mode = mode::STARTING;
     friend std::ostream& operator<<(std::ostream& os, const mode& mode);
-    friend future<> read_sstables_format(distributed<storage_service>&);
-    friend class feature_enabled_listener;
     /* Used for tracking drain progress */
 public:
     struct drain_progress {
@@ -321,17 +322,7 @@ private:
      */
     std::optional<db_clock::time_point> _cdc_streams_ts;
 
-    // _sstables_format is the format used for writing new sstables.
-    // Here we set its default value, but if we discover that all the nodes
-    // in the cluster support a newer format, _sstables_format will be set to
-    // that format. read_sstables_format() also overwrites _sstables_format
-    // if an sstable format was chosen earlier (and this choice was persisted
-    // in the system table).
-    sstables::sstable_version_types _sstables_format = sstables::sstable_version_types::la;
-    seastar::named_semaphore _feature_listeners_sem = {1, named_semaphore_exception_factory{"feature listeners"}};
-    feature_enabled_listener _mc_feature_listener;
 public:
-    sstables::sstable_version_types sstables_format() const { return _sstables_format; }
     void enable_all_features();
 
     /* Broadcasts the chosen tokens through gossip,
@@ -351,19 +342,6 @@ public:
     // should only be called via JMX
     future<bool> is_gossip_running();
 
-    // should only be called via JMX
-    future<> start_rpc_server();
-
-    future<> stop_rpc_server();
-
-    future<bool> is_rpc_server_running();
-
-    future<> start_native_transport();
-
-    future<> stop_native_transport();
-
-    future<bool> is_native_transport_running();
-
     void register_client_shutdown_hook(std::string name, client_shutdown_hook hook) {
         _client_shutdown_hooks.push_back({std::move(name), std::move(hook)});
     }
@@ -375,8 +353,6 @@ public:
         }
     }
 private:
-    future<> do_stop_rpc_server();
-    future<> do_stop_native_transport();
     future<> do_stop_ms();
     future<> do_stop_stream_manager();
     // Runs in thread context
@@ -384,12 +360,14 @@ private:
 
     // Tokens and the CDC streams timestamp of the replaced node.
     using replacement_info = std::pair<std::unordered_set<token>, std::optional<db_clock::time_point>>;
-    future<replacement_info> prepare_replacement_info(const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
+    future<replacement_info> prepare_replacement_info(std::unordered_set<gms::inet_address> initial_contact_nodes,
+            const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features, bind_messaging_port do_bind = bind_messaging_port::yes);
 
 public:
     future<bool> is_initialized();
 
-    future<> check_for_endpoint_collision(const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
+    future<> check_for_endpoint_collision(std::unordered_set<gms::inet_address> initial_contact_nodes,
+            const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features, bind_messaging_port do_bind = bind_messaging_port::yes);
 
     /*!
      * \brief Init the messaging service part of the service.
@@ -402,6 +380,10 @@ public:
      * \see init_server_without_the_messaging_service_part
      */
     future<> init_messaging_service_part();
+    /*!
+     * \brief Uninit the messaging service part of the service.
+     */
+    future<> uninit_messaging_service_part();
 
     /*!
      * \brief complete the server initialization
@@ -413,13 +395,14 @@ public:
      *
      * It is safe to start the API after init_messaging_service_part
      * completed
+     *
+     * Must be called on shard 0.
+     *
      * \see init_messaging_service_part
      */
-    future<> init_server_without_the_messaging_service_part(bind_messaging_port do_bind = bind_messaging_port::yes) {
-        return init_server(get_ring_delay().count(), do_bind);
-    }
+    future<> init_server(bind_messaging_port do_bind = bind_messaging_port::yes);
 
-    future<> init_server(int delay, bind_messaging_port do_bind = bind_messaging_port::yes);
+    future<> join_cluster();
 
     future<> drain_on_shutdown();
 
@@ -428,10 +411,14 @@ public:
     void flush_column_families();
 
 private:
-    bool should_bootstrap() const;
-    void prepare_to_join(std::vector<inet_address> loaded_endpoints, const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features, bind_messaging_port do_bind = bind_messaging_port::yes);
+    bool should_bootstrap();
+    bool is_first_node();
+    void prepare_to_join(
+            std::unordered_set<gms::inet_address> initial_contact_nodes,
+            std::unordered_set<gms::inet_address> loaded_endpoints,
+            std::unordered_map<gms::inet_address, sstring> loaded_peer_features,
+            bind_messaging_port do_bind = bind_messaging_port::yes);
     void join_token_ring(int delay);
-    void wait_for_feature_listeners_to_finish();
     void maybe_start_sys_dist_ks();
 public:
     inline bool is_joined() const {
@@ -585,6 +572,9 @@ private:
     /* Returns `true` iff we started using the generation (it was not obsolete),
      * which means that this node might write some CDC log entries using streams from this generation. */
     bool do_handle_cdc_generation(db_clock::time_point);
+    /* Wrapper around `do_handle_cdc_generation` which intercepts timeout/unavailability exceptions.
+     * Returns: do_handle_cdc_generation(ts). */
+    bool do_handle_cdc_generation_intercept_nonfatal_errors(db_clock::time_point ts);
 
     /* If `handle_cdc_generation` fails, it schedules an asynchronous retry in the background
      * using `async_handle_cdc_generation`.
@@ -597,23 +587,15 @@ private:
      */
     void scan_cdc_generations();
 
-    future<> replicate_to_all_cores();
-    future<> do_replicate_to_all_cores();
-    serialized_action _replicate_action;
-    serialized_action _update_pending_ranges_action;
+public:
+    future<> check_and_repair_cdc_streams();
+private:
+    // Should be serialized under token_metadata_lock.
+    future<> replicate_to_all_cores(mutable_token_metadata_ptr tmptr) noexcept;
     sharded<db::system_distributed_keyspace>& _sys_dist_ks;
     sharded<db::view::view_update_generator>& _view_update_generator;
+    serialized_action _schema_version_publisher;
 private:
-    /**
-     * Replicates token_metadata contents on shard0 instance to other shards.
-     *
-     * Should be serialized.
-     * Should run on shard 0 only.
-     *
-     * @return a ready future when replication is complete.
-     */
-    future<> replicate_tm_only();
-
     /**
      * Handle node bootstrap
      *
@@ -660,6 +642,13 @@ private:
      */
     void handle_state_removing(inet_address endpoint, std::vector<sstring> pieces);
 
+    /**
+     * Handle notification that a node is replacing another node.
+     *
+     * @param endpoint node
+     */
+    void handle_state_replacing(inet_address endpoint);
+
 private:
     void excise(std::unordered_set<token> tokens, inet_address endpoint);
     void excise(std::unordered_set<token> tokens, inet_address endpoint, long expire_time);
@@ -678,9 +667,13 @@ private:
      *
      * @param keyspaceName the keyspace ranges belong to
      * @param ranges the ranges to find sources for
+     * @param tm the token metadata
      * @return multimap of addresses to ranges the address is responsible for
+     *
+     * @note The function must be called from a seastar thread.
+     *       The caller is responsible for keeping @ref tm valid across the call.
      */
-    std::unordered_multimap<inet_address, dht::token_range> get_new_source_ranges(const sstring& keyspaceName, const dht::token_range_vector& ranges);
+    std::unordered_multimap<inet_address, dht::token_range> get_new_source_ranges(const sstring& keyspaceName, const dht::token_range_vector& ranges, const token_metadata& tm);
 public:
     future<> confirm_replication(inet_address node);
 
@@ -716,42 +709,6 @@ public:
 
     future<std::unordered_map<sstring, std::vector<sstring>>> describe_schema_versions();
 
-    /**
-     * Takes the snapshot for all keyspaces. A snapshot name must be specified.
-     *
-     * @param tag the tag given to the snapshot; may not be null or empty
-     */
-    future<> take_snapshot(sstring tag) {
-        return take_snapshot(tag, {});
-    }
-
-    /**
-     * Takes the snapshot for the given keyspaces. A snapshot name must be specified.
-     *
-     * @param tag the tag given to the snapshot; may not be null or empty
-     * @param keyspaceNames the names of the keyspaces to snapshot; empty means "all."
-     */
-    future<> take_snapshot(sstring tag, std::vector<sstring> keyspace_names);
-
-    /**
-     * Takes the snapshot of a specific column family. A snapshot name must be specified.
-     *
-     * @param keyspaceName the keyspace which holds the specified column family
-     * @param columnFamilyName the column family to snapshot
-     * @param tag the tag given to the snapshot; may not be null or empty
-     */
-    future<> take_column_family_snapshot(sstring ks_name, sstring cf_name, sstring tag);
-
-    /**
-     * Remove the snapshot with the given name from the given keyspaces.
-     * If no tag is specified we will remove all snapshots.
-     * If a cf_name is specified, only that table will be deleted
-     */
-    future<> clear_snapshot(sstring tag, std::vector<sstring> keyspace_names, sstring cf_name);
-
-    future<std::unordered_map<sstring, std::vector<snapshot_details>>> get_snapshot_details();
-
-    future<int64_t> true_snapshots_size();
 
     /**
      * Get all ranges an endpoint is responsible for (by keyspace)
@@ -848,7 +805,8 @@ public:
      *
      * @param hostIdString token for the node
      */
-    future<> removenode(sstring host_id_string);
+    future<> removenode(sstring host_id_string, std::list<gms::inet_address> ignore_nodes);
+    future<node_ops_cmd_response> node_ops_cmd_handler(gms::inet_address coordinator, node_ops_cmd_request req);
 
     future<sstring> get_operation_mode();
 
@@ -898,6 +856,8 @@ public:
      */
     future<> load_new_sstables(sstring ks_name, sstring cf_name);
 
+    future<> set_tables_autocompaction(const sstring &keyspace, std::vector<sstring> tables, bool enabled);
+
     template <typename Func>
     auto run_with_api_lock(sstring operation, Func&& func) {
         return get_storage_service().invoke_on(0, [operation = std::move(operation),
@@ -920,15 +880,8 @@ public:
     }
 private:
     void do_isolate_on_error(disk_error type);
-    utils::UUID _local_host_id;
-public:
-    utils::UUID get_local_id() const { return _local_host_id; }
+    future<> isolate();
 
-    sstring get_config_supported_features();
-    std::set<std::string_view> get_config_supported_features_set();
-private:
-    std::set<std::string_view> get_known_features_set();
-    future<> set_cql_ready(bool ready);
     void notify_down(inet_address endpoint);
     void notify_left(inet_address endpoint);
     void notify_up(inet_address endpoint);
@@ -937,14 +890,17 @@ private:
 public:
     future<bool> is_cleanup_allowed(sstring keyspace);
     bool is_repair_based_node_ops_enabled();
+private:
+    struct workload_prioritization_create_tables_tag {};
+    using workload_prioritization_create_tables = bool_class<workload_prioritization_create_tables_tag>;
+    void start_workload_prioritization(workload_prioritization_create_tables create_tables);
 };
 
-future<> init_storage_service(sharded<abort_source>& abort_sources, distributed<database>& db, sharded<gms::gossiper>& gossiper, sharded<auth::service>& auth_service,
+future<> init_storage_service(sharded<abort_source>& abort_sources, distributed<database>& db, sharded<gms::gossiper>& gossiper,
         sharded<db::system_distributed_keyspace>& sys_dist_ks,
         sharded<db::view::view_update_generator>& view_update_generator, sharded<gms::feature_service>& feature_service,
-        storage_service_config config, sharded<service::migration_notifier>& mn, sharded<locator::token_metadata>& tm, sharded<qos::service_level_controller>& sl_controller);
+        storage_service_config config, sharded<service::migration_notifier>& mn, sharded<locator::shared_token_metadata>& stm,
+        sharded<netw::messaging_service>& ms, sharded<qos::service_level_controller>& sl_controller);
 future<> deinit_storage_service();
-
-future<> read_sstables_format(distributed<storage_service>& ss);
 
 }

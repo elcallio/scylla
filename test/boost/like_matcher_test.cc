@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #define BOOST_TEST_MODULE core
@@ -28,6 +17,14 @@
 auto matcher(const char* s) { return like_matcher(bytes(s)); }
 
 bool matches(const like_matcher& m, const char* txt) { return m(bytes(txt)); }
+
+#if __cplusplus > 201703L
+
+auto matcher(const char8_t* s) { return matcher(reinterpret_cast<const char*>(s)); }
+
+bool matches(const like_matcher& m, const char8_t* txt) { return m(bytes(reinterpret_cast<const char*>(txt))); }
+
+#endif
 
 BOOST_AUTO_TEST_CASE(test_literal) {
     auto m = matcher(u8"abc");
@@ -438,13 +435,13 @@ BOOST_AUTO_TEST_CASE(test_dollar) {
 BOOST_AUTO_TEST_CASE(test_reset) {
     auto m = matcher(u8"alpha");
     BOOST_TEST(matches(m, u8"alpha"));
-    m.reset(bytes(u8"omega"));
+    m.reset(bytes(reinterpret_cast<const char*>(u8"omega")));
     BOOST_TEST(!matches(m, u8"alpha"));
     BOOST_TEST(matches(m, u8"omega"));
-    m.reset(bytes(u8"omega"));
+    m.reset(bytes(reinterpret_cast<const char*>(u8"omega")));
     BOOST_TEST(!matches(m, u8"alpha"));
     BOOST_TEST(matches(m, u8"omega"));
-    m.reset(bytes(u8"alpha"));
+    m.reset(bytes(reinterpret_cast<const char*>(u8"alpha")));
     BOOST_TEST(matches(m, u8"alpha"));
     BOOST_TEST(!matches(m, u8"omega"));
 }

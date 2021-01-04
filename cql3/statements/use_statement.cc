@@ -67,11 +67,6 @@ audit::statement_category use_statement::category() const {
 
 }
 
-bool use_statement::uses_function(const sstring& ks_name, const sstring& function_name) const
-{
-    return false;
-}
-
 bool use_statement::depends_on_keyspace(const sstring& ks_name) const
 {
     return false;

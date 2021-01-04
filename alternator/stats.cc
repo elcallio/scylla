@@ -5,22 +5,11 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "stats.hh"
-
+#include "utils/histogram_metrics_helper.hh"
 #include <seastar/core/metrics.hh>
 
 namespace alternator {
@@ -37,7 +26,7 @@ stats::stats() : api_operations{} {
                         seastar::metrics::description("number of operations via Alternator API"), {op(CamelCaseName)}),
 #define OPERATION_LATENCY(name, CamelCaseName) \
                 seastar::metrics::make_histogram("op_latency", \
-                        seastar::metrics::description("Latency histogram of an operation via Alternator API"), {op(CamelCaseName)}, [this]{return api_operations.name.get_histogram(1,20);}),
+                        seastar::metrics::description("Latency histogram of an operation via Alternator API"), {op(CamelCaseName)}, [this]{return to_metrics_histogram(api_operations.name);}),
             OPERATION(batch_write_item, "BatchWriteItem")
             OPERATION(create_backup, "CreateBackup")
             OPERATION(create_global_table, "CreateGlobalTable")
@@ -77,6 +66,11 @@ stats::stats() : api_operations{} {
             OPERATION_LATENCY(get_item_latency, "GetItem")
             OPERATION_LATENCY(delete_item_latency, "DeleteItem")
             OPERATION_LATENCY(update_item_latency, "UpdateItem")
+            OPERATION(list_streams, "ListStreams")
+            OPERATION(describe_stream, "DescribeStream")
+            OPERATION(get_shard_iterator, "GetShardIterator")
+            OPERATION(get_records, "GetRecords")
+            OPERATION_LATENCY(get_records_latency, "GetRecords")
     });
     _metrics.add_group("alternator", {
             seastar::metrics::make_total_operations("unsupported_operations", unsupported_operations,

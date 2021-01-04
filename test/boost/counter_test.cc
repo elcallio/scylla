@@ -413,11 +413,11 @@ SEASTAR_TEST_CASE(test_transfer_updates_to_shards) {
         m3.set_static_cell(scol, std::move(c3));
 
         auto m0 = m1;
-        transform_counter_updates_to_shards(m0, nullptr, 0);
+        transform_counter_updates_to_shards(m0, nullptr, 0, utils::UUID{});
 
         auto empty = mutation(s, pk);
         auto m = m1;
-        transform_counter_updates_to_shards(m, &empty, 0);
+        transform_counter_updates_to_shards(m, &empty, 0, utils::UUID{});
         BOOST_REQUIRE_EQUAL(m, m0);
 
         auto ac = get_counter_cell(m);
@@ -435,7 +435,7 @@ SEASTAR_TEST_CASE(test_transfer_updates_to_shards) {
       });
 
         m = m2;
-        transform_counter_updates_to_shards(m, &m0, 0);
+        transform_counter_updates_to_shards(m, &m0, 0, utils::UUID{});
 
         ac = get_counter_cell(m);
         BOOST_REQUIRE(ac.is_live());
@@ -452,7 +452,7 @@ SEASTAR_TEST_CASE(test_transfer_updates_to_shards) {
       });
 
         m = m3;
-        transform_counter_updates_to_shards(m, &m0, 0);
+        transform_counter_updates_to_shards(m, &m0, 0, utils::UUID{});
         ac = get_counter_cell(m);
         BOOST_REQUIRE(!ac.is_live());
         ac = get_static_counter_cell(m);
@@ -517,70 +517,6 @@ SEASTAR_TEST_CASE(test_sanitize_corrupted_cells) {
           });
          });
         }
-    });
-}
-
-SEASTAR_TEST_CASE(test_counter_id_order_1_7_4) {
-    return seastar::async([] {
-        const char* ids[] = {
-            "e41baa44-b178-48fc-ab75-11e9664409be",
-            "f2ad405d-1658-484f-9418-6314ae2cedcf",
-            "ffeeddcc-aa99-8877-6655-443322110000",
-            "ffeeddcc-aa99-8877-6655-443322110001",
-            "ffeeddcc-aa99-8878-6655-443322110000",
-            "00000000-0000-0000-0000-000000000000",
-            "00000000-0000-0000-0000-000000000001",
-            "0290003c-977e-397c-ac3e-fdfdc01d626b",
-            "0290003c-987e-397c-ac3e-fdfdc01d626b",
-            "0eeeddcc-aa99-8877-6655-443322110000",
-            "0feeddcc-aa99-8877-8655-443322110000",
-            "0feeddcc-aa99-8877-6655-443322110000",
-            "3bf296f0-6e46-4481-87dc-ca53e61a8f08",
-        };
-
-        auto counter_ids = boost::copy_range<std::vector<counter_id>>(
-            ids | boost::adaptors::transformed([] (auto id) {
-                return counter_id(utils::UUID(id));
-            })
-        );
-
-        counter_id::less_compare_1_7_4 cmp;
-        for (auto it = counter_ids.begin(); it != counter_ids.end(); ++it) {
-            for (auto it2 = counter_ids.begin(); it2 != it; ++it2) {
-                BOOST_REQUIRE_MESSAGE(cmp(*it2, *it), *it2 << " expected to be less than " << *it);
-            }
-            for (auto it2 = std::next(it); it2 != counter_ids.end(); ++it2) {
-                BOOST_REQUIRE_MESSAGE(cmp(*it, *it2), *it << " expected to be less than " << *it2);
-            }
-        }
-    });
-}
-
-SEASTAR_TEST_CASE(test_shards_compatible_with_1_7_4) {
-    return seastar::async([] {
-        auto cdef = column_definition("name", counter_type, column_kind::regular_column);
-
-        auto ids = generate_ids(16);
-
-        counter_cell_builder ccb;
-        for (auto&& id : ids) {
-            ccb.add_shard(counter_shard(id, 1, 1));
-        }
-        auto ac = atomic_cell_or_collection(ccb.build(0));
-
-      counter_cell_view::with_linearized(ac.as_atomic_cell(cdef), [&] (counter_cell_view cv) {
-
-        verify_shard_order(cv);
-
-        std::optional<counter_id> previous;
-        counter_id::less_compare_1_7_4 cmp;
-        for (auto&& cs : cv.shards_compatible_with_1_7_4()) {
-            if (previous) {
-                BOOST_REQUIRE_MESSAGE(cmp(*previous, cs.id()), *previous << " expected to be less than " << cs.id());
-            }
-            previous = cs.id();
-        }
-      });
     });
 }
 

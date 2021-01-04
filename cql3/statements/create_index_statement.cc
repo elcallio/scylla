@@ -62,7 +62,7 @@ create_index_statement::create_index_statement(::shared_ptr<cf_name> name,
 
 future<>
 create_index_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
-    return state.has_column_family_access(keyspace(), column_family(), auth::permission::ALTER);
+    return state.has_column_family_access(proxy.local_db(), keyspace(), column_family(), auth::permission::ALTER);
 }
 
 void
@@ -154,7 +154,7 @@ create_index_statement::validate(service::storage_proxy& proxy, const service::c
         }
     }
 
-    if (db.existing_index_names(keyspace()).count(_index_name) > 0) {
+    if (db.existing_index_names(keyspace()).contains(_index_name)) {
         if (_if_not_exists) {
             return;
         } else {
@@ -252,7 +252,7 @@ void create_index_statement::validate_targets_for_multi_column_index(std::vector
     }
     std::unordered_set<sstring> columns;
     for (auto& target : targets) {
-        if (columns.count(target->as_string()) > 0) {
+        if (columns.contains(target->as_string())) {
             throw exceptions::invalid_request_exception(format("Duplicate column {} in index target list", target->as_string()));
         }
         columns.emplace(target->as_string());
@@ -260,10 +260,7 @@ void create_index_statement::validate_targets_for_multi_column_index(std::vector
 }
 
 future<::shared_ptr<cql_transport::event::schema_change>>
-create_index_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const {
-    if (!proxy.features().cluster_supports_indexes()) {
-        throw exceptions::invalid_request_exception("Index support is not enabled");
-    }
+create_index_statement::announce_migration(service::storage_proxy& proxy) const {
     auto& db = proxy.get_db().local();
     auto schema = db.find_schema(keyspace(), column_family());
     std::vector<::shared_ptr<index_target>> targets;
@@ -302,7 +299,7 @@ create_index_statement::announce_migration(service::storage_proxy& proxy, bool i
     schema_builder builder{schema};
     builder.with_index(index);
     return service::get_local_migration_manager().announce_column_family_update(
-            builder.build(), false, {}, is_local_only).then([this]() {
+            builder.build(), false, {}).then([this]() {
         using namespace cql_transport;
         return ::make_shared<event::schema_change>(
                 event::schema_change::change_type::UPDATED,

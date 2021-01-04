@@ -19,6 +19,8 @@
 #include <string>
 
 #include <seastar/core/seastar.hh>
+#include <seastar/core/when_all.hh>
+#include <seastar/util/later.hh>
 #include <seastar/util/log.hh>
 
 #include "seastarx.hh"
@@ -217,7 +219,7 @@ sstring ldap_connection::get_error() const {
 }
 
 int ldap_connection::sbi_ctrl(Sockbuf_IO_Desc* sid, int opt, void* arg) noexcept {
-    mylog.debug("sbi_ctrl({}/{}, {}, {})", sid, sid->sbiod_pvt, opt, arg);
+    mylog.debug("sbi_ctrl({}/{}, {}, {})", static_cast<void*>(sid), sid->sbiod_pvt, opt, arg);
     auto conn = connection(sid);
     switch (opt) {
     case LBER_SB_OPT_DATA_READY:
@@ -235,7 +237,7 @@ int ldap_connection::sbi_ctrl(Sockbuf_IO_Desc* sid, int opt, void* arg) noexcept
 }
 
 ber_slen_t ldap_connection::sbi_read(Sockbuf_IO_Desc* sid, void* buffer, ber_len_t size) noexcept {
-    mylog.trace("sbi_read {}/{}", sid, sid->sbiod_pvt);
+    mylog.trace("sbi_read {}/{}", static_cast<const void*>(sid), static_cast<const void*>(sid->sbiod_pvt));
     try {
         return connection(sid)->read(reinterpret_cast<char*>(buffer), size);
     } catch (...) {
@@ -245,7 +247,7 @@ ber_slen_t ldap_connection::sbi_read(Sockbuf_IO_Desc* sid, void* buffer, ber_len
 }
 
 ber_slen_t ldap_connection::sbi_write(Sockbuf_IO_Desc* sid, void* buffer, ber_len_t size) noexcept {
-    mylog.trace("sbi_write {}/{}", sid, sid->sbiod_pvt);
+    mylog.trace("sbi_write {}/{}", static_cast<const void*>(sid), static_cast<const void*>(sid->sbiod_pvt));
     try {
         return connection(sid)->write(reinterpret_cast<const char*>(buffer), size);
     } catch (...) {
@@ -255,7 +257,7 @@ ber_slen_t ldap_connection::sbi_write(Sockbuf_IO_Desc* sid, void* buffer, ber_le
 }
 
 int ldap_connection::sbi_close(Sockbuf_IO_Desc* sid) noexcept {
-    mylog.debug("sbi_close {}/{}", sid, sid->sbiod_pvt);
+    mylog.debug("sbi_close {}/{}", static_cast<const void*>(sid), static_cast<const void*>(sid->sbiod_pvt));
     // Leave actual closing to the owner of *this.  Note sbi_close() will be invoked during
     // ldap_unbind(), which also calls sbi_write() to convey one last message to the server.  We
     // remain open here, to try to communicate that message.
@@ -288,7 +290,7 @@ void ldap_connection::read_ahead() {
     mylog.trace("read_ahead invoking socket read");
     _read_consumer = _input_stream.read().then([this] (temporary_buffer<char> b) {
         if (b.empty()) {
-            mylog.error("read_ahead received empty buffer; assuming EOF");
+            mylog.debug("read_ahead received empty buffer; assuming EOF");
             set_status(status::eof);
             return;
         }

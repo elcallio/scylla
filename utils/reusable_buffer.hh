@@ -5,24 +5,12 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
 
 #include <seastar/core/memory.hh>
-#include <seastar/util/gcc6-concepts.hh>
 
 #include "bytes.hh"
 #include "bytes_ostream.hh"
@@ -120,9 +108,9 @@ public:
     /// size of the buffer (less than or equal the previously specified maximum
     /// length).
     template<typename Function>
-    GCC6_CONCEPT(requires requires(Function fn, bytes_mutable_view view) {
-        { fn(view) } -> size_t;
-    })
+    requires requires(Function fn, bytes_mutable_view view) {
+        { fn(view) } -> std::convertible_to<size_t>;
+    }
     bytes_ostream make_buffer(size_t maximum_length, Function&& fn) {
         bytes_ostream output;
         bytes_mutable_view view = [&] {
@@ -142,9 +130,9 @@ public:
     }
 
     template<typename Function>
-    GCC6_CONCEPT(requires requires(Function fn, bytes_mutable_view view) {
-        { fn(view) } -> size_t;
-    })
+    requires requires(Function fn, bytes_mutable_view view) {
+        { fn(view) } -> std::same_as<size_t>;
+    }
     fragmented_temporary_buffer make_fragmented_temporary_buffer(size_t maximum_length, size_t maximum_fragment_size, Function&& fn) {
         std::vector<temporary_buffer<char>> fragments;
         bytes_mutable_view view = [&] {

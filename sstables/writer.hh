@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -42,15 +31,32 @@ class metadata_collector;
 class file_writer {
     output_stream<char> _out;
     writer_offset_tracker _offset;
+    std::optional<sstring> _filename;
+    bool _closed = false;
 public:
-    file_writer(file f, file_output_stream_options options)
-        : _out(make_file_output_stream(std::move(f), std::move(options))) {}
+    // Closes the file if file_writer creation fails
+    static future<file_writer> make(file f, file_output_stream_options options, sstring filename) noexcept;
 
-    file_writer(output_stream<char>&& out)
-        : _out(std::move(out)) {}
+    file_writer(output_stream<char>&& out, sstring filename) noexcept
+        : _out(std::move(out))
+        , _filename(std::move(filename))
+    {}
 
-    virtual ~file_writer() = default;
-    file_writer(file_writer&&) = default;
+    file_writer(output_stream<char>&& out) noexcept
+        : _out(std::move(out))
+    {}
+
+    // Must be called in a seastar thread.
+    virtual ~file_writer();
+    file_writer(const file_writer&) = delete;
+    file_writer(file_writer&& x) noexcept
+        : _out(std::move(x._out))
+        , _offset(std::move(x._offset))
+        , _filename(std::move(x._filename))
+        , _closed(x._closed)
+    {
+        x._closed = true;   // don't auto-close in destructor
+    }
     // Must be called in a seastar thread.
     void write(const char* buf, size_t n) {
         _offset.offset += n;
@@ -66,9 +72,8 @@ public:
         _out.flush().get();
     }
     // Must be called in a seastar thread.
-    void close() {
-        _out.close().get();
-    }
+    void close();
+
     uint64_t offset() const {
         return _offset.offset;
     }
@@ -76,6 +81,8 @@ public:
     const writer_offset_tracker& offset_tracker() const {
         return _offset;
     }
+
+    const char* get_filename() const noexcept;
 };
 
 
@@ -127,16 +134,14 @@ serialized_size(sstable_version_types v, const T& object) {
 }
 
 template <typename ChecksumType>
-GCC6_CONCEPT(
-    requires ChecksumUtils<ChecksumType>
-)
+requires ChecksumUtils<ChecksumType>
 class checksummed_file_data_sink_impl : public data_sink_impl {
     data_sink _out;
     struct checksum& _c;
     uint32_t& _full_checksum;
 public:
-    checksummed_file_data_sink_impl(file f, struct checksum& c, uint32_t& full_file_checksum, file_output_stream_options options)
-            : _out(make_file_data_sink(std::move(f), std::move(options)))
+    checksummed_file_data_sink_impl(data_sink out, struct checksum& c, uint32_t& full_file_checksum)
+            : _out(std::move(out))
             , _c(c)
             , _full_checksum(full_file_checksum)
             {}
@@ -167,36 +172,29 @@ public:
 };
 
 template <typename ChecksumType>
-GCC6_CONCEPT(
-    requires ChecksumUtils<ChecksumType>
-)
+requires ChecksumUtils<ChecksumType>
 class checksummed_file_data_sink : public data_sink {
 public:
-    checksummed_file_data_sink(file f, struct checksum& cinfo, uint32_t& full_file_checksum, file_output_stream_options options)
-        : data_sink(std::make_unique<checksummed_file_data_sink_impl<ChecksumType>>(std::move(f), cinfo, full_file_checksum, std::move(options))) {}
+    checksummed_file_data_sink(data_sink out, struct checksum& cinfo, uint32_t& full_file_checksum)
+        : data_sink(std::make_unique<checksummed_file_data_sink_impl<ChecksumType>>(std::move(out), cinfo, full_file_checksum)) {}
 };
 
 template <typename ChecksumType>
-GCC6_CONCEPT(
-    requires ChecksumUtils<ChecksumType>
-)
+requires ChecksumUtils<ChecksumType>
 inline
-output_stream<char> make_checksummed_file_output_stream(file f, struct checksum& cinfo, uint32_t& full_file_checksum, file_output_stream_options options) {
-    auto buffer_size = options.buffer_size;
-    return output_stream<char>(checksummed_file_data_sink<ChecksumType>(std::move(f), cinfo, full_file_checksum, std::move(options)), buffer_size, true);
+output_stream<char> make_checksummed_file_output_stream(data_sink out, struct checksum& cinfo, uint32_t& full_file_checksum, size_t buffer_size) {
+    return output_stream<char>(checksummed_file_data_sink<ChecksumType>(std::move(out), cinfo, full_file_checksum), buffer_size, true);
 }
 
 template <typename ChecksumType>
-GCC6_CONCEPT(
-    requires ChecksumUtils<ChecksumType>
-)
+requires ChecksumUtils<ChecksumType>
 class checksummed_file_writer : public file_writer {
     checksum _c;
     uint32_t _full_checksum;
 public:
-    checksummed_file_writer(file f, file_output_stream_options options)
-            : file_writer(make_checksummed_file_output_stream<ChecksumType>(std::move(f), _c, _full_checksum, options))
-            , _c({uint32_t(std::min(size_t(DEFAULT_CHUNK_SIZE), size_t(options.buffer_size)))})
+    checksummed_file_writer(data_sink out, size_t buffer_size, sstring filename)
+            : file_writer(make_checksummed_file_output_stream<ChecksumType>(std::move(out), _c, _full_checksum, buffer_size), std::move(filename))
+            , _c({uint32_t(std::min(size_t(DEFAULT_CHUNK_SIZE), buffer_size))})
             , _full_checksum(ChecksumType::init_checksum()) {}
 
     // Since we are exposing a reference to _full_checksum, we delete the move
@@ -217,7 +215,7 @@ using adler32_checksummed_file_writer = checksummed_file_writer<adler32_utils>;
 using crc32_checksummed_file_writer = checksummed_file_writer<crc32_utils>;
 
 template <typename T, typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 inline void write_vint_impl(W& out, T value) {
     using vint_type = std::conditional_t<std::is_unsigned_v<T>, unsigned_vint, signed_vint>;
     std::array<bytes::value_type, max_vint_length> encoding_buffer;
@@ -226,24 +224,24 @@ inline void write_vint_impl(W& out, T value) {
 }
 
 template <typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 void write_unsigned_vint(W& out, uint64_t value) {
     return write_vint_impl(out, value);
 }
 
 template <typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 void write_signed_vint(W& out, int64_t value) {
     return write_vint_impl(out, value);
 }
 
 template <typename T, typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 typename std::enable_if_t<!std::is_integral_v<T>>
 write_vint(W& out, T t) = delete;
 
 template <typename T, typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 inline void write_vint(W& out, T value) {
     static_assert(std::is_integral_v<T>, "Non-integral values can't be written using write_vint");
     return std::is_unsigned_v<T> ? write_unsigned_vint(out, value) : write_signed_vint(out, value);
@@ -251,7 +249,7 @@ inline void write_vint(W& out, T value) {
 
 
 template <typename T, typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 inline typename std::enable_if_t<std::is_integral<T>::value, void>
 write(sstable_version_types v, W& out, T i) {
     auto *nr = reinterpret_cast<const net::packed<T> *>(&i);
@@ -261,7 +259,7 @@ write(sstable_version_types v, W& out, T i) {
 }
 
 template <typename T, typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 inline typename std::enable_if_t<std::is_enum<T>::value, void>
 write(sstable_version_types v, W& out, T i) {
     write(v, out, static_cast<typename std::underlying_type<T>::type>(i));
@@ -269,7 +267,7 @@ write(sstable_version_types v, W& out, T i) {
 
 
 template <typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 inline void write(sstable_version_types v, W& out, bool i) {
     write(v, out, static_cast<uint8_t>(i));
 }
@@ -283,13 +281,13 @@ inline void write(sstable_version_types v, file_writer& out, double d) {
 
 
 template <typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 inline void write(sstable_version_types v, W& out, const bytes& s) {
     out.write(s);
 }
 
 template <typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 inline void write(sstable_version_types v, W& out, bytes_view s) {
     out.write(reinterpret_cast<const char*>(s.data()), s.size());
 }
@@ -302,20 +300,20 @@ inline void write(sstable_version_types v, file_writer& out, bytes_ostream s) {
 
 
 template<typename W, typename First, typename Second, typename... Rest>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 inline void write(sstable_version_types v, W& out, const First& first, const Second& second, Rest&&... rest) {
     write(v, out, first);
     write(v, out, second, std::forward<Rest>(rest)...);
 }
 
 template <class T, typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 inline void write(sstable_version_types v, W& out, const vint<T>& t) {
     write_vint(out, t.value);
 }
 
 template <class T, typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 typename std::enable_if_t<!std::is_integral<T>::value && !std::is_enum<T>::value, void>
 write(sstable_version_types v, W& out, const T& t) {
     // describe_type() is not const correct, so cheat here:
@@ -534,32 +532,32 @@ void write_column_name(sstable_version_types v, Writer& out, const schema& s, co
 }
 
 template <typename W>
-GCC6_CONCEPT(requires Writer<W>())
-void write_cell_value(W& out, const abstract_type& type, bytes_view value) {
+requires Writer<W>
+void write_cell_value(sstable_version_types v, W& out, const abstract_type& type, bytes_view value) {
     if (!value.empty()) {
         if (type.value_length_if_fixed()) {
-            write(sstable_version_types::mc, out, value);
+            write(v, out, value);
         } else {
             write_vint(out, value.size());
-            write(sstable_version_types::mc, out, value);
+            write(v, out, value);
         }
     }
 }
 
 template <typename W>
-GCC6_CONCEPT(requires Writer<W>())
-void write_cell_value(W& out, const abstract_type& type, atomic_cell_value_view value) {
+requires Writer<W>
+void write_cell_value(sstable_version_types v, W& out, const abstract_type& type, atomic_cell_value_view value) {
     if (!value.empty()) {
         if (!type.value_length_if_fixed()) {
             write_vint(out, value.size_bytes());
         }
         using boost::range::for_each;
-        for_each(value, [&] (bytes_view fragment) { write(sstable_version_types::mc, out, fragment); });
+        for_each(value, [&] (bytes_view fragment) { write(v, out, fragment); });
     }
 }
 
 template <typename WriteLengthFunc, typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 void write_counter_value(counter_cell_view ccv, W& out, sstable_version_types v, WriteLengthFunc&& write_len_func) {
     auto shard_count = ccv.shard_count();
     static constexpr auto header_entry_size = sizeof(int16_t);
@@ -577,14 +575,8 @@ void write_counter_value(counter_cell_view ccv, W& out, sstable_version_types v,
             int64_t(uuid.get_least_significant_bits()),
             int64_t(s.logical_clock()), int64_t(s.value()));
     };
-    if (service::get_local_storage_service().features().cluster_supports_correct_counter_order()) {
-        for (auto&& s : ccv.shards()) {
-            write_shard(s);
-        }
-    } else {
-        for (auto&& s : ccv.shards_compatible_with_1_7_4()) {
-            write_shard(s);
-        }
+    for (auto&& s : ccv.shards()) {
+        write_shard(s);
     }
 }
 
@@ -597,12 +589,12 @@ const db::config& get_config();
 
 void prepare_summary(summary& s, uint64_t expected_partition_count, uint32_t min_index_interval);
 
-void seal_summary(summary& s,
+future<> seal_summary(summary& s,
     std::optional<key>&& first_key,
     std::optional<key>&& last_key,
     const index_sampling_state& state);
 
-void seal_statistics(sstable_version_types, statistics&, metadata_collector&,
+void seal_statistics(sstable_version_types, statistics&, metadata_collector&, const std::set<int>& _compaction_ancestors,
     const sstring partitioner, double bloom_filter_fp_chance, schema_ptr,
     const dht::decorated_key& first_key, const dht::decorated_key& last_key, const encoding_stats& enc_stats = {});
 

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -39,6 +28,7 @@ class query_processor;
 namespace cdc {
     class stream_id;
     class topology_description;
+    class streams_version;
 } // namespace cdc
 
 namespace db {
@@ -50,10 +40,10 @@ public:
     static constexpr auto SERVICE_LEVELS = "service_levels";
 
     /* Nodes use this table to communicate new CDC stream generations to other nodes. */
-    static constexpr auto CDC_TOPOLOGY_DESCRIPTION = "cdc_topology_description";
+    static constexpr auto CDC_TOPOLOGY_DESCRIPTION = "cdc_generation_descriptions";
 
     /* This table is used by CDC clients to learn about avaliable CDC streams. */
-    static constexpr auto CDC_DESC = "cdc_description";
+    static constexpr auto CDC_DESC = "cdc_streams_descriptions";
 
     /* Information required to modify/query some system_distributed tables, passed from the caller. */
     struct context {
@@ -65,9 +55,14 @@ private:
     service::migration_manager& _mm;
 
 public:
+    /* Should writes to the given table always be synchronized by commitlog (flushed to disk)
+     * before being acknowledged? */
+    static bool is_extra_durable(const sstring& cf_name);
+
     system_distributed_keyspace(cql3::query_processor&, service::migration_manager&);
 
     future<> start();
+    future<> start_workload_prioritization();
     future<> stop();
 
     future<std::unordered_map<utils::UUID, sstring>> view_status(sstring ks_name, sstring view_name) const;
@@ -83,10 +78,15 @@ public:
     future<> expire_cdc_desc(db_clock::time_point streams_ts, db_clock::time_point expiration_time, context);
     future<bool> cdc_desc_exists(db_clock::time_point streams_ts, context);
 
+    future<std::map<db_clock::time_point, cdc::streams_version>> cdc_get_versioned_streams(context);
+
     future<qos::service_levels_info> get_service_levels() const;
     future<qos::service_levels_info> get_service_level(sstring service_level_name) const;
     future<> set_service_level(sstring service_level_name, qos::service_level_options slo) const;
     future<> drop_service_level(sstring service_level_name) const;
+    bool workload_prioritization_tables_exists();
+private:
+    future<> create_tables(std::vector<schema_ptr> tables);
 };
 
 }

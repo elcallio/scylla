@@ -5,27 +5,17 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "test/lib/normalizing_reader.hh"
+#include "test/lib/reader_permit.hh"
 #include <seastar/core/future-util.hh>
 
 normalizing_reader::normalizing_reader(flat_mutation_reader rd)
-    : impl(rd.schema())
+    : impl(rd.schema(), rd.permit())
     , _rd(std::move(rd))
-    , _range_tombstones(*_rd.schema())
+    , _range_tombstones(*_rd.schema(), tests::make_permit())
 {}
 
 future<> normalizing_reader::fill_buffer(db::timeout_clock::time_point timeout) {
@@ -48,9 +38,9 @@ future<> normalizing_reader::fill_buffer(db::timeout_clock::time_point timeout) 
                     while (auto mfo = _range_tombstones.get_next(mf)) {
                         range_tombstone&& rt = std::move(*mfo).as_range_tombstone();
                         if (!less(after_pos, rt.end_position())) {
-                            push_mutation_fragment(std::move(rt));
+                            push_mutation_fragment(*_schema, _permit, std::move(rt));
                         } else {
-                            push_mutation_fragment(range_tombstone{rt.position(), after_pos, rt.tomb});
+                            push_mutation_fragment(*_schema, _permit, range_tombstone{rt.position(), after_pos, rt.tomb});
                             _range_tombstones.apply(range_tombstone{after_pos, rt.end_position(), rt.tomb});
                         }
                     }
@@ -90,9 +80,6 @@ future<> normalizing_reader::fast_forward_to(
     forward_buffer_to(pr.start());
     _end_of_stream = false;
     return _rd.fast_forward_to(std::move(pr), timeout);
-}
-size_t normalizing_reader::buffer_size() const {
-    return flat_mutation_reader::impl::buffer_size() + _rd.buffer_size();
 }
 
 flat_mutation_reader make_normalizing_reader(flat_mutation_reader rd) {

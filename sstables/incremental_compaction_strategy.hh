@@ -60,9 +60,14 @@ class incremental_compaction_strategy : public compaction_strategy_impl {
     incremental_compaction_strategy_options _options;
     compaction_backlog_tracker _backlog_tracker;
 
+    using size_bucket_t = std::vector<sstables::sstable_run>;
+
     static constexpr int32_t DEFAULT_MAX_FRAGMENT_SIZE_IN_MB = 1000;
     const sstring FRAGMENT_SIZE_OPTION = "sstable_size_in_mb";
     size_t _fragment_size = DEFAULT_MAX_FRAGMENT_SIZE_IN_MB*1024*1024;
+
+    const sstring SPACE_AMPLIFICATION_GOAL_OPTION = "space_amplification_goal";
+    std::optional<double> _space_amplification_goal;
 
     std::vector<sstable_run_and_length> create_run_and_length_pairs(const std::vector<sstables::sstable_run>& runs) const;
 
@@ -94,8 +99,6 @@ public:
     virtual compaction_backlog_tracker& get_backlog_tracker() override {
         return _backlog_tracker;
     }
-
-    virtual std::vector<resharding_descriptor> get_resharding_jobs(column_family& cf, std::vector<shared_sstable> candidates) override;
 
     virtual std::unique_ptr<sstable_set_impl> make_sstable_set(schema_ptr schema) const override;
 };

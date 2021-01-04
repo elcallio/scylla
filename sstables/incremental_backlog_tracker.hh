@@ -46,7 +46,7 @@ class incremental_backlog_tracker final : public compaction_backlog_tracker::imp
         return in;
     }
     double log4(double x) const {
-        static constexpr double inv_log_4 = 1.0f / std::log(4);
+        static const double inv_log_4 = 1.0f / std::log(4);
         return log(x) * inv_log_4;
     }
 

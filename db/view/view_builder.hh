@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -28,7 +17,6 @@
 #include "query-request.hh"
 #include "service/migration_listener.hh"
 #include "service/migration_manager.hh"
-#include "sstables/sstable_set.hh"
 #include "utils/exponential_backoff_retry.hh"
 #include "utils/serialized_action.hh"
 #include "utils/UUID.hh"
@@ -115,6 +103,11 @@ class view_builder final : public service::migration_listener::only_view_notific
         std::optional<dht::token> next_token;
     };
 
+    struct stats {
+        uint64_t steps_performed = 0;
+        uint64_t steps_failed = 0;
+    };
+
     /**
      * Keeps track of the build progress for all the views of a particular
      * base table. Each execution of the build step comprises a query of
@@ -147,6 +140,7 @@ class view_builder final : public service::migration_listener::only_view_notific
     database& _db;
     db::system_distributed_keyspace& _sys_dist_ks;
     service::migration_notifier& _mnotifier;
+    reader_permit _permit;
     base_to_build_step_type _base_to_build_step;
     base_to_build_step_type::iterator _current_step = _base_to_build_step.end();
     serialized_action _build_step{std::bind(&view_builder::do_build_step, this)};
@@ -164,6 +158,14 @@ class view_builder final : public service::migration_listener::only_view_notific
     seastar::shared_promise<> _shards_finished_read_promise;
     // Used for testing.
     std::unordered_map<std::pair<sstring, sstring>, seastar::shared_promise<>, utils::tuple_hash> _build_notifiers;
+    stats _stats;
+    metrics::metric_groups _metrics;
+
+    struct view_builder_init_state {
+        std::vector<future<>> bookkeeping_ops;
+        std::vector<std::vector<view_build_status>> status_per_shard;
+        std::unordered_set<utils::UUID> built_views;
+    };
 
 public:
     // The view builder processes the base table in steps of batch_size rows.
@@ -201,11 +203,13 @@ private:
     void initialize_reader_at_current_token(build_step&);
     void load_view_status(view_build_status, std::unordered_set<utils::UUID>&);
     void reshard(std::vector<std::vector<view_build_status>>, std::unordered_set<utils::UUID>&);
-    future<> calculate_shard_build_step(std::vector<system_keyspace::view_name>, std::vector<system_keyspace::view_build_progress>);
+    void setup_shard_build_step(view_builder_init_state& vbi, std::vector<system_keyspace::view_name>, std::vector<system_keyspace::view_build_progress>);
+    future<> calculate_shard_build_step(view_builder_init_state& vbi);
     future<> add_new_view(view_ptr, build_step&);
     future<> do_build_step();
     void execute(build_step&, exponential_backoff_retry);
     future<> maybe_mark_view_as_built(view_ptr, dht::token);
+    void setup_metrics();
 
     struct consumer;
 };

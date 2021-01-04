@@ -22,19 +22,19 @@ import logging
 import multiprocessing
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
 import yaml
-import shutil
-import signal
-import shlex
-import time
 from random import randint
+
+output_is_a_tty = sys.stdout.isatty()
 
 LDAP_SERVER_CONFIGURATION_FILE = os.path.join(os.path.dirname(__file__), 'test', 'resource', 'slapd.conf')
 
@@ -110,7 +110,7 @@ def create_formatter(*decorators):
 
     def nocolor(arg):
         return str(arg)
-    return color if os.isatty(sys.stdout.fileno()) else nocolor
+    return color if output_is_a_tty else nocolor
 
 
 class palette:
@@ -200,12 +200,15 @@ class TestSuite(ABC):
             # Some tests are long and are better to be started earlier,
             # so pop them up while sorting the list
             lst.sort(key=lambda x: (x not in run_first_tests, x))
+        disable_tests = set(self.cfg.get("disable", []))
         skip_tests = set(self.cfg.get("skip_in_debug_mode", []))
         for shortname in lst:
-            if mode not in ["release", "dev"] and shortname in skip_tests:
+            if shortname in disable_tests or (mode not in ["release", "dev"] and shortname in skip_tests):
                 continue
             t = os.path.join(self.name, shortname)
             patterns = options.name if options.name else [t]
+            if options.skip_pattern and options.skip_pattern in t:
+                continue
             for p in patterns:
                 if p in t:
                     for i in range(options.repeat):
@@ -226,6 +229,9 @@ class UnitTestSuite(TestSuite):
     def add_test(self, shortname, mode, options):
         """Create a UnitTest class with possibly custom command line
         arguments and add it to the list of tests"""
+        # Skip tests which are not configured, and hence are not built
+        if os.path.join("test", self.name, shortname) not in options.tests:
+            return
 
         # Default seastar arguments, if not provided in custom test options,
         # are two cores and 2G of RAM
@@ -348,6 +354,7 @@ class BoostTest(UnitTest):
         boost_args += ['--report_level=no',
                        '--logger=HRF,test_suite:XML,test_suite,' + self.xmlout]
         boost_args += ['--catch_system_errors=no']  # causes undebuggable cores
+        boost_args += ['--color_output={}'.format('true' if output_is_a_tty else 'false')]
         boost_args += ['--']
         self.args = boost_args + self.args
 
@@ -355,11 +362,10 @@ class BoostTest(UnitTest):
         ET.parse(self.xmlout)
         super().check_log(trim)
 
-def can_connect(port):
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def can_connect(address, family=socket.AF_INET):
+    s = socket.socket(family)
     try:
-        s.connect(('127.0.0.1', port))
+        s.connect(address)
         return True
     except:
         return False
@@ -372,6 +378,15 @@ def try_something_backoff(something):
         time.sleep(sleep_time)
         sleep_time *= 2
     return True
+
+
+def make_saslauthd_conf(port, instance_path):
+    """Creates saslauthd.conf with appropriate contents under instance_path.  Returns the path to the new file."""
+    saslauthd_conf_path = os.path.join(instance_path, 'saslauthd.conf')
+    with open(saslauthd_conf_path, 'w') as f:
+        f.write('ldap_servers: ldap://localhost:{}\nldap_search_base: dc=example,dc=com'.format(port))
+    return saslauthd_conf_path
+
 
 class LdapTest(BoostTest):
     """A unit test which can produce its own XML output, and needs an ldap server"""
@@ -412,21 +427,32 @@ class LdapTest(BoostTest):
         subprocess.check_output(
             ['find', instance_path, '-type', 'f', '-exec', 'sed', '-i', replace_expression, '{}', ';'])
         # Put the test data in.
-        cmd = ['slapadd', '-F', os.path.abspath(instance_path)]
+        cmd = ['slapadd', '-F', instance_path]
         subprocess.check_output(
             cmd, input='\n\n'.join(DEFAULT_ENTRIES).encode('ascii'), stderr=subprocess.STDOUT)
         # Set up the server.
         SLAPD_URLS='ldap://:{}/ ldaps://:{}/'.format(port, port + 1)
         def can_connect_to_slapd():
-            return can_connect(port) and can_connect(port + 1) and can_connect(port + 2)
-        process = subprocess.Popen(['slapd', '-F', os.path.abspath(instance_path), '-h', SLAPD_URLS, '-d', '0'])
+            return can_connect(('127.0.0.1', port)) and can_connect(('127.0.0.1', port + 1)) and can_connect(('127.0.0.1', port + 2))
+        def can_connect_to_saslauthd():
+            return can_connect(os.path.join(instance_path, 'mux'), socket.AF_UNIX)
+        slapd_proc = subprocess.Popen(['slapd', '-F', instance_path, '-h', SLAPD_URLS, '-d', '0'])
+        saslauthd_conf_path = make_saslauthd_conf(port, instance_path)
+        saslauthd_proc = subprocess.Popen(
+            ['saslauthd', '-d', '-n', '1', '-a', 'ldap', '-O', saslauthd_conf_path, '-m', instance_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         def finalize():
-            process.terminate()
+            slapd_proc.terminate()
+            slapd_proc.wait() # Wait for slapd to remove slapd.pid, so it doesn't race with rmtree below.
+            saslauthd_proc.kill() # Somehow, invoking terminate() here also terminates toxiproxy-server. o_O
             shutil.rmtree(instance_path)
             subprocess.check_output(['toxiproxy-cli', 'd', proxy_name])
         if not try_something_backoff(can_connect_to_slapd):
             finalize()
             raise Exception('Unable to connect to slapd')
+        if not try_something_backoff(can_connect_to_saslauthd):
+            finalize()
+            raise Exception('Unable to connect to saslauthd')
         return finalize, '--byte-limit={}'.format(byte_limit)
 
 class CqlTest(Test):
@@ -498,6 +524,7 @@ class RunTest(Test):
         self.path = os.path.join(suite.path, shortname)
         self.xmlout = os.path.join(options.tmpdir, self.mode, "xml", self.uname + ".xunit.xml")
         self.args = ["--junit-xml={}".format(self.xmlout)]
+        self.env = { 'SCYLLA': os.path.join("build", self.mode, "scylla") }
 
     def print_summary(self):
         print("Output of {} {}:".format(self.path, " ".join(self.args)))
@@ -505,7 +532,7 @@ class RunTest(Test):
 
     async def run(self, options):
         # This test can and should be killed gently, with SIGTERM, not with SIGKILL
-        self.success = await run_test(self, options, gentle_kill=True)
+        self.success = await run_test(self, options, gentle_kill=True, env=self.env)
         logging.info("Test #%d %s", self.id, "succeeded" if self.success else "failed ")
         return self
 
@@ -548,10 +575,12 @@ class TabularConsoleOutput:
                 print(msg)
                 self.print_newline = False
         else:
+            if hasattr(test, 'time_end') and test.time_end > 0:
+                msg += " {:.2f}s".format(test.time_end - test.time_start)
             print(msg)
 
 
-async def run_test(test, options, gentle_kill=False):
+async def run_test(test, options, gentle_kill=False, env=dict()):
     """Run test program, return True if success else False"""
 
     with open(test.log_filename, "wb") as log:
@@ -573,22 +602,36 @@ async def run_test(test, options, gentle_kill=False):
         UBSAN_OPTIONS = [
             "halt_on_error=1",
             "abort_on_error=1",
+            f"suppressions={os.getcwd()}/ubsan-suppressions.supp",
             os.getenv("UBSAN_OPTIONS"),
         ]
         ASAN_OPTIONS = [
             "disable_coredump=0",
             "abort_on_error=1",
+            "detect_stack_use_after_return=1",
             os.getenv("ASAN_OPTIONS"),
         ]
+        ldap_instance_path = os.path.join(
+            os.path.abspath(os.path.join(os.path.split(test.path)[0], 'ldap_instances')),
+            str(ldap_port))
+        saslauthd_mux_path = os.path.join(ldap_instance_path, 'mux')
         if options.manual_execution:
             print('Please run the following shell command, then press <enter>:')
-            print('SEASTAR_LDAP_PORT={} {}'.format(
-                ldap_port, ' '.join([shlex.quote(e) for e in [test.path, *test.args]])))
+            print('SEASTAR_LDAP_PORT={} SASLAUTHD_MUX_PATH={} {}'.format(
+                ldap_port, saslauthd_mux_path, ' '.join([shlex.quote(e) for e in [test.path, *test.args]])))
             input('-- press <enter> to continue --')
             if cleanup_fn is not None:
                 cleanup_fn()
             return True
         try:
+            log.write("=== TEST.PY STARTING TEST #{} ===\n".format(test.id).encode(encoding="UTF-8"))
+            log.write("export UBSAN_OPTIONS='{}'\n".format(":".join(filter(None, UBSAN_OPTIONS))).encode(encoding="UTF-8"))
+            log.write("export ASAN_OPTIONS='{}'\n".format(":".join(filter(None, ASAN_OPTIONS))).encode(encoding="UTF-8"))
+            log.write("{} {}\n".format(test.path, " ".join(test.args)).encode(encoding="UTF-8"))
+            log.write("=== TEST.PY TEST OUTPUT ===\n".format(test.id).encode(encoding="UTF-8"))
+            log.flush();
+            test.time_start = time.time()
+            test.time_end = 0
             process = await asyncio.create_subprocess_exec(
                 test.path,
                 *test.args,
@@ -596,12 +639,18 @@ async def run_test(test, options, gentle_kill=False):
                 stdout=log,
                 env=dict(os.environ,
                          SEASTAR_LDAP_PORT=str(ldap_port),
+                         SASLAUTHD_MUX_PATH=saslauthd_mux_path,
                          UBSAN_OPTIONS=":".join(filter(None, UBSAN_OPTIONS)),
                          ASAN_OPTIONS=":".join(filter(None, ASAN_OPTIONS)),
+                         # TMPDIR env variable is used by any seastar/scylla
+                         # test for directory to store test temporary data.
+                         TMPDIR=os.path.join(options.tmpdir, test.mode),
+                         **env,
                          ),
                 preexec_fn=os.setsid,
             )
             stdout, _ = await asyncio.wait_for(process.communicate(), options.timeout)
+            test.time_end = time.time()
             if process.returncode != 0:
                 report_error('Test exited with code {code}\n'.format(code=process.returncode))
                 return False
@@ -651,7 +700,7 @@ def parse_cmd_line():
     """ Print usage and process command line options. """
     all_modes = ['debug', 'release', 'dev', 'sanitize']
     sysmem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
-    testmem = 2e9
+    testmem = 6e9
     cpus_per_test_job = 1
     default_num_jobs_mem = ((sysmem - 4e9) // testmem)
     default_num_jobs_cpu = multiprocessing.cpu_count() // cpus_per_test_job
@@ -680,7 +729,7 @@ def parse_cmd_line():
                         help="Run only tests for given build mode(s)")
     parser.add_argument('--repeat', action="store", default="1", type=int,
                         help="number of times to repeat test execution")
-    parser.add_argument('--timeout', action="store", default="3000", type=int,
+    parser.add_argument('--timeout', action="store", default="12000", type=int,
                         help="timeout value for test execution")
     parser.add_argument('--verbose', '-v', action='store_true', default=False,
                         help='Verbose reporting')
@@ -689,20 +738,29 @@ def parse_cmd_line():
     parser.add_argument('--save-log-on-success', "-s", default=False,
                         dest="save_log_on_success", action="store_true",
                         help="Save test log output on success.")
+    parser.add_argument('--list', dest="list_tests", action="store_true", default=False,
+                        help="Print list of tests instead of executing them")
+    parser.add_argument('--skip', default="",
+                        dest="skip_pattern", action="store",
+                        help="Skip tests which match the provided pattern")
     parser.add_argument('--manual-execution', action='store_true', default=False,
                         help='Let me manually run the test executable at the moment this script would run it')
     parser.add_argument('--byte-limit', action="store", default=None, type=int,
                         help="Specific byte limit for failure injection (random by default)")
     args = parser.parse_args()
 
-    if not sys.stdout.isatty():
+    if not output_is_a_tty:
         args.verbose = True
 
     if not args.modes:
-        out = subprocess.Popen(['ninja', 'mode_list'], stdout=subprocess.PIPE).communicate()[0].decode()
-        # [1/1] List configured modes
-        # debug release dev
-        args.modes = out.split('\n')[1].split(' ')
+        try:
+            out = subprocess.Popen(['ninja', 'mode_list'], stdout=subprocess.PIPE).communicate()[0].decode()
+            # [1/1] List configured modes
+            # debug release dev
+            args.modes= re.sub(r'.* List configured modes\n(.*)\n', r'\1', out, 1, re.DOTALL).split("\n")[-1].split(' ')
+        except Exception as e:
+            print(palette.fail("Failed to read output of `ninja mode_list`: please run ./configure.py first"))
+            raise
 
     def prepare_dir(dirname, pattern):
         # Ensure the dir exists
@@ -719,6 +777,15 @@ def parse_cmd_line():
         prepare_dir(os.path.join(args.tmpdir, mode), "*.reject")
         prepare_dir(os.path.join(args.tmpdir, mode, "xml"), "*.xml")
 
+    # Get the list of tests configured by configure.py
+    try:
+        out = subprocess.Popen(['ninja', 'unit_test_list'], stdout=subprocess.PIPE).communicate()[0].decode()
+        # [1/1] List configured unit tests
+        args.tests = set(re.sub(r'.* List configured unit tests\n(.*)\n', r'\1', out, 1, re.DOTALL).split("\n"))
+    except Exception as e:
+        print(palette.fail("Failed to read output of `ninja unit_test_list`: please run ./configure.py first"))
+        raise
+
     return args
 
 
@@ -731,8 +798,12 @@ def find_tests(options):
                 suite.add_test_list(mode, options)
 
     if not TestSuite.test_count():
-        print("Test {} not found".format(palette.path(options.name[0])))
-        sys.exit(1)
+        if len(options.name):
+            print("Test {} not found".format(palette.path(options.name[0])))
+            sys.exit(1)
+        else:
+            print(palette.warn("No tests found. Please enable tests in ./configure.py first."))
+            sys.exit(0)
 
     logging.info("Found %d tests, repeat count is %d, starting %d concurrent jobs",
                  TestSuite.test_count(), options.repeat, options.jobs)
@@ -796,9 +867,10 @@ def print_summary(failed_tests):
     if failed_tests:
         print("The following test(s) have failed: {}".format(
             palette.path(" ".join([t.name for t in failed_tests]))))
-        for test in failed_tests:
-            test.print_summary()
-            print("-"*78)
+        if not output_is_a_tty:
+            for test in failed_tests:
+                test.print_summary()
+                print("-"*78)
         print("Summary: {} of the total {} tests failed".format(
             len(failed_tests), TestSuite.test_count()))
 
@@ -872,6 +944,10 @@ async def main():
 
     open_log(options.tmpdir)
     find_tests(options)
+    if options.list_tests:
+        print('\n'.join([t.name for t in TestSuite.tests()]))
+        return 0
+
     if options.manual_execution and TestSuite.test_count() > 1:
         print('--manual-execution only supports running a single test, but multiple selected: {}'.format(
             [t.path for t in TestSuite.tests()][:3])) # Print whole t.path; same shortname may be in different dirs.
@@ -886,7 +962,7 @@ async def main():
         if [t for t in TestSuite.tests() if isinstance(t, LdapTest)]:
             tp_server = subprocess.Popen('toxiproxy-server', stderr=subprocess.DEVNULL)
             def can_connect_to_toxiproxy():
-                return can_connect(8474)
+                return can_connect(('127.0.0.1', 8474))
             if not try_something_backoff(can_connect_to_toxiproxy):
                 raise Exception('Could not connect to toxiproxy')
 

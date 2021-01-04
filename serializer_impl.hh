@@ -14,6 +14,7 @@
 #include <seastar/util/bool_class.hh>
 #include <boost/range/algorithm/for_each.hpp>
 #include "utils/small_vector.hh"
+#include <absl/container/btree_set.h>
 
 namespace ser {
 
@@ -69,6 +70,17 @@ static inline void serialize_array(Output& out, const Container& v) {
 
 template<typename Container>
 struct container_traits;
+
+template<typename T>
+struct container_traits<absl::btree_set<T>> {
+    struct back_emplacer {
+        absl::btree_set<T>& c;
+        back_emplacer(absl::btree_set<T>& c_) : c(c_) {}
+        void operator()(T&& v) {
+            c.emplace(std::move(v));
+        }
+    };
+};
 
 template<typename T>
 struct container_traits<std::unordered_set<T>> {
@@ -232,6 +244,27 @@ struct serializer<std::list<T>> {
     }
     template<typename Output>
     static void write(Output& out, const std::list<T>& v) {
+        safe_serialize_as_uint32(out, v.size());
+        serialize_array_helper<false, T>::doit(out, v);
+    }
+    template<typename Input>
+    static void skip(Input& in) {
+        auto sz = deserialize(in, boost::type<uint32_t>());
+        skip_array<T>(in, sz);
+    }
+};
+
+template<typename T>
+struct serializer<absl::btree_set<T>> {
+    template<typename Input>
+    static absl::btree_set<T> read(Input& in) {
+        auto sz = deserialize(in, boost::type<uint32_t>());
+        absl::btree_set<T> v;
+        deserialize_array_helper<false, T>::doit(in, v, sz);
+        return v;
+    }
+    template<typename Output>
+    static void write(Output& out, const absl::btree_set<T>& v) {
         safe_serialize_as_uint32(out, v.size());
         serialize_array_helper<false, T>::doit(out, v);
     }
@@ -431,7 +464,7 @@ public:
         return bytes_view(reinterpret_cast<const int8_t*>(_stream.begin()), _stream.size());
       } else {
         using iterator_type = typename Stream::iterator_type ;
-        GCC6_CONCEPT(static_assert(FragmentRange<buffer_view<iterator_type>>));
+        static_assert(FragmentRange<buffer_view<iterator_type>>);
         return seastar::with_serialized_stream(_stream, seastar::make_visitor(
             [&] (typename seastar::memory_input_stream<iterator_type >::simple stream) {
                 return buffer_view<iterator_type>(bytes_view(reinterpret_cast<const int8_t*>(stream.begin()),
@@ -496,13 +529,12 @@ struct serializer<bytes> {
         }
     }
     template<typename Output, typename FragmentedBuffer>
-    GCC6_CONCEPT(requires FragmentRange<FragmentedBuffer>)
+    requires FragmentRange<FragmentedBuffer>
     static void write_fragmented(Output& out, FragmentedBuffer&& fragments) {
         safe_serialize_as_uint32(out, uint32_t(fragments.size_bytes()));
-        using boost::range::for_each;
-        for_each(fragments, [&out] (bytes_view frag) {
+        for (bytes_view frag : fragments) {
             out.write(reinterpret_cast<const char*>(frag.begin()), frag.size());
-        });
+        }
     }
     template<typename Input>
     static void skip(Input& in) {
@@ -524,7 +556,7 @@ void serialize(Output& out, const bytes_ostream& v) {
     serializer<bytes>::write(out, v);
 }
 template<typename Output, typename FragmentedBuffer>
-GCC6_CONCEPT(requires FragmentRange<FragmentedBuffer>)
+requires FragmentRange<FragmentedBuffer>
 void serialize_fragmented(Output& out, FragmentedBuffer&& v) {
     serializer<bytes>::write_fragmented(out, std::forward<FragmentedBuffer>(v));
 }
@@ -680,7 +712,7 @@ void serialize(Output& out, const std::variant<T...>& v) {
 template<typename Input, typename T, size_t... I>
 T deserialize_std_variant(Input& in, boost::type<T> t,  size_t idx, std::index_sequence<I...>) {
     T v;
-    ((I == idx ? v = deserialize(in, boost::type<std::variant_alternative_t<I, T>>()), true : false) || ...);
+    (void)((I == idx ? v = deserialize(in, boost::type<std::variant_alternative_t<I, T>>()), true : false) || ...);
     return v;
 }
 

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -25,7 +14,6 @@
 
 #include <seastar/core/align.hh>
 #include <seastar/core/bitops.hh>
-#include <seastar/util/gcc6-concepts.hh>
 
 #include "bytes.hh"
 #include "utils/meta.hh"
@@ -37,7 +25,7 @@ namespace imr {
 namespace internal {
 
 template<typename T, typename CharT>
-GCC6_CONCEPT(requires std::is_pod<T>::value && sizeof(CharT) == 1)
+requires std::is_standard_layout_v<T> && std::is_trivial_v<T> && (sizeof(CharT) == 1)
 inline T read_pod(const CharT* in) noexcept {
     T obj;
     std::copy_n(in, sizeof(T), reinterpret_cast<CharT*>(&obj));
@@ -45,7 +33,7 @@ inline T read_pod(const CharT* in) noexcept {
 }
 
 template<typename T, typename CharT>
-GCC6_CONCEPT(requires std::is_pod<T>::value && sizeof(CharT) == 1)
+requires std::is_standard_layout_v<T> && std::is_trivial_v<T> && (sizeof(CharT) == 1)
 inline void write_pod(T obj, CharT* out) noexcept {
     std::copy_n(reinterpret_cast<const CharT*>(&obj), sizeof(T), out);
 }
@@ -157,7 +145,7 @@ public:
 ///
 /// Represents a fixed-size POD value.
 template<typename Type>
-GCC6_CONCEPT(requires std::is_pod<Type>::value)
+requires std::is_standard_layout_v<Type> && std::is_trivial_v<Type>
 struct pod {
     using underlying = Type;
     enum : size_t {
@@ -237,18 +225,18 @@ struct buffer {
     using basic_view = std::conditional_t<is_mutable == ::mutable_view::no, view, mutable_view>;
 
     template<typename Context>
-    GCC6_CONCEPT(requires requires(const Context& ctx) {
-        { ctx.template size_of<Tag>() } noexcept -> size_t;
-    })
+    requires requires(const Context& ctx) {
+        { ctx.template size_of<Tag>() } noexcept -> std::same_as<size_t>;
+    }
     static view make_view(const uint8_t* in, const Context& context) noexcept {
         auto ptr = reinterpret_cast<bytes_view::const_pointer>(in);
         return bytes_view(ptr, context.template size_of<Tag>());
     }
 
     template<typename Context>
-    GCC6_CONCEPT(requires requires(const Context& ctx) {
-        { ctx.template size_of<Tag>() } noexcept -> size_t;
-    })
+    requires requires(const Context& ctx) {
+        { ctx.template size_of<Tag>() } noexcept -> std::same_as<size_t>;
+    }
     static mutable_view make_view(uint8_t* in, const Context& context) noexcept {
         auto ptr = reinterpret_cast<bytes_mutable_view::pointer>(in);
         return bytes_mutable_view(ptr, context.template size_of<Tag>());
@@ -256,9 +244,9 @@ struct buffer {
 
 public:
     template<typename Context>
-    GCC6_CONCEPT(requires requires(const Context& ctx) {
-        { ctx.template size_of<Tag>() } noexcept -> size_t;
-    })
+    requires requires(const Context& ctx) {
+        { ctx.template size_of<Tag>() } noexcept -> std::same_as<size_t>;
+    }
     static size_t serialized_object_size(const uint8_t*, const Context& context) noexcept {
         return context.template size_of<Tag>();
     }
@@ -268,9 +256,9 @@ public:
     }
 
     template<typename Serializer>
-    GCC6_CONCEPT(requires requires (Serializer ser, uint8_t* ptr) {
+    requires requires (Serializer ser, uint8_t* ptr) {
         { ser(ptr) } noexcept;
-    })
+    }
     static size_t size_when_serialized(size_t size, Serializer&&) noexcept {
         return size;
     }
@@ -297,9 +285,9 @@ public:
     }
 
     template<typename Serializer>
-    GCC6_CONCEPT(requires requires (Serializer ser, uint8_t* ptr) {
+    requires requires (Serializer ser, uint8_t* ptr) {
         { ser(ptr) } noexcept;
-    })
+    }
     static size_t serialize(uint8_t* out, size_t size, Serializer&& serializer) noexcept {
         std::forward<Serializer>(serializer)(out);
         return size;

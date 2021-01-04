@@ -22,9 +22,9 @@
 #include "idl/query.dist.hh"
 #include "serializer_impl.hh"
 #include "serialization_visitors.hh"
-#include "idl/query.dist.impl.hh"
-#include "idl/keys.dist.impl.hh"
 #include "idl/uuid.dist.impl.hh"
+#include "idl/keys.dist.impl.hh"
+#include "idl/query.dist.impl.hh"
 
 namespace query {
 
@@ -111,9 +111,9 @@ public:
 struct result_visitor {
     void accept_new_partition(
         const partition_key& key, // FIXME: use view for the key
-        uint32_t row_count) {}
+        uint64_t row_count) {}
 
-    void accept_new_partition(uint32_t row_count) {}
+    void accept_new_partition(uint64_t row_count) {}
 
     void accept_new_row(
         const clustering_key& key, // FIXME: use view for the key
@@ -125,10 +125,9 @@ struct result_visitor {
     void accept_partition_end(const result_row_view& static_row) {}
 };
 
-GCC6_CONCEPT(
 template<typename Visitor>
-concept bool ResultVisitor = requires(Visitor visitor, const partition_key& pkey,
-                                      uint32_t row_count, const clustering_key& ckey,
+concept ResultVisitor = requires(Visitor visitor, const partition_key& pkey,
+                                      uint64_t row_count, const clustering_key& ckey,
                                       const result_row_view& static_row, const result_row_view& row)
 {
     visitor.accept_new_partition(pkey, row_count);
@@ -137,7 +136,6 @@ concept bool ResultVisitor = requires(Visitor visitor, const partition_key& pkey
     visitor.accept_new_row(static_row, row);
     visitor.accept_partition_end(static_row);
 };
-)
 
 class result_view {
     ser::query_result_view _v;
@@ -159,7 +157,7 @@ public:
     }
 
     template <typename Visitor>
-    GCC6_CONCEPT(requires ResultVisitor<Visitor>)
+    requires ResultVisitor<Visitor>
     void consume(const partition_slice& slice, Visitor&& visitor) const {
         for (auto&& p : _v.partitions()) {
             auto rows = p.rows();
@@ -186,17 +184,18 @@ public:
         }
     }
 
-    std::tuple<uint32_t, uint32_t> count_partitions_and_rows() const {
+    std::tuple<uint32_t, uint64_t> count_partitions_and_rows() const {
         auto&& ps = _v.partitions();
         auto rows = boost::accumulate(ps | boost::adaptors::transformed([] (auto& p) {
             return std::max(p.rows().size(), size_t(1));
-        }), uint32_t(0));
+        }), uint64_t(0));
         return std::make_tuple(ps.size(), rows);
     }
 
     std::tuple<partition_key, std::optional<clustering_key>>
     get_last_partition_and_clustering_key() const {
         auto ps = _v.partitions();
+        assert(!ps.empty());
         auto& p = ps.back();
         auto rs = p.rows();
         return { p.key().value(), !rs.empty() ? rs.back().key() : std::optional<clustering_key>() };

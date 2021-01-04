@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -32,7 +21,10 @@
 namespace db::view {
 
 class view_update_generator {
+public:
     static constexpr size_t registration_queue_size = 5;
+
+private:
     database& _db;
     seastar::abort_source _as;
     future<> _started = make_ready_future<>();
@@ -45,14 +37,20 @@ class view_update_generator {
     };
     std::unordered_map<lw_shared_ptr<table>, std::vector<sstables::shared_sstable>> _sstables_with_tables;
     std::unordered_map<lw_shared_ptr<table>, std::vector<sstables::shared_sstable>> _sstables_to_move;
+    metrics::metric_groups _metrics;
 public:
-    view_update_generator(database& db) : _db(db) { }
+    view_update_generator(database& db) : _db(db) {
+        setup_metrics();
+    }
 
     future<> start();
     future<> stop();
     future<> register_staging_sstable(sstables::shared_sstable sst, lw_shared_ptr<table> table);
+
+    ssize_t available_register_units() const { return _registration_sem.available_units(); }
 private:
     bool should_throttle() const;
+    void setup_metrics();
 };
 
 }

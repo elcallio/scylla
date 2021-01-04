@@ -101,6 +101,7 @@ options {
 #include "cql3/ut_name.hh"
 #include "cql3/functions/function_name.hh"
 #include "cql3/functions/function_call.hh"
+#include "cql3/expr/expression.hh"
 #include <seastar/core/sstring.hh>
 #include "CqlLexer.hpp"
 
@@ -113,8 +114,8 @@ options {
 using namespace cql3::statements;
 using namespace cql3::selection;
 using cql3::cql3_type;
-using conditions_type = std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>,::shared_ptr<cql3::column_condition::raw>>>;
-using operations_type = std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>,::shared_ptr<cql3::operation::raw_update>>>;
+using conditions_type = std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>,lw_shared_ptr<cql3::column_condition::raw>>>;
+using operations_type = std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>, std::unique_ptr<cql3::operation::raw_update>>>;
 
 // ANTLR forces us to define a default-initialized return value
 // for every rule (e.g. [returns ut_name name]), but not every type
@@ -263,8 +264,8 @@ struct uninitialized {
         return to_lower(s) == "true";
     }
 
-    void add_raw_update(std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>,::shared_ptr<cql3::operation::raw_update>>>& operations,
-        ::shared_ptr<cql3::column_identifier::raw> key, ::shared_ptr<cql3::operation::raw_update> update)
+    void add_raw_update(std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>, std::unique_ptr<cql3::operation::raw_update>>>& operations,
+        ::shared_ptr<cql3::column_identifier::raw> key, std::unique_ptr<cql3::operation::raw_update> update)
     {
         for (auto&& p : operations) {
             if (*p.first == *key && !p.second->is_compatible_with(update)) {
@@ -409,6 +410,7 @@ selectStatement returns [std::unique_ptr<raw::select_statement> expr]
         bool allow_filtering = false;
         bool is_json = false;
         bool bypass_cache = false;
+        auto attrs = std::make_unique<cql3::attributes::raw>();
     }
     : K_SELECT (
                 ( K_JSON { is_json = true; } )?
@@ -423,11 +425,12 @@ selectStatement returns [std::unique_ptr<raw::select_statement> expr]
       ( K_LIMIT rows=intValue { limit = rows; } )?
       ( K_ALLOW K_FILTERING  { allow_filtering = true; } )?
       ( K_BYPASS K_CACHE { bypass_cache = true; })?
+      ( usingClause[attrs] )?
       {
           auto params = make_lw_shared<raw::select_statement::parameters>(std::move(orderings), is_distinct, allow_filtering, is_json, bypass_cache);
           $expr = std::make_unique<raw::select_statement>(std::move(cf), std::move(params),
             std::move(sclause), std::move(wclause), std::move(limit), std::move(per_partition_limit),
-            std::move(gbcolumns));
+            std::move(gbcolumns), std::move(attrs));
       }
     ;
 
@@ -536,6 +539,7 @@ usingClause[std::unique_ptr<cql3::attributes::raw>& attrs]
 usingClauseObjective[std::unique_ptr<cql3::attributes::raw>& attrs]
     : K_TIMESTAMP ts=intValue { attrs->timestamp = ts; }
     | K_TTL t=intValue { attrs->time_to_live = t; }
+    | K_TIMEOUT to=term { attrs->timeout = to; }
     ;
 
 /**
@@ -548,7 +552,7 @@ updateStatement returns [std::unique_ptr<raw::update_statement> expr]
     @init {
         bool if_exists = false;
         auto attrs = std::make_unique<cql3::attributes::raw>();
-        std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>, ::shared_ptr<cql3::operation::raw_update>>> operations;
+        std::vector<std::pair<::shared_ptr<cql3::column_identifier::raw>, std::unique_ptr<cql3::operation::raw_update>>> operations;
     }
     : K_UPDATE cf=columnFamilyName
       ( usingClause[attrs] )?
@@ -579,7 +583,7 @@ updateConditions returns [conditions_type conditions]
 deleteStatement returns [std::unique_ptr<raw::delete_statement> expr]
     @init {
         auto attrs = std::make_unique<cql3::attributes::raw>();
-        std::vector<::shared_ptr<cql3::operation::raw_deletion>> column_deletions;
+        std::vector<std::unique_ptr<cql3::operation::raw_deletion>> column_deletions;
         bool if_exists = false;
     }
     : K_DELETE ( dels=deleteSelection { column_deletions = std::move(dels); } )?
@@ -597,15 +601,15 @@ deleteStatement returns [std::unique_ptr<raw::delete_statement> expr]
       }
     ;
 
-deleteSelection returns [std::vector<::shared_ptr<cql3::operation::raw_deletion>> operations]
+deleteSelection returns [std::vector<std::unique_ptr<cql3::operation::raw_deletion>> operations]
     : t1=deleteOp { $operations.emplace_back(std::move(t1)); }
       (',' tN=deleteOp { $operations.emplace_back(std::move(tN)); })*
     ;
 
-deleteOp returns [::shared_ptr<cql3::operation::raw_deletion> op]
-    : c=cident                { $op = ::make_shared<cql3::operation::column_deletion>(std::move(c)); }
-    | c=cident '[' t=term ']' { $op = ::make_shared<cql3::operation::element_deletion>(std::move(c), std::move(t)); }
-    | c=cident '.' field=ident { $op = ::make_shared<cql3::operation::field_deletion>(std::move(c), std::move(field)); }
+deleteOp returns [std::unique_ptr<cql3::operation::raw_deletion> op]
+    : c=cident                { $op = std::make_unique<cql3::operation::column_deletion>(std::move(c)); }
+    | c=cident '[' t=term ']' { $op = std::make_unique<cql3::operation::element_deletion>(std::move(c), std::move(t)); }
+    | c=cident '.' field=ident { $op = std::make_unique<cql3::operation::field_deletion>(std::move(c), std::move(field)); }
     ;
 
 usingClauseDelete[std::unique_ptr<cql3::attributes::raw>& attrs]
@@ -1445,7 +1449,7 @@ setOrMapLiteral[shared_ptr<cql3::term::raw> t] returns [shared_ptr<cql3::term::r
       { $value = ::make_shared<cql3::maps::literal>(std::move(m)); }
     | { s.push_back(t); }
           ( ',' tn=term { s.push_back(tn); } )*
-      { $value = make_shared(cql3::sets::literal(std::move(s))); }
+      { $value = ::make_shared<cql3::sets::literal>(std::move(s)); }
     ;
 
 collectionLiteral returns [shared_ptr<cql3::term::raw> value]
@@ -1456,7 +1460,7 @@ collectionLiteral returns [shared_ptr<cql3::term::raw> value]
     | '{' t=term v=setOrMapLiteral[t] { $value = v; } '}'
     // Note that we have an ambiguity between maps and set for "{}". So we force it to a set literal,
     // and deal with it later based on the type of the column (SetLiteral.java).
-    | '{' '}' { $value = make_shared(cql3::sets::literal({})); }
+    | '{' '}' { $value = ::make_shared<cql3::sets::literal>(std::vector<shared_ptr<cql3::term::raw>>()); }
     ;
 
 usertypeLiteral returns [shared_ptr<cql3::user_types::literal> ut]
@@ -1529,12 +1533,12 @@ normalColumnOperation[operations_type& operations, ::shared_ptr<cql3::column_ide
     : t=term ('+' c=cident )?
       {
           if (!c) {
-              add_raw_update(operations, key, ::make_shared<cql3::operation::set_value>(t));
+              add_raw_update(operations, key, std::make_unique<cql3::operation::set_value>(t));
           } else {
               if (*key != *c) {
                 add_recognition_error("Only expressions of the form X = <value> + X are supported.");
               }
-              add_raw_update(operations, key, ::make_shared<cql3::operation::prepend>(t));
+              add_raw_update(operations, key, std::make_unique<cql3::operation::prepend>(t));
           }
       }
     | c=cident sig=('+' | '-') t=term
@@ -1542,11 +1546,11 @@ normalColumnOperation[operations_type& operations, ::shared_ptr<cql3::column_ide
           if (*key != *c) {
               add_recognition_error("Only expressions of the form X = X " + $sig.text + "<value> are supported.");
           }
-          shared_ptr<cql3::operation::raw_update> op;
+          std::unique_ptr<cql3::operation::raw_update> op;
           if ($sig.text == "+") {
-              op = make_shared<cql3::operation::addition>(t);
+              op = std::make_unique<cql3::operation::addition>(t);
           } else {
-              op = make_shared<cql3::operation::subtraction>(t);
+              op = std::make_unique<cql3::operation::subtraction>(t);
           }
           add_raw_update(operations, key, std::move(op));
       }
@@ -1557,11 +1561,11 @@ normalColumnOperation[operations_type& operations, ::shared_ptr<cql3::column_ide
               // We don't yet allow a '+' in front of an integer, but we could in the future really, so let's be future-proof in our error message
               add_recognition_error("Only expressions of the form X = X " + sstring($i.text[0] == '-' ? "-" : "+") + " <value> are supported.");
           }
-          add_raw_update(operations, key, make_shared<cql3::operation::addition>(cql3::constants::literal::integer($i.text)));
+          add_raw_update(operations, key, std::make_unique<cql3::operation::addition>(cql3::constants::literal::integer($i.text)));
       }
     | K_SCYLLA_COUNTER_SHARD_LIST '(' t=term ')'
       {
-          add_raw_update(operations, key, ::make_shared<cql3::operation::set_counter_value_from_tuple_list>(t));      
+          add_raw_update(operations, key, std::make_unique<cql3::operation::set_counter_value_from_tuple_list>(t));
       }
     ;
 
@@ -1571,7 +1575,7 @@ collectionColumnOperation[operations_type& operations,
                           bool by_uuid]
     : '=' t=term
       {
-          add_raw_update(operations, key, make_shared<cql3::operation::set_element>(k, t, by_uuid));
+          add_raw_update(operations, key, std::make_unique<cql3::operation::set_element>(k, t, by_uuid));
       }
     ;
 
@@ -1580,20 +1584,20 @@ udtColumnOperation[operations_type& operations,
                    shared_ptr<cql3::column_identifier> field]
     : '=' t=term
       {
-          add_raw_update(operations, std::move(key), make_shared<cql3::operation::set_field>(std::move(field), std::move(t)));
+          add_raw_update(operations, std::move(key), std::make_unique<cql3::operation::set_field>(std::move(field), std::move(t)));
       }
     ;
 
 columnCondition[conditions_type& conditions]
     // Note: we'll reject duplicates later
     : key=cident
-        ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, {}, *op)); }
+        ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, {}, op)); }
         | K_IN
             ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::in_condition({}, {}, values)); }
             | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::in_condition({}, marker, {})); }
             )
         | '[' element=term ']'
-            ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, element, *op)); }
+            ( op=relationType t=term { conditions.emplace_back(key, cql3::column_condition::raw::simple_condition(t, element, op)); }
             | K_IN
                 ( values=singleColumnInValues { conditions.emplace_back(key, cql3::column_condition::raw::in_condition(element, {}, values)); }
                 | marker=inMarker { conditions.emplace_back(key, cql3::column_condition::raw::in_condition(element, marker, {})); }
@@ -1616,31 +1620,31 @@ propertyValue returns [sstring str]
     | u=unreserved_keyword { $str = u; }
     ;
 
-relationType returns [const cql3::operator_type* op = nullptr]
-    : '='  { $op = &cql3::operator_type::EQ; }
-    | '<'  { $op = &cql3::operator_type::LT; }
-    | '<=' { $op = &cql3::operator_type::LTE; }
-    | '>'  { $op = &cql3::operator_type::GT; }
-    | '>=' { $op = &cql3::operator_type::GTE; }
-    | '!=' { $op = &cql3::operator_type::NEQ; }
-    | K_LIKE { $op = &cql3::operator_type::LIKE; }
+relationType returns [cql3::expr::oper_t op]
+    : '='  { $op = cql3::expr::oper_t::EQ; }
+    | '<'  { $op = cql3::expr::oper_t::LT; }
+    | '<=' { $op = cql3::expr::oper_t::LTE; }
+    | '>'  { $op = cql3::expr::oper_t::GT; }
+    | '>=' { $op = cql3::expr::oper_t::GTE; }
+    | '!=' { $op = cql3::expr::oper_t::NEQ; }
+    | K_LIKE { $op = cql3::expr::oper_t::LIKE; }
     ;
 
 relation[std::vector<cql3::relation_ptr>& clauses]
-    @init{ const cql3::operator_type* rt = nullptr; }
-    : name=cident type=relationType t=term { $clauses.emplace_back(::make_shared<cql3::single_column_relation>(std::move(name), *type, std::move(t))); }
+    @init{ cql3::expr::oper_t rt; }
+    : name=cident type=relationType t=term { $clauses.emplace_back(::make_shared<cql3::single_column_relation>(std::move(name), type, std::move(t))); }
 
     | K_TOKEN l=tupleOfIdentifiers type=relationType t=term
-        { $clauses.emplace_back(::make_shared<cql3::token_relation>(std::move(l), *type, std::move(t))); }
+        { $clauses.emplace_back(::make_shared<cql3::token_relation>(std::move(l), type, std::move(t))); }
     | name=cident K_IS K_NOT K_NULL {
-          $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::operator_type::IS_NOT, cql3::constants::NULL_LITERAL)); }
+          $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::expr::oper_t::IS_NOT, cql3::constants::NULL_LITERAL)); }
     | name=cident K_IN marker=inMarker
-        { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::operator_type::IN, std::move(marker))); }
+        { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), cql3::expr::oper_t::IN, std::move(marker))); }
     | name=cident K_IN in_values=singleColumnInValues
         { $clauses.emplace_back(cql3::single_column_relation::create_in_relation(std::move(name), std::move(in_values))); }
-    | name=cident K_CONTAINS { rt = &cql3::operator_type::CONTAINS; } (K_KEY { rt = &cql3::operator_type::CONTAINS_KEY; })?
-        t=term { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), *rt, std::move(t))); }
-    | name=cident '[' key=term ']' type=relationType t=term { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), std::move(key), *type, std::move(t))); }
+    | name=cident K_CONTAINS { rt = cql3::expr::oper_t::CONTAINS; } (K_KEY { rt = cql3::expr::oper_t::CONTAINS_KEY; })?
+        t=term { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), rt, std::move(t))); }
+    | name=cident '[' key=term ']' type=relationType t=term { $clauses.emplace_back(make_shared<cql3::single_column_relation>(std::move(name), std::move(key), type, std::move(t))); }
     | ids=tupleOfIdentifiers
       ( K_IN
           ( '(' ')'
@@ -1656,10 +1660,10 @@ relation[std::vector<cql3::relation_ptr>& clauses]
           )
       | type=relationType literal=tupleLiteral /* (a, b, c) > (1, 2, 3) or (a, b, c) > (?, ?, ?) */
           {
-              $clauses.emplace_back(cql3::multi_column_relation::create_non_in_relation(ids, *type, literal));
+              $clauses.emplace_back(cql3::multi_column_relation::create_non_in_relation(ids, type, literal));
           }
       | type=relationType tupleMarker=markerForTuple /* (a, b, c) >= ? */
-          { $clauses.emplace_back(cql3::multi_column_relation::create_non_in_relation(ids, *type, tupleMarker)); }
+          { $clauses.emplace_back(cql3::multi_column_relation::create_non_in_relation(ids, type, tupleMarker)); }
       )
     | '(' relation[$clauses] ')'
     ;
@@ -1807,7 +1811,7 @@ username returns [sstring str]
 // Basically the same as cident, but we need to exlude existing CQL3 types
 // (which for some reason are not reserved otherwise)
 non_type_ident returns [shared_ptr<cql3::column_identifier> id]
-    : t=IDENT                    { if (_reserved_type_names().count($t.text)) { add_recognition_error("Invalid (reserved) user type name " + $t.text); } $id = ::make_shared<cql3::column_identifier>($t.text, false); }
+    : t=IDENT                    { if (_reserved_type_names().contains($t.text)) { add_recognition_error("Invalid (reserved) user type name " + $t.text); } $id = ::make_shared<cql3::column_identifier>($t.text, false); }
     | t=QUOTED_NAME              { $id = ::make_shared<cql3::column_identifier>($t.text, true); }
     | k=basic_unreserved_keyword { $id = ::make_shared<cql3::column_identifier>(k, false); }
     | kk=K_KEY                   { $id = ::make_shared<cql3::column_identifier>($kk.text, false); }
@@ -1880,6 +1884,7 @@ basic_unreserved_keyword returns [sstring str]
 		| K_ATTACHED     
 		| K_FOR   
         | K_GROUP
+        | K_TIMEOUT
         ) { $str = $k.text; }
     ;
 
@@ -2042,6 +2047,8 @@ K_SCYLLA_COUNTER_SHARD_LIST: S C Y L L A '_' C O U N T E R '_' S H A R D '_' L I
 K_GROUP:       G R O U P;
 
 K_LIKE:        L I K E;
+
+K_TIMEOUT:     T I M E O U T;
 
 // Case-insensitive alpha characters
 fragment A: ('a'|'A');

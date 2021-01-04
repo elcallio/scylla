@@ -15,7 +15,6 @@
 #include <boost/range/algorithm/max_element.hpp>
 #include <limits>
 #include <seastar/core/bitops.hh>
-#include <seastar/util/gcc6-concepts.hh>
 #include "seastarx.hh"
 
 namespace bi = boost::intrusive;
@@ -48,7 +47,8 @@ struct log_heap_options {
     }
 
     size_t bucket_of(size_t value) const {
-#ifdef __SANITIZE_ADDRESS__
+#ifdef SANITIZE
+        // ubsan will otherwise complain about pow2_rank(0)
         if (value < min_size) {
             return 0;
         }
@@ -121,11 +121,9 @@ struct log_heap_element_traits<T, opts, false> {
  * precision decreasing as values get larger.
  */
 template<typename T, const log_heap_options& opts>
-GCC6_CONCEPT(
-    requires requires() {
-        typename log_heap_element_traits<T, opts>;
-    }
-)
+requires requires() {
+    typename log_heap_element_traits<T, opts>;
+}
 class log_heap final {
     // Ensure that (value << sub_bucket_index) in bucket_of() doesn't overflow
     static_assert(pow2_rank_constexpr(opts.max_size - opts.min_size + 1) + opts.sub_bucket_shift < std::numeric_limits<size_t>::digits, "overflow");
@@ -143,7 +141,14 @@ private:
     ssize_t _watermark = -1;
 public:
     template <bool IsConst>
-    class hist_iterator : public std::iterator<std::input_iterator_tag, std::conditional_t<IsConst, const T, T>> {
+    class hist_iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = std::conditional_t<IsConst, const T, T>;
+        using difference_type = std::ptrdiff_t;
+        using pointer = std::conditional_t<IsConst, const T, T>*;
+        using reference = std::conditional_t<IsConst, const T, T>&;
+    private:
         using hist_type = std::conditional_t<IsConst, const log_heap, log_heap>;
         using iterator_type = std::conditional_t<IsConst, typename bucket::const_iterator, typename bucket::iterator>;
 

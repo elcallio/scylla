@@ -26,18 +26,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "service/paxos/prepare_summary.hh"
@@ -71,7 +60,7 @@ prepare_summary::replicas_missing_most_recent_commit(schema_ptr s, std::chrono::
     // explained on CASSANDRA-12043. To avoid that, we ignore a MRC that is too old, i.e. older than the TTL we set
     // on paxos tables. For such old commit, we rely on repair to ensure the commit has indeed be
     // propagated to all nodes.
-    auto paxos_ttl_sec = static_cast<std::chrono::seconds>(std::max(s->gc_grace_seconds(), std::chrono::seconds(3600 * 3)));
+    const std::chrono::seconds paxos_ttl_sec(s->paxos_grace_seconds());
     if (!most_recent_commit ||
             utils::UUID_gen::unix_timestamp_in_sec(most_recent_commit->ballot) + paxos_ttl_sec < now_in_sec) {
         return replicas;

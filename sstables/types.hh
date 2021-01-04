@@ -5,23 +5,11 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
 
-#include <seastar/util/gcc6-concepts.hh>
 #include "disk_types.hh"
 #include <seastar/core/enum.hh>
 #include "bytes.hh"
@@ -29,7 +17,6 @@
 #include "tombstone.hh"
 #include "utils/streaming_histogram.hh"
 #include "utils/estimated_histogram.hh"
-#include "column_name_helper.hh"
 #include "sstables/key.hh"
 #include "db/commitlog/replay_position.hh"
 #include "version.hh"
@@ -49,14 +36,11 @@ static inline bytes_view to_bytes_view(const temporary_buffer<char>& b) {
 
 namespace sstables {
 
-GCC6_CONCEPT(
 template<typename T>
-concept bool Writer() {
-    return requires(T& wr, const char* data, size_t size) {
-        { wr.write(data, size) } -> void;
+concept Writer =
+    requires(T& wr, const char* data, size_t size) {
+        { wr.write(data, size) } -> std::same_as<void>;
     };
-}
-)
 
 struct commitlog_interval {
     db::replay_position start;
@@ -85,6 +69,7 @@ struct deletion_time {
     explicit operator tombstone() {
         return !live() ? tombstone(marked_for_delete_at, gc_clock::time_point(gc_clock::duration(local_deletion_time))) : tombstone();
     }
+    friend std::ostream& operator<<(std::ostream&, const deletion_time&);
 };
 
 struct option {
@@ -249,7 +234,7 @@ template <typename T>
 uint64_t serialized_size(sstable_version_types v, const T& object);
 
 template <class T, typename W>
-GCC6_CONCEPT(requires Writer<W>())
+requires Writer<W>
 typename std::enable_if_t<!std::is_integral<T>::value && !std::is_enum<T>::value, void>
 write(sstable_version_types v, W& out, const T& t);
 
@@ -281,6 +266,7 @@ struct compaction_metadata : public metadata_base<compaction_metadata> {
     auto describe_type(sstable_version_types v, Describer f) {
         switch (v) {
         case sstable_version_types::mc:
+        case sstable_version_types::md:
             return f(
                 cardinality
             );
@@ -322,6 +308,7 @@ struct stats_metadata : public metadata_base<stats_metadata> {
     auto describe_type(sstable_version_types v, Describer f) {
         switch (v) {
         case sstable_version_types::mc:
+        case sstable_version_types::md:
             return f(
                 estimated_partition_size,
                 estimated_cells_count,
@@ -392,6 +379,7 @@ struct serialization_header : public metadata_base<serialization_header> {
     auto describe_type(sstable_version_types v, Describer f) {
         switch (v) {
         case sstable_version_types::mc:
+        case sstable_version_types::md:
             return f(
                 min_timestamp_base,
                 min_local_deletion_time_base,
@@ -499,6 +487,7 @@ enum class scylla_metadata_type : uint32_t {
     Features = 2,
     ExtensionAttributes = 3,
     RunIdentifier = 4,
+    LargeDataStats = 5,
 };
 
 struct run_identifier {
@@ -510,14 +499,36 @@ struct run_identifier {
     auto describe_type(sstable_version_types v, Describer f) { return f(id); }
 };
 
+// Types of large data statistics.
+//
+// Note: For extensibility, never reuse an identifier,
+// only add new ones, since these are stored on stable storage.
+enum class large_data_type : uint32_t {
+    partition_size = 1,     // partition size, in bytes
+    row_size = 2,           // row size, in bytes
+    cell_size = 3,          // cell size, in bytes
+    rows_in_partition = 4,  // number of rows in a partition
+};
+
+struct large_data_stats_entry {
+    uint64_t max_value;
+    uint64_t threshold;
+    uint32_t above_threshold;
+
+    template <typename Describer>
+    auto describe_type(sstable_version_types v, Describer f) { return f(max_value, threshold, above_threshold); }
+};
+
 struct scylla_metadata {
     using extension_attributes = disk_hash<uint32_t, disk_string<uint32_t>, disk_string<uint32_t>>;
+    using large_data_stats = disk_hash<uint32_t, large_data_type, large_data_stats_entry>;
 
     disk_set_of_tagged_union<scylla_metadata_type,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Sharding, sharding_metadata>,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Features, sstable_enabled_features>,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ExtensionAttributes, extension_attributes>,
-            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::RunIdentifier, run_identifier>
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::RunIdentifier, run_identifier>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::LargeDataStats, large_data_stats>
             > data;
 
     sstable_enabled_features get_features() const {

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -26,8 +15,8 @@
 #include <seastar/http/httpd.hh>
 #include <seastar/net/tls.hh>
 #include <optional>
-#include <alternator/auth.hh>
-#include <utils/small_vector.hh>
+#include "alternator/auth.hh"
+#include "utils/small_vector.hh"
 #include <seastar/core/units.hh>
 
 namespace alternator {
@@ -41,6 +30,7 @@ class server {
     http_server _http_server;
     http_server _https_server;
     executor& _executor;
+    cql3::query_processor& _qp;
 
     key_cache _key_cache;
     bool _enforce_authorization;
@@ -68,7 +58,7 @@ class server {
     json_parser _json_parser;
 
 public:
-    server(executor& executor);
+    server(executor& executor, cql3::query_processor& qp);
 
     future<> init(net::inet_address addr, std::optional<uint16_t> port, std::optional<uint16_t> https_port, std::optional<tls::credentials_builder> creds,
             bool enforce_authorization, semaphore* memory_limiter);

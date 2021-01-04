@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "atomic_cell.hh"
@@ -208,7 +197,7 @@ size_t atomic_cell_or_collection::external_memory_usage(const abstract_type& t) 
             external_value_size = cell_view.value_size();
         }
         // Add overhead of chunk headers. The last one is a special case.
-        external_value_size += (external_value_size - 1) / data::cell::maximum_external_chunk_length * data::cell::external_chunk_overhead;
+        external_value_size += (external_value_size - 1) / data::cell::effective_external_chunk_length * data::cell::external_chunk_overhead;
         external_value_size += data::cell::external_last_chunk_overhead;
     }
     return data::cell::structure::serialized_object_size(_data.get(), ctx)

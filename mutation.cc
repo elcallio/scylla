@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "mutation.hh"
@@ -109,7 +98,7 @@ void
 mutation::query(query::result::builder& builder,
     const query::partition_slice& slice,
     gc_clock::time_point now,
-    uint32_t row_limit) &&
+    uint64_t row_limit) &&
 {
     auto pb = builder.add_partition(*schema(), key());
     auto is_reversed = slice.options.contains<query::partition_slice::option::reversed>();
@@ -122,23 +111,25 @@ mutation::query(query::result::builder& builder,
 
 query::result
 mutation::query(const query::partition_slice& slice,
+    query::result_memory_accounter&& accounter,
     query::result_options opts,
-    gc_clock::time_point now, uint32_t row_limit) &&
+    gc_clock::time_point now, uint64_t row_limit) &&
 {
-    query::result::builder builder(slice, opts, { });
+    query::result::builder builder(slice, opts, std::move(accounter));
     std::move(*this).query(builder, slice, now, row_limit);
     return builder.build();
 }
 
 query::result
 mutation::query(const query::partition_slice& slice,
+    query::result_memory_accounter&& accounter,
     query::result_options opts,
-    gc_clock::time_point now, uint32_t row_limit) const&
+    gc_clock::time_point now, uint64_t row_limit) const&
 {
-    return mutation(*this).query(slice, opts, now, row_limit);
+    return mutation(*this).query(slice, std::move(accounter), opts, now, row_limit);
 }
 
-size_t
+uint64_t
 mutation::live_row_count(gc_clock::time_point query_time) const {
     return partition().live_row_count(*schema(), query_time);
 }
@@ -276,7 +267,20 @@ future<mutation_opt> read_mutation_from_flat_mutation_reader(flat_mutation_reade
 
 std::ostream& operator<<(std::ostream& os, const mutation& m) {
     const ::schema& s = *m.schema();
-    fmt_print(os, "{{{}.{} {} ", s.ks_name(), s.cf_name(), m.decorated_key());
-    os << mutation_partition::printer(s, m.partition()) << "}";
+    const auto& dk = m.decorated_key();
+
+    fmt_print(os, "{{table: '{}.{}', key: {{", s.ks_name(), s.cf_name());
+
+    auto type_iterator = dk._key.get_compound_type(s)->types().begin();
+    auto column_iterator = s.partition_key_columns().begin();
+
+    for (auto&& e : dk._key.components(s)) {
+        os << "'" << column_iterator->name_as_text() << "': " << (*type_iterator)->to_string(to_bytes(e)) << ", ";
+        ++type_iterator;
+        ++column_iterator;
+    }
+
+    fmt_print(os, "token: {}}}, ", dk._token);
+    os << mutation_partition::printer(s, m.partition()) << "\n}";
     return os;
 }

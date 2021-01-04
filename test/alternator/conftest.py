@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # This file contains "test fixtures", a pytest concept described in
 # https://docs.pytest.org/en/latest/fixture.html.
@@ -79,6 +68,25 @@ def dynamodb(request):
         # Disable verifying in order to be able to use self-signed TLS certificates
         verify = not request.config.getoption('https')
         return boto3.resource('dynamodb', endpoint_url=local_url, verify=verify,
+            region_name='us-east-1', aws_access_key_id='alternator', aws_secret_access_key='secret_pass',
+            config=botocore.client.Config(retries={"max_attempts": 3}))
+
+@pytest.fixture(scope="session")
+def dynamodbstreams(request):
+    if request.config.getoption('aws'):
+        return boto3.client('dynamodbstreams')
+    else:
+        # Even though we connect to the local installation, Boto3 still
+        # requires us to specify dummy region and credential parameters,
+        # otherwise the user is forced to properly configure ~/.aws even
+        # for local runs.
+        if request.config.getoption('url') != None:
+            local_url = request.config.getoption('url')
+        else:
+            local_url = 'https://localhost:8043' if request.config.getoption('https') else 'http://localhost:8000'
+        # Disable verifying in order to be able to use self-signed TLS certificates
+        verify = not request.config.getoption('https')
+        return boto3.client('dynamodbstreams', endpoint_url=local_url, verify=verify,
             region_name='us-east-1', aws_access_key_id='alternator', aws_secret_access_key='secret_pass',
             config=botocore.client.Config(retries={"max_attempts": 3}))
 
@@ -153,6 +161,13 @@ def test_table_sn(dynamodb):
     table = create_test_table(dynamodb,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, { 'AttributeName': 'c', 'KeyType': 'RANGE' } ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' }, { 'AttributeName': 'c', 'AttributeType': 'N' } ])
+    yield table
+    table.delete()
+@pytest.fixture(scope="session")
+def test_table_ss(dynamodb):
+    table = create_test_table(dynamodb,
+        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, { 'AttributeName': 'c', 'KeyType': 'RANGE' } ],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' }, { 'AttributeName': 'c', 'AttributeType': 'S' } ])
     yield table
     table.delete()
 

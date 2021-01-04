@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Various utility functions which are useful for multiple tests
 
@@ -28,14 +17,18 @@ def random_string(length=10, chars=string.ascii_uppercase + string.digits):
 def random_bytes(length=10):
     return bytearray(random.getrandbits(8) for _ in range(length))
 
-# Utility functions for scan and query into an array of items:
-# TODO: add to full_scan and full_query by default ConsistentRead=True, as
-# it's not useful for tests without it!
-def full_scan(table, **kwargs):
-    response = table.scan(**kwargs)
+# Utility functions for scan and query into an array of items, reading
+# the full (possibly requiring multiple requests to read successive pages).
+# For convenience, ConsistentRead=True is used by default, as most tests
+# need it to run correctly on a multi-node cluster. Callers who need to
+# override it, can (this is necessary in GSI tests, where ConsistentRead=True
+# is not supported).
+def full_scan(table, ConsistentRead=True, **kwargs):
+    response = table.scan(ConsistentRead=ConsistentRead, **kwargs)
     items = response['Items']
     while 'LastEvaluatedKey' in response:
-        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'], **kwargs)
+        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'],
+            ConsistentRead=ConsistentRead, **kwargs)
         items.extend(response['Items'])
     return items
 
@@ -43,8 +36,8 @@ def full_scan(table, **kwargs):
 # Note that count isn't simply len(items) - the server returns them
 # independently. e.g., with Select='COUNT' the items are not returned, but
 # count is.
-def full_scan_and_count(table, **kwargs):
-    response = table.scan(**kwargs)
+def full_scan_and_count(table, ConsistentRead=True, **kwargs):
+    response = table.scan(ConsistentRead=ConsistentRead, **kwargs)
     items = []
     count = 0
     if 'Items' in response:
@@ -52,7 +45,8 @@ def full_scan_and_count(table, **kwargs):
     if 'Count' in response:
         count = count + response['Count']
     while 'LastEvaluatedKey' in response:
-        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'], **kwargs)
+        response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'],
+            ConsistentRead=ConsistentRead, **kwargs)
         if 'Items' in response:
             items.extend(response['Items'])
         if 'Count' in response:
@@ -60,13 +54,44 @@ def full_scan_and_count(table, **kwargs):
     return (count, items)
 
 # Utility function for fetching the entire results of a query into an array of items
-def full_query(table, **kwargs):
-    response = table.query(**kwargs)
+def full_query(table, ConsistentRead=True, **kwargs):
+    response = table.query(ConsistentRead=ConsistentRead, **kwargs)
     items = response['Items']
     while 'LastEvaluatedKey' in response:
-        response = table.query(ExclusiveStartKey=response['LastEvaluatedKey'], **kwargs)
+        response = table.query(ExclusiveStartKey=response['LastEvaluatedKey'],
+            ConsistentRead=ConsistentRead, **kwargs)
         items.extend(response['Items'])
     return items
+
+# full_query_and_counts returns both items and counts (pre-filter and
+# post-filter count) as returned by the server.
+# Note that count isn't simply len(items) - the server returns them
+# independently. e.g., with Select='COUNT' the items are not returned, but
+# count is.
+def full_query_and_counts(table, ConsistentRead=True, **kwargs):
+    response = table.query(ConsistentRead=ConsistentRead, **kwargs)
+    items = []
+    prefilter_count = 0
+    postfilter_count = 0
+    pages = 0
+    if 'Items' in response:
+        items.extend(response['Items'])
+        pages = pages + 1
+    if 'Count' in response:
+        postfilter_count = postfilter_count + response['Count']
+    if 'ScannedCount' in response:
+        prefilter_count = prefilter_count + response['ScannedCount']
+    while 'LastEvaluatedKey' in response:
+        response = table.query(ExclusiveStartKey=response['LastEvaluatedKey'],
+            ConsistentRead=ConsistentRead, **kwargs)
+        if 'Items' in response:
+            items.extend(response['Items'])
+            pages = pages + 1
+        if 'Count' in response:
+            postfilter_count = postfilter_count + response['Count']
+        if 'ScannedCount' in response:
+            prefilter_count = prefilter_count + response['ScannedCount']
+    return (prefilter_count, postfilter_count, pages, items)
 
 # To compare two lists of items (each is a dict) without regard for order,
 # "==" is not good enough because it will fail if the order is different.

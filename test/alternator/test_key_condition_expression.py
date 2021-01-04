@@ -2,35 +2,24 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for the KeyConditionExpression parameter of the Query operation.
-# KeyConditionExpression is a newer version of the older "KeyCondition"
-# syntax. That older syntax is tested in test_query.py.
+# KeyConditionExpression is a newer version of the older "KeyConditions"
+# syntax. That older syntax is tested in test_query.py and test_key_conditions.py.
 
 import pytest
 from botocore.exceptions import ClientError, ParamValidationError
 import random
-from util import random_string, random_bytes, full_query, multiset
+from util import random_string, full_query, multiset
 
-# test_table_sn_with_sorted_partition is just the regular test_table_sn, with
-# a partition inserted with many items. The table, the partition key, and the
-# items are returned - the items are sorted (by column 'c'), so they can be
-# easily used to test various range queries. This fixture is useful for
-# writing many small query tests which read the same input data without
-# needing to re-insert data for every test, so overall the test suite is
-# faster.
+# The test_table_{sn,ss,sb}_with_sorted_partition fixtures are the regular
+# test_table_{sn,ss,sb} fixture with a partition inserted with many items.
+# The table, the partition key, and the items are returned - the items are
+# sorted (by column 'c'), so they can be easily used to test various range
+# queries. This fixture is useful for writing many small query tests which
+# read the same input data without needing to re-insert data for every test,
+# so overall the test suite is faster.
 @pytest.fixture(scope="session")
 def test_table_sn_with_sorted_partition(test_table_sn):
     p = random_string()
@@ -39,7 +28,7 @@ def test_table_sn_with_sorted_partition(test_table_sn):
         for item in items:
             batch.put_item(item)
         # Add another partition just to make sure that a query of just
-        # partition p can't just do a whole table scan and still succeed
+        # partition p can't just match the entire table and still succeed
         batch.put_item({'p': random_string(), 'c': 123, 'a': random_string()})
     yield test_table_sn, p, items
 
@@ -221,14 +210,9 @@ def test_key_condition_expression_multi(test_table_sn_with_sorted_partition):
     with pytest.raises(ClientError, match='ValidationException'):
         full_query(table, KeyConditionExpression='p=:p AND c>=:c1 AND c>=:c1',
             ExpressionAttributeValues={':p': p, ':c1': 3})
-    # DynamoDB's produces a somewhat confusing error message for the
-    # following. Before complaining on too many conditions on c, it ignores
-    # the second - and then complains that the attribute value c2 isn't used.
-    # But the details are less important, as long as we consider this an
-    # error and use the word "syntax" in the error message, like Dynamo.
-    with pytest.raises(ClientError, match='ValidationException.*yntax'):
+    with pytest.raises(ClientError, match='ValidationException'):
         full_query(table, KeyConditionExpression='p=:p AND c>=:c1 AND c<=:c2',
-            ExpressionAttributeValues={':p': p, ':c1': 3, 'c2': 7})
+            ExpressionAttributeValues={':p': p, ':c1': 3, ':c2': 7})
 
 # Although the syntax for KeyConditionExpression is only a subset of that
 # of ConditionExpression, it turns out that DynamoDB actually use the same
@@ -328,7 +312,7 @@ def test_key_condition_expression_bad_value(test_table_sn_with_sorted_partition)
         full_query(table, KeyConditionExpression=':a',
             ExpressionAttributeValues={':a': 3})
 
-# In all tests above the condition had p first, s second. Verify that this
+# In all tests above the condition had p first, c second. Verify that this
 # order can be reversed.
 def test_key_condition_expression_order(test_table_sn_with_sorted_partition):
     table, p, items = test_table_sn_with_sorted_partition
@@ -498,10 +482,9 @@ def test_key_condition_expression_bytes_begins(test_table_sb_with_sorted_partiti
     expected_items = [item for item in items if item['c'].startswith(bytearray('00', 'ascii'))]
     assert(got_items == expected_items)
 
-# Query and KeyConditionExpress works also on a table with just a partition
+# Query and KeyConditionExpression works also on a table with just a partition
 # key and no sort key, although obviously it isn't very useful (for such
 # tables, Query is just an elaborate way to do a GetItem).
-# would have been more efficient):
 def test_key_condition_expression_hash_only(test_table_s):
     p = random_string()
     item = {'p': p, 'val': 'hello'}
@@ -519,6 +502,42 @@ def test_key_condition_expression_and_conditions(test_table_sn_with_sorted_parti
             KeyConditions={'c' : {'AttributeValueList': [3],
                 'ComparisonOperator': 'GT'}}
             )
+
+# Demonstrate that issue #6573 was not a bug for KeyConditionExpression:
+# binary strings are ordered as unsigned bytes, i.e., byte 128 comes after
+# 127, not as signed bytes.
+# Test the five ordering operators: <, <=, >, >=, between
+def test_key_condition_expression_unsigned_bytes(test_table_sb):
+    p = random_string()
+    items = [{'p': p, 'c': bytearray([i])} for i in range(126,129)]
+    with test_table_sb.batch_writer() as batch:
+        for item in items:
+            batch.put_item(item)
+    got_items = full_query(test_table_sb,
+        KeyConditionExpression='p=:p AND c<:c',
+        ExpressionAttributeValues={':p': p, ':c': bytearray([127])})
+    expected_items = [item for item in items if item['c'] < bytearray([127])]
+    assert(got_items == expected_items)
+    got_items = full_query(test_table_sb,
+        KeyConditionExpression='p=:p AND c<=:c',
+        ExpressionAttributeValues={':p': p, ':c': bytearray([127])})
+    expected_items = [item for item in items if item['c'] <= bytearray([127])]
+    assert(got_items == expected_items)
+    got_items = full_query(test_table_sb,
+        KeyConditionExpression='p=:p AND c>:c',
+        ExpressionAttributeValues={':p': p, ':c': bytearray([127])})
+    expected_items = [item for item in items if item['c'] > bytearray([127])]
+    assert(got_items == expected_items)
+    got_items = full_query(test_table_sb,
+        KeyConditionExpression='p=:p AND c>=:c',
+        ExpressionAttributeValues={':p': p, ':c': bytearray([127])})
+    expected_items = [item for item in items if item['c'] >= bytearray([127])]
+    assert(got_items == expected_items)
+    got_items = full_query(test_table_sb,
+        KeyConditionExpression='p=:p AND c BETWEEN :c1 AND :c2',
+        ExpressionAttributeValues={':p': p, ':c1': bytearray([127]), ':c2': bytearray([128])})
+    expected_items = [item for item in items if item['c'] >= bytearray([127]) and item['c'] <= bytearray([128])]
+    assert(got_items == expected_items)
 
 # The following is an older test we had, which test one arbitrary use case
 # for KeyConditionExpression. It uses filled_test_table (the one we also

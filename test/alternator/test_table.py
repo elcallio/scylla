@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for basic table operations: CreateTable, DeleteTable, ListTables.
 
@@ -200,7 +189,7 @@ def test_create_table_invalid_schema(dynamodb):
 # Test that trying to create a table that already exists fails in the
 # appropriate way (ResourceInUseException)
 def test_create_table_already_exists(dynamodb, test_table):
-    with pytest.raises(ClientError, match='ResourceInUseException'):
+    with pytest.raises(ClientError, match='ResourceInUseException.*Table.*already exists'):
         create_table(dynamodb, test_table.name)
 
 # Test that BillingMode error path works as expected - only the values
@@ -253,13 +242,13 @@ def test_table_streams_off(dynamodb):
     # Unfortunately, boto3 doesn't allow us to pass StreamSpecification=None.
     # This is what we had in issue #5796.
 
-@pytest.mark.xfail(reason="streams not yet implemented")
 def test_table_streams_on(dynamodb):
-    table = create_test_table(dynamodb,
-        StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'OLD_IMAGE'},
-        KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
-        AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' }]);
-    table.delete();
+    for type in [ 'OLD_IMAGE', 'NEW_IMAGE', 'KEYS_ONLY', 'NEW_AND_OLD_IMAGES']:
+        table = create_test_table(dynamodb,
+            StreamSpecification={'StreamEnabled': True, 'StreamViewType': type},
+            KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
+            AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' }]);
+        table.delete();
 
 # Our first implementation had a special column name called "attrs" where
 # we stored a map for all non-key columns. If the user tried to name one
@@ -308,3 +297,17 @@ def test_list_tables_wrong_limit(dynamodb):
     # lower limit (min. 1) is imposed by boto3 library checks
     with pytest.raises(ClientError, match='ValidationException'):
         dynamodb.meta.client.list_tables(Limit=101)
+
+# Even before Alternator gains support for configuring server-side encryption
+# ("encryption at rest") with CreateTable's SSESpecification option, we should
+# support the option "Enabled=false" which is the default, and means the server
+# takes care of whatever server-side encryption is done, on its own.
+# Reproduces issue #7031.
+def test_table_sse_off(dynamodb):
+    # If StreamSpecification is given, but has StreamEnabled=false, it's as
+    # if StreamSpecification was missing, and fine. No other attribues are
+    # necessary.
+    table = create_test_table(dynamodb, SSESpecification = {'Enabled': False},
+        KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
+        AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' }]);
+    table.delete();

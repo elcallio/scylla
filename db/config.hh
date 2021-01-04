@@ -22,6 +22,7 @@
 #include "seastarx.hh"
 #include "utils/config_file.hh"
 #include "utils/enum_option.hh"
+#include "db/hints/host_filter.hh"
 
 namespace seastar { class file; struct logging_settings; }
 
@@ -70,7 +71,7 @@ namespace db {
 
 /// Enumeration of all valid values for the `experimental` config entry.
 struct experimental_features_t {
-    enum feature { UNUSED, UDF, CDC };
+    enum feature { UNUSED, UDF, UNUSED_CDC, ALTERNATOR_STREAMS };
     static std::unordered_map<sstring, feature> map(); // See enum_option.
     static std::vector<enum_option<experimental_features_t>> all();
 };
@@ -80,6 +81,9 @@ public:
     config();
     config(std::shared_ptr<db::extensions>);
     ~config();
+
+    // For testing only
+    void add_cdc_extension();
 
     /// True iff the feature is enabled.
     bool check_experimental(experimental_features_t::feature f) const;
@@ -101,6 +105,7 @@ public:
                     //program_options::string_map;
     using string_list = std::vector<sstring>;
     using seed_provider_type = db::seed_provider_type;
+    using hinted_handoff_enabled_type = db::hints::host_filter;
 
     /*
      * All values and documentation taken from
@@ -207,6 +212,8 @@ public:
     named_value<bool> start_native_transport;
     named_value<uint16_t> native_transport_port;
     named_value<uint16_t> native_transport_port_ssl;
+    named_value<uint16_t> native_shard_aware_transport_port;
+    named_value<uint16_t> native_shard_aware_transport_port_ssl;
     named_value<uint32_t> native_transport_max_threads;
     named_value<uint32_t> native_transport_max_frame_size_in_mb;
     named_value<sstring> broadcast_rpc_address;
@@ -222,7 +229,7 @@ public:
     named_value<double> dynamic_snitch_badness_threshold;
     named_value<uint32_t> dynamic_snitch_reset_interval_in_ms;
     named_value<uint32_t> dynamic_snitch_update_interval_in_ms;
-    named_value<sstring> hinted_handoff_enabled;
+    named_value<hinted_handoff_enabled_type> hinted_handoff_enabled;
     named_value<uint32_t> hinted_handoff_throttle_in_kb;
     named_value<uint32_t> max_hint_window_in_ms;
     named_value<uint32_t> max_hints_delivery_threads;
@@ -241,6 +248,7 @@ public:
     named_value<uint32_t> permissions_cache_max_entries;
     named_value<string_map> server_encryption_options;
     named_value<string_map> client_encryption_options;
+    named_value<string_map> alternator_encryption_options;
     named_value<uint32_t> ssl_storage_port;
     named_value<bool> enable_in_memory_data_store;
     named_value<bool> enable_cache;
@@ -286,23 +294,32 @@ public:
     named_value<bool> cpu_scheduler;
     named_value<bool> view_building;
     named_value<bool> enable_sstables_mc_format;
+    named_value<bool> enable_sstables_md_format;
     named_value<bool> enable_dangerous_direct_import_of_cassandra_counters;
     named_value<bool> enable_shard_aware_drivers;
     named_value<bool> enable_ipv6_dns_lookup;
     named_value<bool> abort_on_internal_error;
     named_value<uint32_t> max_partition_key_restrictions_per_query;
     named_value<uint32_t> max_clustering_key_restrictions_per_query;
-    named_value<uint64_t> max_memory_for_unlimited_query;
+    named_value<uint64_t> max_memory_for_unlimited_query_soft_limit;
+    named_value<uint64_t> max_memory_for_unlimited_query_hard_limit;
+    named_value<unsigned> initial_sstable_loading_concurrency;
     named_value<bool> enable_3_1_0_compatibility_mode;
     named_value<bool> enable_user_defined_functions;
     named_value<unsigned> user_defined_function_time_limit_ms;
     named_value<unsigned> user_defined_function_allocation_limit_bytes;
     named_value<unsigned> user_defined_function_contiguous_allocation_limit_bytes;
+    named_value<uint32_t> schema_registry_grace_period;
+    named_value<uint32_t> max_concurrent_requests_per_shard;
 
     named_value<uint16_t> alternator_port;
     named_value<uint16_t> alternator_https_port;
     named_value<sstring> alternator_address;
     named_value<bool> alternator_enforce_authorization;
+    named_value<sstring> alternator_write_isolation;
+    named_value<uint32_t> alternator_streams_time_window_s;
+    named_value<uint32_t> alternator_timeout_in_ms;
+
     named_value<bool> abort_on_ebadf;
 
     named_value<uint16_t> redis_port;
@@ -322,11 +339,9 @@ public:
     named_value<sstring> ldap_attr_role;
     named_value<sstring> ldap_bind_dn;
     named_value<sstring> ldap_bind_passwd;
+    named_value<sstring> saslauthd_socket_path;
 
     seastar::logging_settings logging_settings(const boost::program_options::variables_map&) const;
-
-    boost::program_options::options_description_easy_init&
-    add_options(boost::program_options::options_description_easy_init&);
 
     const db::extensions& extensions() const;
 
@@ -345,8 +360,7 @@ private:
             return this->is_set() ? (*this)() : t;
         }
         // do not add to boost::options. We only care about yaml config
-        void add_command_line_option(boost::program_options::options_description_easy_init&,
-                        const std::string_view&, const std::string_view&) override {}
+        void add_command_line_option(boost::program_options::options_description_easy_init&) override {}
     };
 
     log_legacy_value<seastar::log_level> default_log_level;

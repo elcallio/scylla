@@ -198,3 +198,69 @@ drop table lwt;
 -- update is on column d
 -- a composite read command is built and both rows are retreieved,
 -- conditions are executed correctly and mutations are applied accordingly
+--
+--
+-- Issue: #6273
+-- Delete have priority above Insert.
+create table lwt (key bigint, ck int, cv set<text>, PRIMARY KEY((key), ck));
+insert into lwt (key, ck, cv) values (1, 0, {'a', 'b'}) if not exists;
+begin batch
+    delete from lwt where key=1 and ck=0 if exists
+    insert into lwt (key, ck, cv) values (1, 0, {'b', 'c'})
+apply batch;
+select * from lwt;
+drop table lwt;
+--
+-- Workaround for Issue #6273.
+-- Delete individual cells instead of entire partition.
+--
+create table lwt (key bigint, ck int, cv set<text>, PRIMARY KEY((key), ck));
+insert into lwt (key, ck, cv) values (1, 0, {'a', 'b'}) if not exists;
+begin batch
+    update lwt set cv=null where key=1 and ck=0 if exists
+    insert into lwt (key, ck, cv) values (1, 0, {'b', 'c'})
+apply batch;
+select * from lwt;
+drop table lwt;
+
+--
+-- A test case for Issue #7113
+-- Return one row per each LWT statement
+-- in a batch, in statement order.
+--
+CREATE TABLE IF NOT EXISTS gh7113 (
+    part int,
+    key int,
+    lwt_trivial int,
+    int1 int,
+    int2 int,
+    PRIMARY KEY (part, key)
+);
+
+BEGIN BATCH
+    UPDATE gh7113 SET int1 = 6 WHERE part = 0 AND key = 4 IF lwt_trivial = null
+APPLY BATCH;
+
+BEGIN BATCH
+    UPDATE gh7113 SET int2 = 0, int1 = 0 WHERE part = 0 AND key = 0 IF lwt_trivial = null
+    UPDATE gh7113 SET int2 = 1, int1 = 6 WHERE part = 0 AND key = 7 IF lwt_trivial = null
+APPLY BATCH;
+
+BEGIN BATCH
+    UPDATE gh7113 SET int2 = 0, int1 = 2 WHERE part = 0 AND key = 9 IF lwt_trivial = null
+    UPDATE gh7113 SET int1 = 7 WHERE part = 0 AND key = 0 IF lwt_trivial = null
+APPLY BATCH;
+
+
+BEGIN BATCH
+UPDATE gh7113 SET int1 = 6, int2 = 7 WHERE part = 0 AND key = 1 IF lwt_trivial = null
+UPDATE gh7113 SET int2 = 4 WHERE part = 0 AND key = 0 IF lwt_trivial = null
+UPDATE gh7113 SET int2 = 2 WHERE part = 0 AND key = 3 IF lwt_trivial = null
+APPLY BATCH;
+
+BEGIN BATCH
+    UPDATE gh7113 SET int2 = 1 WHERE part = 0 AND key = 4 IF lwt_trivial = null
+    UPDATE gh7113 SET int2 = 1 WHERE part = 0 AND key = 0 IF lwt_trivial = null
+    UPDATE gh7113 SET int1 = 4, int2 = 8 WHERE part = 0 AND key = 9 IF lwt_trivial = null
+    UPDATE gh7113 SET int1 = 0, int2 = 9 WHERE part = 0 AND key = 0 IF lwt_trivial = null
+APPLY BATCH;

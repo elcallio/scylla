@@ -21,6 +21,7 @@
 #include "service/migration_manager.hh"
 #include "schema_builder.hh"
 #include "schema_registry.hh"
+#include "db/schema_tables.hh"
 #include "types/list.hh"
 #include "types/user.hh"
 #include "db/config.hh"
@@ -41,7 +42,7 @@ SEASTAR_TEST_CASE(test_new_schema_with_no_structural_change_is_propagated) {
 
             auto old_schema = partial.build();
 
-            service::get_local_migration_manager().announce_new_column_family(old_schema, false).get();
+            service::get_local_migration_manager().announce_new_column_family(old_schema).get();
 
             auto old_table_version = e.db().local().find_schema(old_schema->id())->version();
             auto old_node_version = e.db().local().get_version();
@@ -68,7 +69,7 @@ SEASTAR_TEST_CASE(test_schema_is_updated_in_keyspace) {
 
             auto old_schema = builder.build();
 
-            service::get_local_migration_manager().announce_new_column_family(old_schema, false).get();
+            service::get_local_migration_manager().announce_new_column_family(old_schema).get();
 
             auto s = e.local_db().find_schema(old_schema->id());
             BOOST_REQUIRE_EQUAL(*old_schema, *s);
@@ -99,7 +100,7 @@ SEASTAR_TEST_CASE(test_tombstones_are_ignored_in_version_calculation) {
                     .with_column("v1", bytes_type)
                     .build();
 
-            service::get_local_migration_manager().announce_new_column_family(table_schema, false).get();
+            service::get_local_migration_manager().announce_new_column_family(table_schema).get();
 
             auto old_table_version = e.db().local().find_schema(table_schema->id())->version();
             auto old_node_version = e.db().local().get_version();
@@ -111,7 +112,7 @@ SEASTAR_TEST_CASE(test_tombstones_are_ignored_in_version_calculation) {
                 mutation m(s, pkey);
                 auto ckey = clustering_key::from_exploded(*s, {utf8_type->decompose(table_schema->cf_name()), "v1"});
                 m.partition().apply_delete(*s, ckey, tombstone(api::min_timestamp, gc_clock::now()));
-                service::get_local_migration_manager().announce(std::vector<mutation>({m}), true).get();
+                service::get_local_migration_manager().announce(std::vector<mutation>({m})).get();
             }
 
             auto new_table_version = e.db().local().find_schema(table_schema->id())->version();
@@ -147,15 +148,15 @@ SEASTAR_TEST_CASE(test_concurrent_column_addition) {
                     .with_column("v2", bytes_type)
                     .build();
 
-            mm.announce_new_column_family(s1, false).get();
+            mm.announce_new_column_family(s1).get();
             auto old_version = e.db().local().find_schema(s1->id())->version();
 
             // Apply s0 -> s2 change.
             {
                 auto&& keyspace = e.db().local().find_keyspace(s0->ks_name()).metadata();
-                auto muts = db::schema_tables::make_update_table_mutations(keyspace, s0, s2,
+                auto muts = db::schema_tables::make_update_table_mutations(e.db().local(), keyspace, s0, s2,
                     api::new_timestamp(), false);
-                mm.announce(std::move(muts), true).get();
+                mm.announce(std::move(muts)).get();
             }
 
             auto new_schema = e.db().local().find_schema(s1->id());
@@ -188,7 +189,7 @@ SEASTAR_TEST_CASE(test_sort_type_in_update) {
         auto muts = muts2;
         muts.insert(muts.end(), muts1.begin(), muts1.end());
         muts.insert(muts.end(), muts3.begin(), muts3.end());
-        mm.announce(std::move(muts), false).get();
+        mm.announce(std::move(muts)).get();
     });
 }
 
@@ -201,9 +202,9 @@ SEASTAR_TEST_CASE(test_column_is_dropped) {
             e.execute_cql("alter table tests.table1 add s1 int;").get();
 
             schema_ptr s = e.db().local().find_schema("tests", "table1");
-            BOOST_REQUIRE(s->columns_by_name().count(to_bytes("c1")));
-            BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c2")));
-            BOOST_REQUIRE(s->columns_by_name().count(to_bytes("s1")));
+            BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("c1")));
+            BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c2")));
+            BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("s1")));
         });
     });
 }
@@ -216,15 +217,15 @@ SEASTAR_TEST_CASE(test_static_column_is_dropped) {
         e.execute_cql("alter table tests.table1 drop c2;").get();
         e.execute_cql("alter table tests.table1 add s1 int static;").get();
         schema_ptr s = e.db().local().find_schema("tests", "table1");
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("c1")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c2")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("s1")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("c1")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c2")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("s1")));
 
         e.execute_cql("alter table tests.table1 drop s1;").get();
         s = e.db().local().find_schema("tests", "table1");
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("c1")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c2")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("s1")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("c1")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c2")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("s1")));
     });
 }
 
@@ -236,20 +237,20 @@ SEASTAR_TEST_CASE(test_multiple_columns_add_and_drop) {
         e.execute_cql("alter table tests.table1 drop (c2);").get();
         e.execute_cql("alter table tests.table1 add (s1 int);").get();
         schema_ptr s = e.db().local().find_schema("tests", "table1");
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("c1")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c2")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("c3")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("s1")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("c1")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c2")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("c3")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("s1")));
 
         e.execute_cql("alter table tests.table1 drop (c1, c3);").get();
         e.execute_cql("alter table tests.table1 add (s2 int, s3 int);").get();
         s = e.db().local().find_schema("tests", "table1");
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c1")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c2")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c3")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("s1")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("s2")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("s3")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c1")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c2")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c3")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("s1")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("s2")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("s3")));
     });
 }
 
@@ -261,20 +262,20 @@ SEASTAR_TEST_CASE(test_multiple_static_columns_add_and_drop) {
         e.execute_cql("alter table tests.table1 drop (c2);").get();
         e.execute_cql("alter table tests.table1 add (s1 int static);").get();
         schema_ptr s = e.db().local().find_schema("tests", "table1");
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("c1")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c2")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("c3")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("s1")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("c1")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c2")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("c3")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("s1")));
 
         e.execute_cql("alter table tests.table1 drop (c3, s1);").get();
         e.execute_cql("alter table tests.table1 add (s2 int, s3 int static);").get();
         s = e.db().local().find_schema("tests", "table1");
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("c1")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c2")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("c3")));
-        BOOST_REQUIRE(!s->columns_by_name().count(to_bytes("s1")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("s2")));
-        BOOST_REQUIRE(s->columns_by_name().count(to_bytes("s3")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("c1")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c2")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("c3")));
+        BOOST_REQUIRE(!s->columns_by_name().contains(to_bytes("s1")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("s2")));
+        BOOST_REQUIRE(s->columns_by_name().contains(to_bytes("s3")));
     });
 }
 
@@ -290,7 +291,7 @@ SEASTAR_TEST_CASE(test_combined_column_add_and_drop) {
                     .with_column("v1", bytes_type)
                     .build();
 
-            mm.announce_new_column_family(s1, false).get();
+            mm.announce_new_column_family(s1).get();
 
             auto&& keyspace = e.db().local().find_keyspace(s1->ks_name()).metadata();
 
@@ -301,9 +302,9 @@ SEASTAR_TEST_CASE(test_combined_column_add_and_drop) {
 
             // Drop v1
             {
-                auto muts = db::schema_tables::make_update_table_mutations(keyspace, s1, s2,
+                auto muts = db::schema_tables::make_update_table_mutations(e.db().local(), keyspace, s1, s2,
                     api::new_timestamp(), false);
-                mm.announce(std::move(muts), true).get();
+                mm.announce(std::move(muts)).get();
             }
 
             // Add a new v1 and drop it
@@ -318,9 +319,9 @@ SEASTAR_TEST_CASE(test_combined_column_add_and_drop) {
                         .without_column("v1", list_type_impl::get_instance(int32_type, true), api::new_timestamp())
                         .build();
 
-                auto muts = db::schema_tables::make_update_table_mutations(keyspace, s3, s4,
+                auto muts = db::schema_tables::make_update_table_mutations(e.db().local(), keyspace, s3, s4,
                     api::new_timestamp(), false);
-                mm.announce(std::move(muts), true).get();
+                mm.announce(std::move(muts)).get();
             }
 
             auto new_schema = e.db().local().find_schema(s1->id());
@@ -450,7 +451,7 @@ SEASTAR_TEST_CASE(test_nested_type_mutation_in_update) {
 
         auto muts = muts1;
         muts.insert(muts.end(), muts2.begin(), muts2.end());
-        mm.announce(std::move(muts), false).get();
+        mm.announce(std::move(muts)).get();
 
         BOOST_REQUIRE_EQUAL(listener.create_user_type_count, 2);
         BOOST_REQUIRE_EQUAL(listener.update_user_type_count, 2);
@@ -567,6 +568,15 @@ SEASTAR_TEST_CASE(test_prepared_statement_is_invalidated_by_schema_change) {
 
 // We don't want schema digest to change between Scylla versions because that results in a schema disagreement
 // during rolling upgrade.
+// This test is *not* supposed to check that the schema does not change.
+// It only checks that the digest itself does not change *given* that the schema does not change.
+// If the schema changes, the digest will change too (as expected), which will cause the test
+// to fail unless you regenerate the test data. That's by design of the test.
+// Note that changing the schema may introduce rolling upgrade problems, e.g. if changing the schema
+// on an upgraded node doesn't force other nodes to follow-up. This test is not intended to catch such bugs.
+// To test that rolling upgrade works in case of schema changes, we need to actually run two different
+// versions of Scylla, and that cannot be done in a unit test.
+// See also #6582.
 future<> test_schema_digest_does_not_change_with_disabled_features(sstring data_dir,
         std::set<sstring> disabled_features, std::vector<utils::UUID> expected_digests,
         std::function<void(cql_test_env& e)> extra_schema_changes,
@@ -579,6 +589,10 @@ future<> test_schema_digest_does_not_change_with_disabled_features(sstring data_
     // This test uses pre-generated sstables and relies on the fact that they are up to date
     // with the current system schema. If it is not, the schema will be updated, which will cause
     // new timestamps to appear and schema digests will not match anymore.
+    // Warning: if you regenerate the data (and digests), please make sure that you don't accidentally
+    // hide a digest calculation bug. Separate commits that touch the schema from commits which
+    // could potentially modify the digest calculation algorithm (for example). And DO test whether
+    // rolling upgrade works.
     const bool regenerate = false;
 
     auto db_cfg_ptr = ::make_shared<db::config>(std::move(extensions));
@@ -666,45 +680,45 @@ future<> test_schema_digest_does_not_change_with_disabled_features(sstring data_
 
 SEASTAR_TEST_CASE(test_schema_digest_does_not_change) {
     std::vector<utils::UUID> expected_digests{
-        utils::UUID("8182496e-4baf-3a07-91e6-caa140388846"),
-        utils::UUID("a65ea746-4d8a-3e5c-8fbf-5f70c14dbcbc"),
-        utils::UUID("a65ea746-4d8a-3e5c-8fbf-5f70c14dbcbc"),
-        utils::UUID("4c138336-4677-3520-8556-4aab007cfedb"),
-        utils::UUID("4c138336-4677-3520-8556-4aab007cfedb"),
-        utils::UUID("62e1e586-6eec-3ff5-882a-89386664694b"),
-        utils::UUID("daf6ded5-c294-3b07-b6a0-1b318a3c2e17"),
-        utils::UUID("370c7d8e-0a4a-394d-b627-318805c64584"),
-        utils::UUID("74bcc842-6a3f-35cd-84ea-3b330ed83c4c")
+        utils::UUID("f32d47ff-e417-3caf-84e5-af6fc756835d"),
+        utils::UUID("e4eacd58-7d49-3cf6-8d04-f7d67c3c268b"),
+        utils::UUID("e4eacd58-7d49-3cf6-8d04-f7d67c3c268b"),
+        utils::UUID("dd04f3d9-88bd-346a-af7f-24a4415613a0"),
+        utils::UUID("dd04f3d9-88bd-346a-af7f-24a4415613a0"),
+        utils::UUID("3c0390a5-c9d3-315b-b5e2-99012fd1b2b6"),
+        utils::UUID("2770f4be-8074-30ec-a04e-938e9cd166cc"),
+        utils::UUID("e46b10ed-488b-30c0-a178-d020cd04687b"),
+        utils::UUID("da3e37d2-54b6-3410-bbaf-66cb6644159c"),
     };
     return test_schema_digest_does_not_change_with_disabled_features("./test/resource/sstables/schema_digest_test", std::set<sstring>{"COMPUTED_COLUMNS", "CDC"}, std::move(expected_digests), [] (cql_test_env& e) {});
 }
 
 SEASTAR_TEST_CASE(test_schema_digest_does_not_change_after_computed_columns) {
     std::vector<utils::UUID> expected_digests{
-        utils::UUID("a33bc2a7-33b7-335d-8644-ecfdd23d1ca6"),
-        utils::UUID("8ec3169e-33f9-356e-9a20-172ddf4261dc"),
-        utils::UUID("8ec3169e-33f9-356e-9a20-172ddf4261dc"),
-        utils::UUID("6d3a2294-0e82-33b8-943a-459cc9f3bf76"),
-        utils::UUID("6d3a2294-0e82-33b8-943a-459cc9f3bf76"),
-        utils::UUID("e4c2bd0d-5f02-3d6f-9a43-de38b152b1fd"),
-        utils::UUID("3b2c4957-4434-3078-ae42-fedcd81ac8cd"),
-        utils::UUID("90518efe-88e6-39bd-a0a6-d32efc80777a"),
-        utils::UUID("61f0fd97-7de7-3449-b32a-b1f41ef14cb2")
+        utils::UUID("b367addc-749e-3a44-b252-ef791a6a8ad0"),
+        utils::UUID("2a2ecd73-4abf-385c-a485-1b3522160ac1"),
+        utils::UUID("2a2ecd73-4abf-385c-a485-1b3522160ac1"),
+        utils::UUID("e6cd543a-7752-3e56-a808-78d8dc9079b7"),
+        utils::UUID("e6cd543a-7752-3e56-a808-78d8dc9079b7"),
+        utils::UUID("c2fe59c7-54b1-31ae-879d-4797d6980272"),
+        utils::UUID("75028458-dc53-3a03-a446-bf7a0425e91e"),
+        utils::UUID("de9fbe48-8ad8-3c10-a98a-1e0d36592ecc"),
+        utils::UUID("e375f56a-b268-3df0-ab49-3acb3b40d6e3"),
     };
     return test_schema_digest_does_not_change_with_disabled_features("./test/resource/sstables/schema_digest_test_computed_columns", std::set<sstring>{"CDC"}, std::move(expected_digests), [] (cql_test_env& e) {});
 }
 
 SEASTAR_TEST_CASE(test_schema_digest_does_not_change_with_functions) {
     std::vector<utils::UUID> expected_digests{
-        utils::UUID("e8879c0e-a731-3ac5-9b43-d2ed33b331f2"),
-        utils::UUID("4a20c241-583c-334e-9fe9-b906280f724f"),
-        utils::UUID("4a20c241-583c-334e-9fe9-b906280f724f"),
-        utils::UUID("9711e6c4-dfcd-3c09-bf8b-f02811f73730"),
-        utils::UUID("9711e6c4-dfcd-3c09-bf8b-f02811f73730"),
-        utils::UUID("e96eb4ca-4f90-3b47-bfed-81e4a441734c"),
-        utils::UUID("14f6c60f-8ba3-3141-8958-dd74366ee1ca"),
-        utils::UUID("987a3386-83d1-3436-b3fc-1d2a3cfdd659"),
-        utils::UUID("9b8baa5b-b09a-34e1-b845-c81da52d4d12")
+        utils::UUID("607dbbc6-e575-3aeb-afbb-135a7f731ebd"),
+        utils::UUID("128082f8-ff08-3730-b30e-3451127e9e8b"),
+        utils::UUID("128082f8-ff08-3730-b30e-3451127e9e8b"),
+        utils::UUID("7e4d2c05-e7cf-32a6-a423-7a0fe63f1341"),
+        utils::UUID("7e4d2c05-e7cf-32a6-a423-7a0fe63f1341"),
+        utils::UUID("70ddb79f-cc18-340b-9f1e-1411718354c8"),
+        utils::UUID("45f8821c-93e6-3a6e-ba48-fefcc0144c6f"),
+        utils::UUID("9b46b4ce-16db-3de7-a77f-8c2f65c40b63"),
+        utils::UUID("498e989a-3acf-3fe1-9f7b-dfca8540d449"),
     };
     return test_schema_digest_does_not_change_with_disabled_features(
         "./test/resource/sstables/schema_digest_with_functions_test",
@@ -720,15 +734,15 @@ SEASTAR_TEST_CASE(test_schema_digest_does_not_change_with_cdc_options) {
     auto ext = std::make_shared<db::extensions>();
     ext->add_schema_extension<cdc::cdc_extension>(cdc::cdc_extension::NAME);
     std::vector<utils::UUID> expected_digests{
-        utils::UUID("07d3ffb8-b7f5-367d-b128-d34b2033b788"),
-        utils::UUID("9500fd95-abeb-32ea-b7af-568021eee217"),
-        utils::UUID("9500fd95-abeb-32ea-b7af-568021eee217"),
-        utils::UUID("9bd2ee49-f6db-37c7-a81f-1c2524dec3bf"),
-        utils::UUID("9bd2ee49-f6db-37c7-a81f-1c2524dec3bf"),
-        utils::UUID("549d0735-3087-3cf5-b4b6-23518a803246"),
-        utils::UUID("612eaafb-27a4-3c01-b292-5d4424585ff7"),
-        utils::UUID("01ea7d67-6f30-3215-aaf0-b7e2266daec5"),
-        utils::UUID("1392a698-e4b2-3a2c-936d-dbd7bf962d08")
+        utils::UUID("9d5233be-e193-31d7-b608-c8cad269a49f"),
+        utils::UUID("862e5a24-7bf7-334a-91bc-0d4cdc33d475"),
+        utils::UUID("862e5a24-7bf7-334a-91bc-0d4cdc33d475"),
+        utils::UUID("098d2bdf-db36-3807-8a48-8623a4b6ab1f"),
+        utils::UUID("098d2bdf-db36-3807-8a48-8623a4b6ab1f"),
+        utils::UUID("c3b98746-7899-37fb-9195-c379ee4f6b70"),
+        utils::UUID("d0596a48-4efb-3e36-9b2d-e69a6e363658"),
+        utils::UUID("638aff24-1222-34e4-b7d0-7c53ba68eeaa"),
+        utils::UUID("d16823ae-0f68-3dac-98ce-e7b7534950a6"),
     };
     return test_schema_digest_does_not_change_with_disabled_features(
         "./test/resource/sstables/schema_digest_test_cdc_options",

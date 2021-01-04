@@ -39,28 +39,24 @@ property_definitions::property_definitions()
 { }
 
 void property_definitions::add_property(const sstring& name, sstring value) {
-    auto it = _properties.find(name);
-    if (it != _properties.end()) {
+    if (auto [ignored, added] = _properties.try_emplace(name, value); !added) {
         throw exceptions::syntax_exception(format("Multiple definition for property '{}'", name));
     }
-    _properties.emplace(name, value);
 }
 
 void property_definitions::add_property(const sstring& name, const std::map<sstring, sstring>& value) {
-    auto it = _properties.find(name);
-    if (it != _properties.end()) {
+    if (auto [ignored, added] = _properties.try_emplace(name, value); !added) {
         throw exceptions::syntax_exception(format("Multiple definition for property '{}'", name));
     }
-    _properties.emplace(name, value);
 }
 
 void property_definitions::validate(const std::set<sstring>& keywords, const std::set<sstring>& exts, const std::set<sstring>& obsolete) const {
     for (auto&& kv : _properties) {
         auto&& name = kv.first;
-        if (keywords.count(name) || exts.count(name)) {
+        if (keywords.contains(name) || exts.contains(name)) {
             continue;
         }
-        if (obsolete.count(name)) {
+        if (obsolete.contains(name)) {
 #if 0
             logger.warn("Ignoring obsolete property {}", name);
 #endif
@@ -95,7 +91,14 @@ std::optional<std::map<sstring, sstring>> property_definitions::get_map(const ss
 }
 
 bool property_definitions::has_property(const sstring& name) const {
-    return _properties.find(name) != _properties.end();
+    return _properties.contains(name);
+}
+
+std::optional<property_definitions::value_type> property_definitions::get(const sstring& name) const {
+    if (auto it = _properties.find(name); it != _properties.end()) {
+        return it->second;
+    }
+    return std::nullopt;
 }
 
 sstring property_definitions::get_string(sstring key, sstring default_value) const {

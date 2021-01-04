@@ -7,28 +7,18 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 import os
 import sys
 import argparse
 import subprocess
 import re
-
-from pkg_resources import parse_version
+import distro
+import shutil
 
 from scylla_util import *
+from subprocess import run
 
 if __name__ == '__main__':
     if os.getuid() > 0:
@@ -42,7 +32,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     if is_debian_variant():
-        run('apt-get install -y ntp ntpdate')
+        if not shutil.which('ntpd') or not shutil.which('ntpdate'):
+            apt_install('ntp ntpdate')
         with open('/etc/ntp.conf') as f:
             conf = f.read()
         if not re.match(r'^server ', conf, flags=re.MULTILINE):
@@ -53,31 +44,26 @@ if __name__ == '__main__':
         ntp = systemd_unit('ntp.service')
         ntp.stop()
         # ignore error, ntpd may able to adjust clock later
-        run('ntpdate ntp.ubuntu.com', exception=False)
+        run('ntpdate ntp.ubuntu.com', shell=True)
         ntp.start()
 
     if is_gentoo_variant():
-        run('emerge -uq net-misc/ntp')
+        if not shutil.which('ntpd'):
+            emerge_install('net-misc/ntp')
         with open('/etc/ntp.conf') as f:
             conf = f.read()
         match = re.search(r'^server\s+(\S*)(\s+\S+)?', conf, flags=re.MULTILINE)
         server = match.group(1)
-        if is_systemd():
-            ntpd = systemd_unit('ntpd.service')
-            ntpd.stop()
-            run('ntpdate {}'.format(server))
-            ntpd.enable()
-            ntpd.start()
-        else:
-            run('rc-service ntpd stop', exception=False)
-            # ignore error, ntpd may able to adjust clock later
-            run('ntpdate {}'.format(server), exception=False)
-            run('rc-update add ntpd default')
-            run('rc-service ntpd start')
+        ntpd = systemd_unit('ntpd.service')
+        ntpd.stop()
+        run('ntpdate {}'.format(server), shell=True, check=True)
+        ntpd.enable()
+        ntpd.start()
 
     if is_redhat_variant():
-        if parse_version(redhat_version()) >= parse_version('8'):
-            run('dnf install -y chrony')
+        if int(distro.major_version()) >= 8:
+            if not shutil.which('chronyd'):
+                yum_install('chrony')
             with open('/etc/chrony.conf') as f:
                 conf = f.read()
             if args.subdomain:
@@ -88,9 +74,10 @@ if __name__ == '__main__':
             chronyd = systemd_unit('chronyd.service')
             chronyd.enable()
             chronyd.restart()
-            run('chronyc makestep')
+            run('chronyc makestep', shell=True, check=True)
         else:
-            run('yum install -y ntp ntpdate')
+            if not shutil.which('ntpd') or not shutil.which('ntpdate'):
+                yum_install('ntp ntpdate')
             with open('/etc/ntp.conf') as f:
                 conf = f.read()
             if args.subdomain:
@@ -103,6 +90,6 @@ if __name__ == '__main__':
             ntpd = systemd_unit('ntpd.service')
             ntpd.stop()
             # ignore error, ntpd may able to adjust clock later
-            run('ntpdate {}'.format(server), exception=False)
+            run('ntpdate {}'.format(server), shell=True)
             ntpd.enable()
             ntpd.start()

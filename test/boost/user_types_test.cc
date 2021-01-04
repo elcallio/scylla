@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <seastar/testing/test_case.hh>
@@ -507,11 +496,6 @@ SEASTAR_TEST_CASE(test_nonfrozen_user_types_prepared) {
             e.execute_prepared(id, vs).discard_result().get();
         };
 
-        auto query_prepared = [&] (const sstring& cql, const std::vector<cql3::raw_value>& vs) {
-            auto id = e.prepare(cql).get0();
-            return e.execute_prepared(id, vs).get0();
-        };
-
         auto mk_int = [] (int x) {
             return cql3::raw_value::make_value(int32_type->decompose(x));
         };
@@ -523,17 +507,6 @@ SEASTAR_TEST_CASE(test_nonfrozen_user_types_prepared) {
         auto mk_tuple = [&] (const std::vector<data_value>& vs) {
             auto type = static_pointer_cast<const tuple_type_impl>(ut);
             return cql3::raw_value::make_value(type->decompose(make_tuple_value(type, vs)));
-        };
-
-        auto mk_ut_list = [&] (const std::vector<std::vector<data_value>>& vss) {
-            std::vector<data_value> ut_vs;
-            for (const auto& vs: vss) {
-                ut_vs.push_back(make_user_value(ut, vs));
-            }
-
-            const auto& ut_list_type = list_type_impl::get_instance(ut, true);
-            return cql3::raw_value::make_value(
-                    ut_list_type->decompose(make_list_value(ut_list_type, list_type_impl::native_type(ut_vs))));
         };
 
         auto text_null = data_value::make_null(utf8_type);
@@ -560,10 +533,25 @@ SEASTAR_TEST_CASE(test_nonfrozen_user_types_prepared) {
             mk_null_row(3),
         });
 
+        auto query_prepared = [&] (const sstring& cql, const std::vector<cql3::raw_value>& vs) {
+            auto id = e.prepare(cql).get0();
+            return e.execute_prepared(id, vs).get0();
+        };
+
+        auto mk_ut_list = [&] (const std::vector<std::vector<data_value>>& vss) {
+            std::vector<data_value> ut_vs;
+            for (const auto& vs: vss) {
+                ut_vs.push_back(make_user_value(ut, vs));
+            }
+
+            const auto& ut_list_type = list_type_impl::get_instance(ut, true);
+            return cql3::raw_value::make_value(
+                    ut_list_type->decompose(make_list_value(ut_list_type, list_type_impl::native_type(ut_vs))));
+        };
+
         assert_that(query_prepared("select * from cf where b in ? allow filtering", {mk_ut_list({{1, "text1", long_null}, {}})}))
                 .is_rows().with_rows_ignore_order({
             mk_row(1, {1, "text1", long_null}),
-            mk_null_row(3),
         });
 
         execute_prepared("insert into cf (a, b) values (?, ?)", {mk_int(4), mk_tuple({4, "text4", int64_t(4)})});

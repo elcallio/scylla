@@ -19,28 +19,28 @@
 
 namespace cql3 {
 
-shared_ptr<column_specification>
+lw_shared_ptr<column_specification>
 lists::index_spec_of(const column_specification& column) {
-    return ::make_shared<column_specification>(column.ks_name, column.cf_name,
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
             ::make_shared<column_identifier>(format("idx({})", *column.name), true), int32_type);
 }
 
-shared_ptr<column_specification>
+lw_shared_ptr<column_specification>
 lists::value_spec_of(const column_specification& column) {
-    return ::make_shared<column_specification>(column.ks_name, column.cf_name,
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
             ::make_shared<column_identifier>(format("value({})", *column.name), true),
                 dynamic_pointer_cast<const list_type_impl>(column.type)->get_elements_type());
 }
 
-shared_ptr<column_specification>
+lw_shared_ptr<column_specification>
 lists::uuid_index_spec_of(const column_specification& column) {
-    return ::make_shared<column_specification>(column.ks_name, column.cf_name,
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
             ::make_shared<column_identifier>(format("uuid_idx({})", *column.name), true), uuid_type);
 }
 
 
 shared_ptr<term>
-lists::literal::prepare(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) const {
+lists::literal::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const {
     validate_assignable_to(db, keyspace, *receiver);
 
     // In Cassandra, an empty (unfrozen) map/set/list is equivalent to the column being null. In
@@ -70,7 +70,7 @@ lists::literal::prepare(database& db, const sstring& keyspace, shared_ptr<column
     if (all_terminal) {
         return value.bind(query_options::DEFAULT);
     } else {
-        return make_shared(std::move(value));
+        return make_shared<delayed_value>(std::move(value));
     }
 }
 
@@ -82,7 +82,7 @@ lists::literal::validate_assignable_to(database& db, const sstring keyspace, con
     }
     auto&& value_spec = value_spec_of(receiver);
     for (auto rt : _elements) {
-        if (!is_assignable(rt->test_assignment(db, keyspace, value_spec))) {
+        if (!is_assignable(rt->test_assignment(db, keyspace, *value_spec))) {
             throw exceptions::invalid_request_exception(format("Invalid list literal for {}: value {} is not of type {}",
                     *receiver.name, *rt, value_spec->type->as_cql3_type()));
         }
@@ -90,8 +90,8 @@ lists::literal::validate_assignable_to(database& db, const sstring keyspace, con
 }
 
 assignment_testable::test_result
-lists::literal::test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) const {
-    if (!dynamic_pointer_cast<const list_type_impl>(receiver->type)) {
+lists::literal::test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const {
+    if (!dynamic_pointer_cast<const list_type_impl>(receiver.type)) {
         return assignment_testable::test_result::NOT_ASSIGNABLE;
     }
 
@@ -100,11 +100,11 @@ lists::literal::test_assignment(database& db, const sstring& keyspace, shared_pt
         return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
     }
 
-    auto&& value_spec = value_spec_of(*receiver);
+    auto&& value_spec = value_spec_of(receiver);
     std::vector<shared_ptr<assignment_testable>> to_test;
     to_test.reserve(_elements.size());
     std::copy(_elements.begin(), _elements.end(), std::back_inserter(to_test));
-    return assignment_testable::test_all(db, keyspace, value_spec, to_test);
+    return assignment_testable::test_all(db, keyspace, *value_spec, to_test);
 }
 
 sstring
@@ -114,18 +114,11 @@ lists::literal::to_string() const {
 
 lists::value
 lists::value::from_serialized(const fragmented_temporary_buffer::view& val, const list_type_impl& type, cql_serialization_format sf) {
-    return with_linearized(val, [&] (bytes_view v) {
-        return from_serialized(v, type, sf);
-    });
-}
-
-lists::value
-lists::value::from_serialized(bytes_view v, const list_type_impl& type, cql_serialization_format sf) {
     try {
         // Collections have this small hack that validate cannot be called on a serialized object,
         // but compose does the validation (so we're fine).
         // FIXME: deserializeForNativeProtocol()?!
-        auto l = value_cast<list_type_impl::native_type>(type.deserialize(v, sf));
+        auto l = value_cast<list_type_impl::native_type>(type.deserialize(val, sf));
         std::vector<bytes_opt> elements;
         elements.reserve(l.size());
         for (auto&& element : l) {
@@ -223,12 +216,11 @@ lists::marker::bind(const query_options& options) {
         return constants::UNSET_VALUE;
     } else {
         try {
-            return with_linearized(*value, [&] (bytes_view v) {
-                ltype.validate(v, options.get_cql_serialization_format());
-                return make_shared(value::from_serialized(v, ltype, options.get_cql_serialization_format()));
-            });
+            ltype.validate(*value, options.get_cql_serialization_format());
+            return make_shared<lists::value>(value::from_serialized(*value, ltype, options.get_cql_serialization_format()));
         } catch (marshal_exception& e) {
-            throw exceptions::invalid_request_exception(e.what());
+            throw exceptions::invalid_request_exception(
+                    format("Exception while binding column {:s}: {:s}", _receiver->name->to_cql_string(), e.what()));
         }
     }
 }
@@ -296,9 +288,7 @@ lists::setter_by_index::execute(mutation& m, const clustering_key_prefix& prefix
         return;
     }
 
-    auto idx = with_linearized(*index, [] (bytes_view v) {
-        return value_cast<int32_t>(data_type_for<int32_t>()->deserialize(v));
-    });
+    auto idx = value_cast<int32_t>(data_type_for<int32_t>()->deserialize(*index));
     auto&& existing_list_opt = params.get_prefetched_list(m.key(), prefix, column);
     if (!existing_list_opt) {
         throw exceptions::invalid_request_exception("Attempted to set an element on a list which is null");
@@ -346,7 +336,12 @@ lists::setter_by_uuid::execute(mutation& m, const clustering_key_prefix& prefix,
 
     collection_mutation_description mut;
     mut.cells.reserve(1);
-    mut.cells.emplace_back(to_bytes(*index), params.make_cell(*ltype->value_comparator(), *value, atomic_cell::collection_member::yes));
+
+    if (!value) {
+        mut.cells.emplace_back(to_bytes(*index), params.make_dead_cell());
+    } else {
+        mut.cells.emplace_back(to_bytes(*index), params.make_cell(*ltype->value_comparator(), *value, atomic_cell::collection_member::yes));
+    }
 
     m.set_cell(prefix, column, mut.serialize(*ltype));
 }

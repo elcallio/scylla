@@ -15,11 +15,6 @@ uint32_t service_level_statement::get_bound_terms() const {
     return 0;
 }
 
-bool service_level_statement::uses_function(
-        const sstring &ks_name, const sstring &function_name) const {
-    return parsed_statement::uses_function(ks_name, function_name);
-}
-
 bool service_level_statement::depends_on_keyspace(
         const sstring &ks_name) const {
     return false;

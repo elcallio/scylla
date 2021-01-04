@@ -15,7 +15,9 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/core/distributed.hh>
 #include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
 #include "sstables/sstables.hh"
+#include "sstables/incremental_compaction_strategy.hh"
 #include "schema.hh"
 #include "database.hh"
 #include "sstables/compaction_manager.hh"
@@ -25,7 +27,7 @@
 #include "cell_locking.hh"
 #include "test/lib/flat_mutation_reader_assertions.hh"
 #include "service/storage_proxy.hh"
-#include "sstable_run_based_compaction_strategy_for_tests.hh"
+#include "test/lib/sstable_run_based_compaction_strategy_for_tests.hh"
 #include "dht/i_partitioner.hh"
 #include "dht/murmur3_partitioner.hh"
 #include "db/large_data_handler.hh"
@@ -35,7 +37,7 @@
 using namespace sstables;
 
 static flat_mutation_reader sstable_reader(shared_sstable sst, schema_ptr s) {
-    return sst->as_mutation_source().make_reader(s, no_reader_permit(), query::full_partition_range, s->full_slice());
+    return sst->as_mutation_source().make_reader(s, tests::make_permit(), query::full_partition_range, s->full_slice());
 
 }
 
@@ -54,18 +56,17 @@ SEASTAR_TEST_CASE(incremental_compaction_test) {
         auto tmp = make_lw_shared<tmpdir>();
         auto sst_gen = [&env, s, tmp, gen = make_lw_shared<unsigned>(1)] () mutable {
             auto sst = env.make_sstable(s, tmp->path().string(), (*gen)++, la, big);
-            sst->set_unshared();
             return sst;
         };
 
         auto cm = make_lw_shared<compaction_manager>();
         auto tracker = make_lw_shared<cache_tracker>();
-        auto cf = make_lw_shared<column_family>(s, column_family_test_config(), column_family::no_commitlog(), *cm, cl_stats, *tracker);
+        auto cf = make_lw_shared<column_family>(s, column_family_test_config(env.manager()), column_family::no_commitlog(), *cm, cl_stats, *tracker);
         cf->mark_ready_for_writes();
         cf->start();
         cf->set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
         auto compact = [&, s] (std::vector<shared_sstable> all, auto replacer) -> std::vector<shared_sstable> {
-            auto desc = sstables::compaction_descriptor(std::move(all), 1, 0);
+            auto desc = sstables::compaction_descriptor(std::move(all), cf->get_sstable_set(), service::get_local_compaction_priority(), 1, 0);
             desc.replacer = replacer;
             desc.creator = [sst_gen] (shard_id ignore) mutable { return sst_gen(); };
             return sstables::compact_sstables(std::move(desc), *cf).get0().new_sstables;
@@ -137,9 +138,9 @@ SEASTAR_TEST_CASE(incremental_compaction_test) {
             auto replacer = [&] (compaction_completion_desc ccd) {
                 BOOST_REQUIRE(expected_sst != sstable_run.end());
                 if (incremental_enabled) {
-                    do_incremental_replace(std::move(ccd.input_sstables), std::move(ccd.output_sstables), expected_sst, closed_sstables_tracker);
+                    do_incremental_replace(std::move(ccd.old_sstables), std::move(ccd.new_sstables), expected_sst, closed_sstables_tracker);
                 } else {
-                    do_replace(std::move(ccd.input_sstables), std::move(ccd.output_sstables));
+                    do_replace(std::move(ccd.old_sstables), std::move(ccd.new_sstables));
                     expected_sst = sstable_run.end();
                 }
             };
@@ -174,3 +175,96 @@ SEASTAR_TEST_CASE(incremental_compaction_test) {
     });
 }
 
+SEASTAR_THREAD_TEST_CASE(incremental_compaction_sag_test) {
+    auto builder = schema_builder("tests", "incremental_compaction_test")
+        .with_column("id", utf8_type, column_kind::partition_key)
+        .with_column("value", int32_type);
+    auto s = builder.build();
+
+    struct sag_test {
+        test_env& _env;
+        compaction_manager _cm;
+        cell_locker_stats _cl_stats;
+        cache_tracker _tracker;
+        lw_shared_ptr<column_family> _cf;
+        incremental_compaction_strategy _ics;
+        const unsigned min_threshold = 4;
+        const size_t data_set_size = 1'000'000'000;
+
+        static incremental_compaction_strategy make_ics(double space_amplification_goal) {
+            std::map<sstring, sstring> options;
+            options.emplace(sstring("space_amplification_goal"), sstring(std::to_string(space_amplification_goal)));
+            return incremental_compaction_strategy(options);
+        }
+        static column_family::config make_table_config(test_env& env) {
+            auto config = column_family_test_config(env.manager());
+            config.compaction_enforce_min_threshold = true;
+            return config;
+        }
+
+        sag_test(test_env& env, schema_ptr s, double space_amplification_goal)
+            : _env(env)
+            , _cf(make_lw_shared<column_family>(s, make_table_config(_env), column_family::no_commitlog(), _cm, _cl_stats, _tracker))
+            , _ics(make_ics(space_amplification_goal))
+        {
+        }
+
+        double space_amplification() const {
+            auto sstables = _cf->get_sstables();
+            auto total = boost::accumulate(*sstables | boost::adaptors::transformed(std::mem_fn(&sstable::data_size)), uint64_t(0));
+            return double(total) / data_set_size;
+        }
+
+        shared_sstable make_sstable_with_size(size_t sstable_data_size) {
+            static thread_local unsigned gen = 0;
+            auto sst = _env.make_sstable(_cf->schema(), "", gen++, la, big);
+            sstables::test(sst).set_data_file_size(sstable_data_size);
+            sstables::test(sst).set_values("a", "z", stats_metadata{});
+            return sst;
+        }
+
+        void populate(double target_space_amplification) {
+            auto add_sstable = [this] (unsigned sst_data_size) {
+                auto sst = make_sstable_with_size(sst_data_size);
+                column_family_test(_cf).add_sstable(sst);
+            };
+
+            add_sstable(data_set_size);
+            while (space_amplification() < target_space_amplification) {
+                add_sstable(data_set_size / min_threshold);
+            }
+        }
+
+        void run() {
+            for (;;) {
+                auto desc = _ics.get_sstables_for_compaction(*_cf, _cf->non_staging_sstables());
+                // no more jobs, bailing out...
+                if (desc.sstables.empty()) {
+                    break;
+                }
+                auto total = boost::accumulate(desc.sstables | boost::adaptors::transformed(std::mem_fn(&sstable::data_size)), uint64_t(0));
+                std::vector<shared_sstable> new_ssts = { make_sstable_with_size(std::min(total, data_set_size)) };
+                column_family_test(_cf).rebuild_sstable_list(new_ssts, desc.sstables);
+            }
+        }
+    };
+
+    using SAG = double;
+    using TABLE_INITIAL_SA = double;
+
+    auto with_sag_test = [&] (SAG sag, TABLE_INITIAL_SA initial_sa) {
+      test_env::do_with_async([&] (test_env& env) {
+        sag_test test(env, s, sag);
+        test.populate(initial_sa);
+        BOOST_REQUIRE(test.space_amplification() >= initial_sa);
+        test.run();
+        BOOST_REQUIRE(test.space_amplification() <= sag);
+      }).get();
+    };
+
+    with_sag_test(SAG(1.25), TABLE_INITIAL_SA(1.5));
+    with_sag_test(SAG(2), TABLE_INITIAL_SA(1.5));
+    with_sag_test(SAG(1.5), TABLE_INITIAL_SA(1.75));
+    with_sag_test(SAG(1.01), TABLE_INITIAL_SA(1.5));
+    with_sag_test(SAG(1.5), TABLE_INITIAL_SA(1));
+}

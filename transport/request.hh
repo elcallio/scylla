@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -24,6 +13,7 @@
 #include <boost/locale/encoding_utf.hpp>
 
 #include "server.hh"
+#include "utils/utf8.hh"
 #include "utils/reusable_buffer.hh"
 #include "utils/fragmented_temporary_buffer.hh"
 
@@ -40,10 +30,9 @@ private:
         };
     };
     static void validate_utf8(sstring_view s) {
-        try {
-            boost::locale::conv::utf_to_utf<char>(s.begin(), s.end(), boost::locale::conv::stop);
-        } catch (const boost::locale::conv::conversion_error& ex) {
-            throw exceptions::protocol_exception("Cannot decode string as UTF8");
+        auto error_pos = utils::utf8::validate_with_error_position(to_bytes_view(s));
+        if (error_pos) {
+            throw exceptions::protocol_exception(format("Cannot decode string as UTF8, invalid character at byte offset {}", *error_pos));
         }
     }
 

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "db/data_listeners.hh"
@@ -31,16 +20,16 @@ namespace db {
 
 void data_listeners::install(data_listener* listener) {
     _listeners.emplace(listener);
-    dblog.debug("data_listeners: install listener {}", listener);
+    dblog.debug("data_listeners: install listener {}", fmt::ptr(listener));
 }
 
 void data_listeners::uninstall(data_listener* listener) {
-    dblog.debug("data_listeners: uninstall listener {}", listener);
+    dblog.debug("data_listeners: uninstall listener {}", fmt::ptr(listener));
     _listeners.erase(listener);
 }
 
 bool data_listeners::exists(data_listener* listener) const {
-    return _listeners.count(listener) != 0;
+    return _listeners.contains(listener);
 }
 
 flat_mutation_reader data_listeners::on_read(const schema_ptr& s, const dht::partition_range& range,
@@ -64,17 +53,17 @@ toppartitions_item_key::operator sstring() const {
 }
 
 toppartitions_data_listener::toppartitions_data_listener(database& db, sstring ks, sstring cf) : _db(db), _ks(ks), _cf(cf) {
-    dblog.debug("toppartitions_data_listener: installing {}", this);
+    dblog.debug("toppartitions_data_listener: installing {}", fmt::ptr(this));
     _db.data_listeners().install(this);
 }
 
 toppartitions_data_listener::~toppartitions_data_listener() {
-    dblog.debug("toppartitions_data_listener: uninstalling {}", this);
+    dblog.debug("toppartitions_data_listener: uninstalling {}", fmt::ptr(this));
     _db.data_listeners().uninstall(this);
 }
 
 future<> toppartitions_data_listener::stop() {
-    dblog.debug("toppartitions_data_listener: stopping {}", this);
+    dblog.debug("toppartitions_data_listener: stopping {}", fmt::ptr(this));
     return make_ready_future<>();
 }
 
@@ -138,7 +127,7 @@ future<toppartitions_query::results> toppartitions_query::gather(unsigned res_si
     dblog.debug("toppartitions_query::gather");
 
     auto map = [res_size, this] (toppartitions_data_listener& listener) {
-        dblog.trace("toppartitions_query::map_reduce with listener {}", &listener);
+        dblog.trace("toppartitions_query::map_reduce with listener {}", fmt::ptr(&listener));
         top_t rd = toppartitions_data_listener::globalize(listener._top_k_read.top(res_size));
         top_t wr = toppartitions_data_listener::globalize(listener._top_k_write.top(res_size));
         return make_foreign(std::make_unique<std::tuple<top_t, top_t>>(std::move(rd), std::move(wr)));

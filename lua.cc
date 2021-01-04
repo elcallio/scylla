@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "lua.hh"
@@ -26,6 +15,14 @@
 #include "utils/ascii.hh"
 #include "utils/date.h"
 #include <lua.hpp>
+
+// Lua 5.4 added an extra parameter to lua_resume
+
+#if LUA_VERSION_NUM >= 504
+#    define LUA_504_PLUS(x...) x
+#else
+#    define LUA_504_PLUS(x...)
+#endif
 
 using namespace seastar;
 
@@ -220,19 +217,17 @@ struct lua_table {
 template <typename Func>
 using lua_visit_ret_type = std::invoke_result_t<Func, const double&>;
 
-GCC6_CONCEPT(
 template <typename Func>
-concept bool CanHandleRawLuaTypes = requires(Func f) {
-    { f(*static_cast<const long long*>(nullptr)) }                      -> lua_visit_ret_type<Func>;
-    { f(*static_cast<const double*>(nullptr)) }                         -> lua_visit_ret_type<Func>;
-    { f(*static_cast<const big_decimal*>(nullptr)) }                    -> lua_visit_ret_type<Func>;
-    { f(*static_cast<const std::string_view*>(nullptr)) }               -> lua_visit_ret_type<Func>;
-    { f(*static_cast<const lua_table*>(nullptr)) }                      -> lua_visit_ret_type<Func>;
+concept CanHandleRawLuaTypes = requires(Func f) {
+    { f(*static_cast<const long long*>(nullptr)) }                      -> std::same_as<lua_visit_ret_type<Func>>;
+    { f(*static_cast<const double*>(nullptr)) }                         -> std::same_as<lua_visit_ret_type<Func>>;
+    { f(*static_cast<const big_decimal*>(nullptr)) }                    -> std::same_as<lua_visit_ret_type<Func>>;
+    { f(*static_cast<const std::string_view*>(nullptr)) }               -> std::same_as<lua_visit_ret_type<Func>>;
+    { f(*static_cast<const lua_table*>(nullptr)) }                      -> std::same_as<lua_visit_ret_type<Func>>;
 };
-)
 
 template <typename Func>
-GCC6_CONCEPT(requires CanHandleRawLuaTypes<Func>)
+requires CanHandleRawLuaTypes<Func>
 static auto visit_lua_raw_value(lua_State* l, int index, Func&& f) {
     switch (lua_type(l, index)) {
     case LUA_TNONE:
@@ -264,30 +259,37 @@ static auto visit_lua_raw_value(lua_State* l, int index, Func&& f) {
 
 template <typename Func>
 static auto visit_decimal(const big_decimal &v, Func&& f) {
-    boost::multiprecision::cpp_int ten(10);
-    const auto& dividend = v.unscaled_value();
-    auto divisor = boost::multiprecision::pow(ten, v.scale());
+    boost::multiprecision::cpp_rational r = v.as_rational();
+    const boost::multiprecision::cpp_int& dividend = numerator(r);
+    const boost::multiprecision::cpp_int& divisor = denominator(r);
     if (dividend % divisor == 0) {
-        return f(utils::multiprecision_int(boost::multiprecision::cpp_int(dividend/divisor)));
+        return f(utils::multiprecision_int(dividend/divisor));
     }
-    boost::multiprecision::cpp_rational r = dividend;
-    r /= divisor;
     return f(r.convert_to<double>());
 }
 
-GCC6_CONCEPT(
 template <typename Func>
-concept bool CanHandleLuaTypes = requires(Func f) {
-    { f(*static_cast<const double*>(nullptr)) }                         -> lua_visit_ret_type<Func>;
-    { f(*static_cast<const utils::multiprecision_int*>(nullptr)) }      -> lua_visit_ret_type<Func>;
-    { f(*static_cast<const big_decimal*>(nullptr)) }                    -> lua_visit_ret_type<Func>;
-    { f(*static_cast<const std::string_view*>(nullptr)) }               -> lua_visit_ret_type<Func>;
-    { f(*static_cast<const lua_table*>(nullptr)) }                      -> lua_visit_ret_type<Func>;
+concept CanHandleLuaTypes = requires(Func f) {
+    { f(*static_cast<const double*>(nullptr)) }                         -> std::same_as<lua_visit_ret_type<Func>>;
+    { f(*static_cast<const utils::multiprecision_int*>(nullptr)) }      -> std::same_as<lua_visit_ret_type<Func>>;
+    { f(*static_cast<const big_decimal*>(nullptr)) }                    -> std::same_as<lua_visit_ret_type<Func>>;
+    { f(*static_cast<const std::string_view*>(nullptr)) }               -> std::same_as<lua_visit_ret_type<Func>>;
+    { f(*static_cast<const lua_table*>(nullptr)) }                      -> std::same_as<lua_visit_ret_type<Func>>;
 };
-)
+
+// This is used to test if a double fits in a long long, so
+// we expect overflows. Prevent the sanitizer from complaining.
+#ifdef __clang__
+[[clang::no_sanitize("undefined")]]
+#endif
+static
+long long
+cast_to_long_long_allow_overflow(double v) {
+    return (long long)v;
+}
 
 template <typename Func>
-GCC6_CONCEPT(requires CanHandleLuaTypes<Func>)
+requires CanHandleLuaTypes<Func>
 static auto visit_lua_value(lua_State* l, int index, Func&& f) {
     struct visitor {
         lua_State* l;
@@ -296,7 +298,7 @@ static auto visit_lua_value(lua_State* l, int index, Func&& f) {
         auto operator()(const long long& v) { return f(utils::multiprecision_int(v)); }
         auto operator()(const utils::multiprecision_int& v) { return f(v); }
         auto operator()(const double& v) {
-            long long v2 = v;
+            long long v2 = cast_to_long_long_allow_overflow(v);
             if (v2 == v) {
                 return (*this)(v2);
             }
@@ -799,10 +801,11 @@ struct from_lua_visitor {
 
     data_value operator()(const utf8_type_impl& t) {
         sstring s = get_string(l, -1);
-        if (utils::utf8::validate(reinterpret_cast<uint8_t*>(s.data()), s.size())) {
-            return std::move(s);
+        auto error_pos = utils::utf8::validate_with_error_position(reinterpret_cast<uint8_t*>(s.data()), s.size());
+        if (error_pos) {
+            throw exceptions::invalid_request_exception(format("value is not valid utf8, invalid character at byte offset {}", *error_pos));
         }
-        throw exceptions::invalid_request_exception("value is not valid utf8");
+        return std::move(s);
     }
 
     data_value operator()(const ascii_type_impl& t) {
@@ -1087,7 +1090,8 @@ future<bytes_opt> lua::run_script(lua::bitcode_view bitcode, const std::vector<d
         // The hook will be called after 1000 instructions.
         lua_sethook(l, debug_hook, LUA_MASKCALL | LUA_MASKCOUNT, 1000);
         auto start = ::now();
-        switch (lua_resume(l, nullptr, nargs)) {
+        LUA_504_PLUS(int nresults;)
+        switch (lua_resume(l, nullptr, nargs LUA_504_PLUS(, &nresults))) {
         case LUA_OK:
             return make_ready_future<std::optional<bytes_opt>>(convert_return(l, return_type));
         case LUA_YIELD: {

@@ -36,7 +36,7 @@ namespace gms {
 
 namespace version_generator
 {
-    int get_next_version();
+    int get_next_version() noexcept;
 }
 
 } // namespace gms

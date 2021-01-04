@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -28,8 +17,14 @@
 #include "utils/buffer_input_stream.hh"
 #include "sstables/prepended_input_stream.hh"
 #include "tracing/traced_file.hh"
+#include "sstables/scanning_clustered_index_cursor.hh"
+#include "sstables/mx/bsearch_clustered_cursor.hh"
 
 namespace sstables {
+
+extern seastar::logger sstlog;
+extern thread_local cached_file::metrics index_page_cache_metrics;
+extern thread_local mc::cached_promoted_index::metrics promoted_index_cache_metrics;
 
 class index_consumer {
     uint64_t max_quantity;
@@ -66,6 +61,7 @@ class index_consume_entry_context : public data_consumer::continuous_data_consum
     using read_status = typename continuous_data_consumer::read_status;
 private:
     IndexConsumer& _consumer;
+    sstring _file_name;
     file _index_file;
     file_input_stream_options _options;
     uint64_t _entry_offset;
@@ -84,8 +80,25 @@ private:
         CONSUME_ENTRY,
     } _state = state::START;
 
+    friend std::ostream& operator<<(std::ostream& out, const state& s) {
+        switch (s) {
+        case state::START: return out <<  "START";
+        case state::KEY_SIZE: return out <<  "KEY_SIZE";
+        case state::KEY_BYTES: return out <<  "KEY_BYTES";
+        case state::POSITION: return out <<  "POSITION";
+        case state::PROMOTED_SIZE: return out <<  "PROMOTED_SIZE";
+        case state::PARTITION_HEADER_LENGTH_1: return out <<  "PARTITION_HEADER_LENGTH_1";
+        case state::PARTITION_HEADER_LENGTH_2: return out <<  "PARTITION_HEADER_LENGTH_2";
+        case state::LOCAL_DELETION_TIME: return out <<  "LOCAL_DELETION_TIME";
+        case state::MARKED_FOR_DELETE_AT: return out <<  "MARKED_FOR_DELETE_AT";
+        case state::NUM_PROMOTED_INDEX_BLOCKS: return out <<  "NUM_PROMOTED_INDEX_BLOCKS";
+        case state::CONSUME_ENTRY: return out <<  "CONSUME_ENTRY";
+        }
+        abort();
+    }
+
     temporary_buffer<char> _key;
-    uint32_t _promoted_index_end;
+    uint64_t _promoted_index_end;
     uint64_t _position;
     uint64_t _partition_header_length = 0;
     std::optional<deletion_time> _deletion_time;
@@ -94,6 +107,8 @@ private:
     trust_promoted_index _trust_pi;
     const schema& _s;
     std::optional<column_values_fixed_lengths> _ck_values_fixed_lengths;
+    bool _use_binary_search;
+    tracing::trace_state_ptr _trace_state;
 
     inline bool is_mc_format() const { return static_cast<bool>(_ck_values_fixed_lengths); }
 
@@ -123,31 +138,37 @@ public:
         switch (_state) {
         // START comes first, to make the handling of the 0-quantity case simpler
         case state::START:
+            sstlog.trace("{}: pos {} state {}", fmt::ptr(this), current_pos(), state::START);
             _state = state::KEY_SIZE;
             break;
         case state::KEY_SIZE:
+            sstlog.trace("{}: pos {} state {}", fmt::ptr(this), current_pos(), state::KEY_SIZE);
             _entry_offset = current_pos();
             if (this->read_16(data) != continuous_data_consumer::read_status::ready) {
                 _state = state::KEY_BYTES;
                 break;
             }
         case state::KEY_BYTES:
+            sstlog.trace("{}: pos {} state {}", fmt::ptr(this), current_pos(), state::KEY_BYTES);
             if (this->read_bytes(data, this->_u16, _key) != continuous_data_consumer::read_status::ready) {
                 _state = state::POSITION;
                 break;
             }
         case state::POSITION:
+            sstlog.trace("{}: pos {} state {}", fmt::ptr(this), current_pos(), state::POSITION);
             if (read_vint_or_uint64(data) != continuous_data_consumer::read_status::ready) {
                 _state = state::PROMOTED_SIZE;
                 break;
             }
         case state::PROMOTED_SIZE:
+            sstlog.trace("{}: pos {} state {}", fmt::ptr(this), current_pos(), state::PROMOTED_SIZE);
             _position = this->_u64;
             if (read_vint_or_uint32(data) != continuous_data_consumer::read_status::ready) {
                 _state = state::PARTITION_HEADER_LENGTH_1;
                 break;
             }
         case state::PARTITION_HEADER_LENGTH_1: {
+            sstlog.trace("{}: pos {} state {}", fmt::ptr(this), current_pos(), state::PARTITION_HEADER_LENGTH_1);
             auto promoted_index_size_with_header = get_uint32();
             _promoted_index_end = current_pos() + promoted_index_size_with_header;
             if (promoted_index_size_with_header == 0) {
@@ -165,21 +186,25 @@ public:
             }
         }
         case state::PARTITION_HEADER_LENGTH_2:
+            sstlog.trace("{}: pos {} state {} {}", fmt::ptr(this), current_pos(), state::PARTITION_HEADER_LENGTH_2, this->_u64);
             _partition_header_length = this->_u64;
         state_LOCAL_DELETION_TIME:
         case state::LOCAL_DELETION_TIME:
+            sstlog.trace("{}: pos {} state {}", fmt::ptr(this), current_pos(), state::LOCAL_DELETION_TIME);
             _deletion_time.emplace();
             if (this->read_32(data) != continuous_data_consumer::read_status::ready) {
                 _state = state::MARKED_FOR_DELETE_AT;
                 break;
             }
         case state::MARKED_FOR_DELETE_AT:
+            sstlog.trace("{}: pos {} state {}", fmt::ptr(this), current_pos(), state::MARKED_FOR_DELETE_AT);
             _deletion_time->local_deletion_time = this->_u32;
             if (this->read_64(data) != continuous_data_consumer::read_status::ready) {
                 _state = state::NUM_PROMOTED_INDEX_BLOCKS;
                 break;
             }
         case state::NUM_PROMOTED_INDEX_BLOCKS:
+            sstlog.trace("{}: pos {} state {}", fmt::ptr(this), current_pos(), state::NUM_PROMOTED_INDEX_BLOCKS);
             _deletion_time->marked_for_delete_at = this->_u64;
             if (read_vint_or_uint32(data) != continuous_data_consumer::read_status::ready) {
                 _state = state::CONSUME_ENTRY;
@@ -187,37 +212,46 @@ public:
             }
         state_CONSUME_ENTRY:
         case state::CONSUME_ENTRY: {
-            auto promoted_index_size = _promoted_index_end - current_pos();
+            auto promoted_index_start = current_pos();
+            auto promoted_index_size = _promoted_index_end - promoted_index_start;
+            sstlog.trace("{}: pos {} state {} size {}", fmt::ptr(this), current_pos(), state::CONSUME_ENTRY, promoted_index_size);
             if (_deletion_time) {
                 _num_pi_blocks = get_uint32();
             }
             auto data_size = data.size();
-            std::optional<input_stream<char>> promoted_index_stream;
+            std::unique_ptr<promoted_index> pi;
             if ((_trust_pi == trust_promoted_index::yes) && (promoted_index_size > 0)) {
-                if (promoted_index_size <= data_size) {
-                    auto buf = data.share();
-                    buf.trim(promoted_index_size);
-                    promoted_index_stream = make_buffer_input_stream(std::move(buf));
+                std::unique_ptr<clustered_index_cursor> cursor;
+                if (_use_binary_search) {
+                    cached_file f(_index_file, continuous_data_consumer::_permit, index_page_cache_metrics,
+                        promoted_index_start, promoted_index_size, _file_name);
+                    if (promoted_index_size <= data_size) {
+                        f.populate_front(data.share());
+                    } else {
+                        f.populate_front(std::move(data));
+                    }
+                    cursor = std::make_unique<mc::bsearch_clustered_cursor>(_s,
+                        promoted_index_cache_metrics, continuous_data_consumer::_permit,
+                        *_ck_values_fixed_lengths, std::move(f), _options.io_priority_class, _num_pi_blocks, _trace_state);
                 } else {
-                    promoted_index_stream = make_prepended_input_stream(
-                            std::move(data),
-                            make_file_input_stream(_index_file, this->position(), promoted_index_size - data_size, _options).detach());
+                    input_stream<char> promoted_index_stream = [&] {
+                        if (promoted_index_size <= data_size) {
+                            auto buf = data.share();
+                            buf.trim(promoted_index_size);
+                            return make_buffer_input_stream(std::move(buf));
+                        } else {
+                            return make_prepended_input_stream(std::move(data),
+                                make_file_input_stream(_index_file, this->position(), promoted_index_size - data_size, _options).detach());
+                        }
+                    }();
+                    cursor = std::make_unique<scanning_clustered_index_cursor>(_s, continuous_data_consumer::_permit,
+                        std::move(promoted_index_stream), promoted_index_size, _num_pi_blocks, _ck_values_fixed_lengths);
                 }
+                pi = std::make_unique<promoted_index>(_s, *_deletion_time, promoted_index_size, std::move(cursor));
             } else {
                 _num_pi_blocks = 0;
             }
-            std::unique_ptr<promoted_index> index;
-            if (promoted_index_stream) {
-                if (is_mc_format()) {
-                    index = std::make_unique<promoted_index>(_s, continuous_data_consumer::_permit, *_deletion_time, std::move(*promoted_index_stream),
-                                  promoted_index_size,
-                                  _num_pi_blocks, *_ck_values_fixed_lengths);
-                } else {
-                     index = std::make_unique<promoted_index>(_s, continuous_data_consumer::_permit, *_deletion_time, std::move(*promoted_index_stream),
-                                   promoted_index_size, _num_pi_blocks);
-                }
-            }
-            _consumer.consume_entry(index_entry{_s, std::move(_key), _position, std::move(index)}, _entry_offset);
+            _consumer.consume_entry(index_entry{_s, std::move(_key), _position, std::move(pi)}, _entry_offset);
             _deletion_time = std::nullopt;
             _num_pi_blocks = 0;
             _state = state::START;
@@ -225,20 +259,24 @@ public:
                 data.trim_front(promoted_index_size);
             } else {
                 data.trim(0);
+                sstlog.trace("{}: skip {} pos {} state {}", fmt::ptr(this), promoted_index_size - data_size, current_pos(), _state);
                 return skip_bytes{promoted_index_size - data_size};
             }
         }
             break;
         }
+        sstlog.trace("{}: exit pos {} state {}", fmt::ptr(this), current_pos(), _state);
         return proceed::yes;
     }
 
     index_consume_entry_context(reader_permit permit, IndexConsumer& consumer, trust_promoted_index trust_pi, const schema& s,
-            file index_file, file_input_stream_options options, uint64_t start,
-            uint64_t maxlen, std::optional<column_values_fixed_lengths> ck_values_fixed_lengths)
+            sstring file_name, file index_file, file_input_stream_options options, uint64_t start,
+            uint64_t maxlen, std::optional<column_values_fixed_lengths> ck_values_fixed_lengths, tracing::trace_state_ptr trace_state = {})
         : continuous_data_consumer(std::move(permit), make_file_input_stream(index_file, start, maxlen, options), start, maxlen)
-        , _consumer(consumer), _index_file(index_file), _options(options)
+        , _consumer(consumer), _file_name(std::move(file_name)), _index_file(index_file), _options(options)
         , _entry_offset(start), _trust_pi(trust_pi), _s(s), _ck_values_fixed_lengths(std::move(ck_values_fixed_lengths))
+        , _use_binary_search(is_mc_format() && use_binary_search_in_promoted_index)
+        , _trace_state(std::move(trace_state))
     {}
 
     void reset(uint64_t offset) {
@@ -250,7 +288,7 @@ public:
 
 // Less-comparator for lookups in the partition index.
 class index_comparator {
-    dht::ring_position_comparator _tri_cmp;
+    dht::ring_position_comparator_for_sstables _tri_cmp;
 public:
     index_comparator(const schema& s) : _tri_cmp(s) {}
 
@@ -282,6 +320,26 @@ future<> close_index_list(shared_index_lists::list_ptr& list) {
     }
     return make_ready_future<>();
 }
+
+// Stores information about open end RT marker
+// of the lower index bound
+struct open_rt_marker {
+    position_in_partition pos;
+    tombstone tomb;
+};
+
+// Contains information about index_reader position in the index file
+struct index_bound {
+    index_bound() = default;
+    shared_index_lists::list_ptr current_list;
+    uint64_t previous_summary_idx = 0;
+    uint64_t current_summary_idx = 0;
+    uint64_t current_index_idx = 0;
+    uint64_t current_pi_idx = 0; // Points to upper bound of the cursor.
+    uint64_t data_file_position = 0;
+    indexable_element element = indexable_element::partition;
+    std::optional<open_rt_marker> end_open_marker;
+};
 
 // Provides access to sstable indexes.
 //
@@ -316,6 +374,7 @@ class index_reader {
             options.buffer_size = sst->sstable_buffer_size;
             options.read_ahead = 2;
             options.io_priority_class = pc;
+            options.dynamic_adjustments = sst->_index_history;
             return options;
         }
 
@@ -323,40 +382,24 @@ class index_reader {
             : _consumer(quantity)
             , _context(permit, _consumer,
                        trust_promoted_index(sst->has_correct_promoted_index_entries()), *sst->_schema,
-                       get_file(*sst, permit, std::move(trace_state)),
+                       trace_state ? sst->filename(component_type::Index) : sstring(),
+                       get_file(*sst, permit, trace_state),
                        get_file_input_stream_options(sst, pc), begin, end - begin,
-                       (sst->get_version() == sstable_version_types::mc
+                       (sst->get_version() >= sstable_version_types::mc
                            ? std::make_optional(get_clustering_values_fixed_lengths(sst->get_serialization_header()))
-                           : std::optional<column_values_fixed_lengths>{}))
+                           : std::optional<column_values_fixed_lengths>{}),
+                       trace_state)
         { }
     };
 
-    // Stores information about open end RT marker
-    // of the lower index bound
-    struct open_rt_marker {
-        position_in_partition pos;
-        tombstone tomb;
-    };
-
-    // Contains information about index_reader position in the index file
-    struct index_bound {
-        shared_index_lists::list_ptr current_list;
-        uint64_t previous_summary_idx = 0;
-        uint64_t current_summary_idx = 0;
-        uint64_t current_index_idx = 0;
-        uint64_t current_pi_idx = 0; // Points to upper bound of the cursor.
-        uint64_t data_file_position = 0;
-        indexable_element element = indexable_element::partition;
-        std::optional<open_rt_marker> end_open_marker;
-    };
-
+private:
     index_bound _lower_bound;
     // Upper bound may remain uninitialized
     std::optional<index_bound> _upper_bound;
 
 private:
     void advance_to_end(index_bound& bound) {
-        sstlog.trace("index {}: advance_to_end() bound {}", this, &bound);
+        sstlog.trace("index {}: advance_to_end() bound {}", fmt::ptr(this), fmt::ptr(&bound));
         bound.data_file_position = data_file_end();
         bound.element = indexable_element::partition;
         bound.current_list = {};
@@ -365,16 +408,16 @@ private:
 
     // Must be called for non-decreasing summary_idx.
     future<> advance_to_page(index_bound& bound, uint64_t summary_idx) {
-        sstlog.trace("index {}: advance_to_page({}), bound {}", this, summary_idx, &bound);
+        sstlog.trace("index {}: advance_to_page({}), bound {}", fmt::ptr(this), summary_idx, fmt::ptr(&bound));
         assert(!bound.current_list || bound.current_summary_idx <= summary_idx);
         if (bound.current_list && bound.current_summary_idx == summary_idx) {
-            sstlog.trace("index {}: same page", this);
+            sstlog.trace("index {}: same page", fmt::ptr(this));
             return make_ready_future<>();
         }
 
         auto& summary = _sstable->get_summary();
         if (summary_idx >= summary.header.size) {
-            sstlog.trace("index {}: eof", this);
+            sstlog.trace("index {}: eof", fmt::ptr(this));
             advance_to_end(bound);
             return make_ready_future<>();
         }
@@ -401,9 +444,16 @@ private:
                     auto indexes = std::move(entries_reader->_consumer.indexes);
                     return entries_reader->_context.close().then([indexes = std::move(indexes), ex = std::move(ex)] () mutable {
                         if (ex) {
-                            std::rethrow_exception(std::move(ex));
+                            return do_with(std::move(indexes), [ex = std::move(ex)] (index_list& indexes) mutable {
+                                return parallel_for_each(indexes, [] (index_entry& ie) mutable {
+                                    return ie.close_pi_stream();
+                                }).then_wrapped([ex = std::move(ex)] (future<>&& fut) mutable {
+                                    fut.ignore_ready_future();
+                                    return make_exception_future<index_list>(std::move(ex));
+                                });
+                            });
                         }
-                        return std::move(indexes);
+                        return make_ready_future<index_list>(std::move(indexes));
                     });
 
                 });
@@ -423,7 +473,7 @@ private:
             bound.end_open_marker.reset();
 
             if (sstlog.is_enabled(seastar::log_level::trace)) {
-                sstlog.trace("index {} bound {}: page:", this, &bound);
+                sstlog.trace("index {} bound {}: page:", fmt::ptr(this), fmt::ptr(&bound));
                 for (const index_entry& e : *bound.current_list) {
                     auto dk = dht::decorate_key(*_sstable->_schema,
                         e.get_key().to_partition_key(*_sstable->_schema));
@@ -474,7 +524,7 @@ private:
     }
 
     future<> advance_to_next_partition(index_bound& bound) {
-        sstlog.trace("index {} bound {}: advance_to_next_partition()", &bound, this);
+        sstlog.trace("index {} bound {}: advance_to_next_partition()", fmt::ptr(&bound), fmt::ptr(this));
         if (!partition_data_ready(bound)) {
             return advance_to_page(bound, 0).then([this, &bound] {
                 return advance_to_next_partition(bound);
@@ -498,10 +548,10 @@ private:
 
     future<> advance_to(index_bound& bound, dht::ring_position_view pos) {
         sstlog.trace("index {} bound {}: advance_to({}), _previous_summary_idx={}, _current_summary_idx={}",
-            this, &bound, pos, bound.previous_summary_idx, bound.current_summary_idx);
+            fmt::ptr(this), fmt::ptr(&bound), pos, bound.previous_summary_idx, bound.current_summary_idx);
 
         if (pos.is_min()) {
-            sstlog.trace("index {}: first entry", this);
+            sstlog.trace("index {}: first entry", fmt::ptr(this));
             return make_ready_future<>();
         } else if (pos.is_max()) {
             advance_to_end(bound);
@@ -513,13 +563,13 @@ private:
             std::lower_bound(summary.entries.begin() + bound.previous_summary_idx, summary.entries.end(), pos, index_comparator(*_sstable->_schema)));
 
         if (bound.previous_summary_idx == 0) {
-            sstlog.trace("index {}: first entry", this);
+            sstlog.trace("index {}: first entry", fmt::ptr(this));
             return make_ready_future<>();
         }
 
         auto summary_idx = bound.previous_summary_idx - 1;
 
-        sstlog.trace("index {}: summary_idx={}", this, summary_idx);
+        sstlog.trace("index {}: summary_idx={}", fmt::ptr(this), summary_idx);
 
         // Despite the requirement that the values of 'pos' in subsequent calls
         // are increasing we still may encounter a situation when we try to read
@@ -542,11 +592,11 @@ private:
         }
 
         return advance_to_page(bound, summary_idx).then([this, &bound, pos, summary_idx] {
-            sstlog.trace("index {}: old page index = {}", this, bound.current_index_idx);
+            sstlog.trace("index {}: old page index = {}", fmt::ptr(this), bound.current_index_idx);
             auto& entries = *bound.current_list;
             auto i = std::lower_bound(std::begin(entries) + bound.current_index_idx, std::end(entries), pos, index_comparator(*_sstable->_schema));
             if (i == std::end(entries)) {
-                sstlog.trace("index {}: not found", this);
+                sstlog.trace("index {}: not found", fmt::ptr(this));
                 return advance_to_page(bound, summary_idx + 1);
             }
             bound.current_index_idx = std::distance(std::begin(entries), i);
@@ -554,7 +604,7 @@ private:
             bound.data_file_position = i->position();
             bound.element = indexable_element::partition;
             bound.end_open_marker.reset();
-            sstlog.trace("index {}: new page index = {}, pos={}", this, bound.current_index_idx, bound.data_file_position);
+            sstlog.trace("index {}: new page index = {}, pos={}", fmt::ptr(this), bound.current_index_idx, bound.data_file_position);
             return make_ready_future<>();
         });
     }
@@ -569,7 +619,7 @@ private:
     //
     // Must be called only when !eof().
     future<> advance_upper_past(position_in_partition_view pos) {
-        sstlog.trace("index {}: advance_upper_past({})", this, pos);
+        sstlog.trace("index {}: advance_upper_past({})", fmt::ptr(this), pos);
 
         // We advance cursor within the current lower bound partition
         // So need to make sure first that it is read
@@ -585,59 +635,27 @@ private:
         }
 
         index_entry& e = current_partition_entry(*_upper_bound);
-        if (e.get_total_pi_blocks_count() == 0) {
-            sstlog.trace("index {}: no promoted index", this);
+
+        if (!e.get_promoted_index()) {
+            sstlog.trace("index {}: no promoted index", fmt::ptr(this));
             return advance_to_next_partition(*_upper_bound);
         }
 
-        if (e.get_read_pi_blocks_count() == 0) {
-            return e.get_next_pi_blocks().then([this, pos] {
-                return advance_upper_past(pos);
-            });
-        }
-
-        const schema& s = *_sstable->_schema;
-        auto cmp_with_start = [pos_cmp = promoted_index_block_compare(s), &s]
-                (position_in_partition_view pos, const promoted_index_block& info) -> bool {
-            return pos_cmp(pos, info.start(s));
-        };
-        promoted_index_blocks* pi_blocks = e.get_pi_blocks();
-        assert(pi_blocks);
-        auto i = std::upper_bound(pi_blocks->begin() + _upper_bound->current_pi_idx, pi_blocks->end(), pos, cmp_with_start);
-        _upper_bound->current_pi_idx = std::distance(pi_blocks->begin(), i);
-        if (i == pi_blocks->end()) {
-            return advance_to_next_partition(*_upper_bound);
-        }
-
-        _upper_bound->data_file_position = e.position() + i->offset();
-        _upper_bound->element = indexable_element::cell;
-        sstlog.trace("index {} upper bound: skipped to cell, _current_pi_idx={}, _data_file_position={}",
-                 this, _upper_bound->current_pi_idx, _upper_bound->data_file_position);
-        return make_ready_future<>();
+        promoted_index& pi = *e.get_promoted_index();
+        return pi.cursor().probe_upper_bound(pos).then([this, &e] (std::optional<clustered_index_cursor::offset_in_partition> off) {
+            if (!off) {
+                return advance_to_next_partition(*_upper_bound);
+            }
+            _upper_bound->data_file_position = e.position() + *off;
+            _upper_bound->element = indexable_element::cell;
+            sstlog.trace("index {} upper bound: skipped to cell, _data_file_position={}", fmt::ptr(this), _upper_bound->data_file_position);
+            return make_ready_future<>();
+        });
     }
 
     // Returns position right after all partitions in the sstable
     uint64_t data_file_end() const {
         return _sstable->data_size();
-    }
-
-    void get_info_from_promoted_block(const promoted_index_blocks::const_iterator iter,
-            const promoted_index_blocks& pi_blocks) {
-        const index_entry& e = current_partition_entry();
-        _lower_bound.data_file_position = e.position() + iter->offset();
-        _lower_bound.element = indexable_element::cell;
-        if (iter == pi_blocks.cbegin() || !std::prev(iter)->end_open_marker()) {
-            _lower_bound.end_open_marker.reset();
-        } else {
-            auto prev = std::prev(iter);
-            // End open marker can be only engaged in SSTables 3.x ('mc' format) and never in ka/la
-            auto end_pos = prev->end(*_sstable->get_schema());
-            position_in_partition_view* open_rt_pos = std::get_if<position_in_partition_view>(&end_pos);
-            assert(open_rt_pos);
-            _lower_bound.end_open_marker = open_rt_marker{
-                    position_in_partition{*open_rt_pos},
-                    tombstone(*prev->end_open_marker())};
-        }
     }
 
 public:
@@ -647,7 +665,7 @@ public:
         , _pc(pc)
         , _trace_state(std::move(trace_state))
     {
-        sstlog.trace("index {}: index_reader for {}", this, _sstable->get_filename());
+        sstlog.trace("index {}: index_reader for {}", fmt::ptr(this), _sstable->get_filename());
     }
 
     // Ensures that partition_data_ready() returns true.
@@ -666,7 +684,7 @@ public:
     future<> advance_to(const dht::partition_range& range) {
         return seastar::when_all_succeed(
             advance_lower_to_start(range),
-            advance_upper_to_end(range));
+            advance_upper_to_end(range)).discard_result();
     }
 
     // Get current index entry
@@ -703,7 +721,7 @@ public:
     // Must be called only after advanced to some partition and !eof().
     future<> advance_to(position_in_partition_view pos) {
         sstlog.trace("index {}: advance_to({}), current data_file_pos={}",
-                 this, pos, _lower_bound.data_file_position);
+                 fmt::ptr(this), pos, _lower_bound.data_file_position);
 
         const schema& s = *_sstable->_schema;
         if (pos.is_before_all_fragments(s)) {
@@ -712,59 +730,33 @@ public:
 
         if (!partition_data_ready()) {
             return read_partition_data().then([this, pos] {
-                sstlog.trace("index {}: page done", this);
+                sstlog.trace("index {}: page done", fmt::ptr(this));
                 assert(partition_data_ready(_lower_bound));
                 return advance_to(pos);
             });
         }
 
         index_entry& e = current_partition_entry();
-        if (e.get_total_pi_blocks_count() == 0) {
-            sstlog.trace("index {}: no promoted index", this);
+        if (!e.get_promoted_index()) {
+            sstlog.trace("index {}: no promoted index", fmt::ptr(this));
             return make_ready_future<>();
         }
 
-        const promoted_index_blocks* pi_blocks = e.get_pi_blocks();
-        assert(pi_blocks);
-
-        if ((e.get_total_pi_blocks_count() == e.get_read_pi_blocks_count())
-                && _lower_bound.current_pi_idx >= pi_blocks->size() - 1) {
-            sstlog.trace("index {}: position in current block (all blocks are read)", this);
-            return make_ready_future<>();
-        }
-
-        auto cmp_with_start = [pos_cmp = promoted_index_block_compare(s), &s]
-                (position_in_partition_view pos, const promoted_index_block& info) -> bool {
-            return pos_cmp(pos, info.start(s));
-        };
-
-        if (!pi_blocks->empty() && cmp_with_start(pos, (*pi_blocks)[_lower_bound.current_pi_idx])) {
-            sstlog.trace("index {}: position in current block (exact match)", this);
-            return make_ready_future<>();
-        }
-
-        auto i = std::upper_bound(pi_blocks->cbegin() + _lower_bound.current_pi_idx, pi_blocks->cend(), pos, cmp_with_start);
-        _lower_bound.current_pi_idx = std::distance(pi_blocks->cbegin(), i);
-        if ((i != pi_blocks->cend()) || (e.get_read_pi_blocks_count() == e.get_total_pi_blocks_count())) {
-            if (i != pi_blocks->begin()) {
-                --i;
+        promoted_index& pi = *e.get_promoted_index();
+        return pi.cursor().advance_to(pos).then([this, &e] (std::optional<clustered_index_cursor::skip_info> si) {
+            if (!si) {
+                sstlog.trace("index {}: position in the same block", fmt::ptr(this));
+                return;
             }
-
-            get_info_from_promoted_block(i, *pi_blocks);
-            sstlog.trace("index {}: lower bound skipped to cell, _current_pi_idx={}, _data_file_position={}",
-                                this, _lower_bound.current_pi_idx, _lower_bound.data_file_position);
-            return make_ready_future<>();
-        }
-
-        return e.get_pi_blocks_until(pos).then([this, &s, &e, pi_blocks] (size_t current_pi_idx) {
-            _lower_bound.current_pi_idx = current_pi_idx;
-            auto i = std::cbegin(*pi_blocks);
-            if (_lower_bound.current_pi_idx > 0) {
-                std::advance(i, _lower_bound.current_pi_idx - 1);
+            if (!si->active_tombstone) {
+                // End open marker can be only engaged in SSTables 3.x ('mc' format) and never in ka/la
+                _lower_bound.end_open_marker.reset();
+            } else {
+                _lower_bound.end_open_marker = open_rt_marker{std::move(si->active_tombstone_pos), si->active_tombstone};
             }
-            get_info_from_promoted_block(i, *pi_blocks);
-            sstlog.trace("index {}: skipped to cell, _current_pi_idx={}, _data_file_position={}",
-                                this, _lower_bound.current_pi_idx, _lower_bound.data_file_position);
+            _lower_bound.data_file_position = e.position() + si->offset;
+            _lower_bound.element = indexable_element::cell;
+            sstlog.trace("index {}: skipped to cell, _data_file_position={}", fmt::ptr(this), _lower_bound.data_file_position);
         });
     }
 

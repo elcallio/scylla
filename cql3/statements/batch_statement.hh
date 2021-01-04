@@ -109,8 +109,6 @@ public:
 
     const std::vector<single_statement>& statements() const { return _statements; }
 
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
-
     virtual bool depends_on_keyspace(const sstring& ks_name) const override;
 
     virtual bool depends_on_column_family(const sstring& cf_name) const override;
@@ -163,6 +161,8 @@ private:
             service::storage_proxy& storage,
             const query_options& options,
             service::query_state& state) const;
+
+    db::timeout_clock::duration get_timeout(const query_options& options) const;
 public:
     // FIXME: no cql_statement::to_string() yet
 #if 0

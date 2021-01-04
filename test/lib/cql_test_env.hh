@@ -53,6 +53,7 @@ namespace db {
 class cql_test_config {
 public:
     seastar::shared_ptr<db::config> db_config;
+    std::optional<database_config> dbcfg;
     std::set<sstring> disabled_features;
 
     cql_test_config();
@@ -65,10 +66,10 @@ class cql_test_env {
 public:
     virtual ~cql_test_env() {};
 
-    virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(const sstring& text) = 0;
+    virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(sstring_view text) = 0;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_cql(
-        const sstring& text, std::unique_ptr<cql3::query_options> qo) = 0;
+            sstring_view text, std::unique_ptr<cql3::query_options> qo) = 0;
 
     /// Processes queries (which must be modifying queries) as a batch.
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute_batch(

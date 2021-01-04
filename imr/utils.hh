@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -148,9 +137,9 @@ public:
     /// \note This function could be deprecated once the IMR starts supporting
     /// copying IMR objects.
     template<typename RawWriter>
-    GCC6_CONCEPT(requires requires (RawWriter wr, uint8_t* ptr) {
+    requires requires (RawWriter wr, uint8_t* ptr) {
         { wr(ptr) } noexcept;
-    })
+    }
     static object make_raw(size_t len, RawWriter&& wr, allocation_strategy::migrate_fn migrate = &imr::alloc::default_lsa_migrate_fn<structure>::migrate_fn) {
         object obj;
         auto ptr = static_cast<uint8_t*>(current_allocator().alloc(migrate, sizeof(void*) + len, 1));
@@ -163,7 +152,7 @@ public:
 
     /// Create an IMR objects
     template<typename Writer, typename MigrateFn>
-    GCC6_CONCEPT(requires WriterAllocator<Writer, Structure>)
+    requires WriterAllocator<Writer, Structure>
     static object make(Writer&& object_writer,
                        MigrateFn* migrate = &imr::alloc::default_lsa_migrate_fn<structure>::migrate_fn) {
         static_assert(std::is_same_v<typename MigrateFn::structure, structure>);
@@ -171,7 +160,7 @@ public:
     }
 private:
     template<typename Writer>
-    GCC6_CONCEPT(requires WriterAllocator<Writer, Structure>)
+    requires WriterAllocator<Writer, Structure>
     static object do_make(Writer&& object_writer, allocation_strategy::migrate_fn migrate) {
         struct alloc_deleter {
             size_t _size;

@@ -42,6 +42,9 @@
 #include "tracing/tracing.hh"
 #include "tracing/trace_state.hh"
 
+#include "enum_set.hh"
+#include "transport/cql_protocol_extension.hh"
+
 namespace auth {
 class resource;
 }
@@ -76,7 +79,8 @@ private:
     client_state(const client_state* cs, seastar::sharded<auth::service>* auth_service)
             : _keyspace(cs->_keyspace),  _user(cs->_user), _auth_state(cs->_auth_state),
               _is_internal(cs->_is_internal), _is_thrift(cs->_is_thrift), _remote_address(cs->_remote_address),
-              _auth_service(auth_service ? &auth_service->local() : nullptr) {}
+              _auth_service(auth_service ? &auth_service->local() : nullptr),
+              _enabled_protocol_extensions(cs->_enabled_protocol_extensions) {}
     friend client_state_for_another_shard;
 private:
     sstring _keyspace;
@@ -103,6 +107,7 @@ private:
     private volatile String keyspace;
 #endif
     std::optional<auth::authenticated_user> _user;
+    std::optional<sstring> _driver_name, _driver_version;
 
     auth_state _auth_state = auth_state::UNINITIALIZED;
 
@@ -130,6 +135,20 @@ public:
 
     void set_auth_state(auth_state new_state) noexcept {
         _auth_state = new_state;
+    }
+
+    std::optional<sstring> get_driver_name() const {
+        return _driver_name;
+    }
+    void set_driver_name(sstring driver_name) {
+        _driver_name = std::move(driver_name);
+    }
+
+    std::optional<sstring> get_driver_version() const {
+        return _driver_version;
+    }
+    void set_driver_version(sstring driver_version) {
+        _driver_version = std::move(driver_version);
     }
 
     client_state(external_tag, auth::service& auth_service, const socket_address& remote_address = socket_address(), bool thrift = false)
@@ -258,7 +277,7 @@ public:
     }
 
 public:
-    void set_keyspace(database& db, sstring keyspace);
+    void set_keyspace(database& db, std::string_view keyspace);
 
     void set_raw_keyspace(sstring new_keyspace) noexcept {
         _keyspace = std::move(new_keyspace);
@@ -281,15 +300,16 @@ public:
 
     future<> has_all_keyspaces_access(auth::permission) const;
     future<> has_keyspace_access(const sstring&, auth::permission) const;
-    future<> has_column_family_access(const sstring&, const sstring&, auth::permission) const;
+    future<> has_column_family_access(const database& db, const sstring&, const sstring&, auth::permission,
+                                      auth::command_desc::type = auth::command_desc::type::OTHER) const;
     future<> has_schema_access(const schema& s, auth::permission p) const;
 
 private:
-    future<> has_access(const sstring&, auth::permission, const auth::resource&) const;
+    future<> has_access(const sstring& keyspace, auth::command_desc) const;
 
 public:
-    future<bool> check_has_permission(auth::permission, const auth::resource&) const;
-    future<> ensure_has_permission(auth::permission, const auth::resource&) const;
+    future<bool> check_has_permission(auth::command_desc) const;
+    future<> ensure_has_permission(auth::command_desc) const;
 
     /**
      * Returns an exceptional future with \ref exceptions::invalid_request_exception if the resource does not exist.
@@ -343,6 +363,20 @@ public:
         }
     }
 #endif
+
+private:
+
+    cql_transport::cql_protocol_extension_enum_set _enabled_protocol_extensions;
+
+public:
+
+    bool is_protocol_extension_set(cql_transport::cql_protocol_extension ext) const {
+        return _enabled_protocol_extensions.contains(ext);
+    }
+
+    void set_protocol_extensions(cql_transport::cql_protocol_extension_enum_set exts) {
+        _enabled_protocol_extensions = std::move(exts);
+    }
 };
 
 }

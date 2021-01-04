@@ -39,7 +39,7 @@ future<bool> gossiping_property_file_snitch::property_file_was_modified() {
         });
     }).then_wrapped([this] (auto&& f) {
         try {
-            auto st = std::get<0>(f.get());
+            auto st = f.get0();
 
             if (!_last_file_mod ||
                 _last_file_mod->tv_sec != st.st_mtim.tv_sec) {
@@ -126,15 +126,14 @@ future<> gossiping_property_file_snitch::gossiper_starting() {
     // this function will be executed on CPU0 only.
     //
     auto& g = get_local_gossiper();
-    auto& ss = get_local_storage_service();
 
-    auto local_internal_addr = netw::get_local_messaging_service().listen_address();
+    auto local_internal_addr = g.get_local_messaging().listen_address();
     std::ostringstream ostrm;
 
     ostrm<<local_internal_addr<<std::flush;
 
     return g.add_local_application_state(application_state::INTERNAL_IP,
-        ss.value_factory.internal_ip(ostrm.str())).then([this] {
+        versioned_value::internal_ip(ostrm.str())).then([this] {
         _gossip_started = true;
         return reload_gossiper_state();
     });
@@ -173,14 +172,14 @@ future<> gossiping_property_file_snitch::reload_configuration() {
     sstring new_rack;
 
     // Rack and Data Center have to be defined in the properties file!
-    if (!_prop_values.count(dc_property_key) || !_prop_values.count(rack_property_key)) {
+    if (!_prop_values.contains(dc_property_key) || !_prop_values.contains(rack_property_key)) {
         throw_incomplete_file();
     }
 
     new_dc   = _prop_values[dc_property_key];
     new_rack = _prop_values[rack_property_key];
 
-    if (_prop_values.count(prefer_local_property_key)) {
+    if (_prop_values.contains(prefer_local_property_key)) {
         if (_prop_values[prefer_local_property_key] == "false") {
             new_prefer_local = false;
         } else if (_prop_values[prefer_local_property_key] == "true") {
@@ -216,21 +215,9 @@ future<> gossiping_property_file_snitch::reload_configuration() {
                     return local_snitch_ptr->reload_gossiper_state();
                 }).get();
 
-                // update Storage Service on each shard
-                auto cpus = boost::irange(0u, smp::count);
-                parallel_for_each(cpus.begin(), cpus.end(), [] (unsigned int c) {
-                    return smp::submit_to(c, [] {
-                        if (service::get_storage_service().local_is_initialized()) {
-                            auto& tmd = service::get_local_storage_service().get_token_metadata();
-
-                            // initiate the token metadata endpoints cache reset
-                            tmd.invalidate_cached_rings();
-                            // re-read local rack and DC info
-                            tmd.update_topology(utils::fb_utilities::get_broadcast_address());
-                        }
-                    });
-                }).get();
-
+                if (service::get_storage_service().local_is_initialized()) {
+                    service::storage_service::update_topology(utils::fb_utilities::get_broadcast_address()).get();
+                }
 
                 // spread the word...
                 smp::submit_to(0, [] {

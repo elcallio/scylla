@@ -5,19 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- *
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "seastar/include/seastar/testing/perf_tests.hh"
@@ -97,44 +85,47 @@ PERF_TEST_F(clustering_row, make_1M)
 
 PERF_TEST_F(clustering_row, copy_4)
 {
-    auto mf = mutation_fragment(*schema(), clustering_row_4());
+    auto mf = mutation_fragment(*schema(), tests::make_permit(), clustering_row_4());
     perf_tests::do_not_optimize(mf);
 }
 
 PERF_TEST_F(clustering_row, copy_4k)
 {
-    auto mf = mutation_fragment(*schema(), clustering_row_4k());
+    auto mf = mutation_fragment(*schema(), tests::make_permit(), clustering_row_4k());
     perf_tests::do_not_optimize(mf);
 }
 
 PERF_TEST_F(clustering_row, copy_1M)
 {
-    auto mf = mutation_fragment(*schema(), clustering_row_1M());
+    auto mf = mutation_fragment(*schema(), tests::make_permit(), clustering_row_1M());
     perf_tests::do_not_optimize(mf);
 }
 
 PERF_TEST_F(clustering_row, hash_4)
 {
-    auto& cr = clustering_row_4().as_mutable_clustering_row();
-    cr.cells().prepare_hash(*schema(), column_kind::regular_column);
-    perf_tests::do_not_optimize(cr);
-    cr.cells().clear_hash();
+    clustering_row_4().mutate_as_clustering_row(*schema(), [&] (::clustering_row& cr) mutable {
+        cr.cells().prepare_hash(*schema(), column_kind::regular_column);
+        perf_tests::do_not_optimize(cr);
+        cr.cells().clear_hash();
+    });
 }
 
 PERF_TEST_F(clustering_row, hash_4k)
 {
-    auto& cr = clustering_row_4k().as_mutable_clustering_row();
-    cr.cells().prepare_hash(*schema(), column_kind::regular_column);
-    perf_tests::do_not_optimize(cr);
-    cr.cells().clear_hash();
+    clustering_row_4k().mutate_as_clustering_row(*schema(), [&] (::clustering_row& cr) mutable {
+        cr.cells().prepare_hash(*schema(), column_kind::regular_column);
+        perf_tests::do_not_optimize(cr);
+        cr.cells().clear_hash();
+    });
 }
 
 PERF_TEST_F(clustering_row, hash_1M)
 {
-    auto& cr = clustering_row_1M().as_mutable_clustering_row();
-    cr.cells().prepare_hash(*schema(), column_kind::regular_column);
-    perf_tests::do_not_optimize(cr);
-    cr.cells().clear_hash();
+    clustering_row_1M().mutate_as_clustering_row(*schema(), [&] (::clustering_row& cr) mutable {
+        cr.cells().prepare_hash(*schema(), column_kind::regular_column);
+        perf_tests::do_not_optimize(cr);
+        cr.cells().clear_hash();
+    });
 }
 
 }

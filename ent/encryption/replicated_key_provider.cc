@@ -18,7 +18,6 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
-#include <seastar/core/apply.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/fstream.hh>
@@ -96,7 +95,7 @@ public:
             return true;
         }
         auto& qp = _ctxt.get_query_processor();
-        return !qp.local_is_initialized() || _ctxt.get_database().local().get_compaction_manager().stopped();
+        return !qp.local_is_initialized() || _ctxt.get_database().local().get_compaction_manager().enabled();
     }
 
     void print(std::ostream& os) const override {
@@ -142,7 +141,7 @@ future<::shared_ptr<cql3::untyped_result_set>> replicated_key_provider::query(ss
         auto query_normal = [this](const sstring& q, auto&& ...params) {
             return _ctxt.get_query_processor().local().execute_internal(q, db::consistency_level::ONE, rkp_db_timeout_config, { (params)...}, false);
         };
-        return starting ? seastar::apply(query_internal, t) : seastar::apply(query_normal, t);
+        return starting ? std::apply(query_internal, t) : std::apply(query_normal, t);
     });
 }
 
@@ -349,7 +348,7 @@ replicated_key_provider_factory::replicated_key_provider_factory()
 replicated_key_provider_factory::~replicated_key_provider_factory()
 {}
 
-namespace bfs = boost::filesystem;
+namespace bfs = std::filesystem;
 
 shared_ptr<key_provider> replicated_key_provider_factory::get_provider(encryption_context& ctxt, const options& map) {
     opt_wrapper opts(map);

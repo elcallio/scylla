@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for authorization
 
@@ -59,7 +48,8 @@ def test_expired_signature(dynamodb, test_table):
     assert not response.ok
     assert "InvalidSignatureException" in response.text and "Signature expired" in response.text
 
-# A test verifying that missing Authorization header is handled properly
+# A test verifying that missing Authorization header results in an
+# MissingAuthenticationTokenException error.
 def test_no_authorization_header(dynamodb, test_table):
     url = dynamodb.meta.client._endpoint.host
     print(url)
@@ -69,7 +59,7 @@ def test_no_authorization_header(dynamodb, test_table):
     }
     response = requests.post(url, headers=headers, verify=False)
     assert not response.ok
-    assert "InvalidSignatureException" in response.text and "Authorization header" in response.text
+    assert "MissingAuthenticationTokenException" in response.text
 
 # A test ensuring that signatures that exceed current time too much are not accepted.
 # Watch out - this test is valid only for around next 1000 years, it needs to be updated later.

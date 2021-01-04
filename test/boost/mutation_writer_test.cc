@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 
@@ -65,7 +54,7 @@ SEASTAR_TEST_CASE(test_multishard_writer) {
                     auto shard = s->get_sharder().shard_of(m.token());
                     shards_before[shard]++;
                 }
-                auto source_reader = partition_nr > 0 ? flat_mutation_reader_from_mutations(muts) : make_empty_flat_reader(s);
+                auto source_reader = partition_nr > 0 ? flat_mutation_reader_from_mutations(tests::make_permit(), muts) : make_empty_flat_reader(s, tests::make_permit());
                 auto& sharder = s->get_sharder();
                 size_t partitions_received = distribute_reader_and_consume_on_shards(s,
                     std::move(source_reader),
@@ -114,6 +103,53 @@ SEASTAR_TEST_CASE(test_multishard_writer) {
             BOOST_ASSERT(false);
         } catch (...) {
         }
+    });
+}
+
+SEASTAR_TEST_CASE(test_multishard_writer_producer_aborts) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        auto test_random_streams = [] (random_mutation_generator&& gen, size_t partition_nr, generate_error error = generate_error::no) {
+            auto muts = gen(partition_nr);
+            schema_ptr s = gen.schema();
+            auto source_reader = partition_nr > 0 ? flat_mutation_reader_from_mutations(tests::make_permit(), muts) : make_empty_flat_reader(s, tests::make_permit());
+            int mf_produced = 0;
+            auto get_next_mutation_fragment = [&source_reader, &mf_produced] () mutable {
+                if (mf_produced++ > 800) {
+                    return make_exception_future<mutation_fragment_opt>(std::runtime_error("the producer failed"));
+                } else {
+                    return source_reader(db::no_timeout);
+                }
+            };
+            auto& sharder = s->get_sharder();
+            try {
+                distribute_reader_and_consume_on_shards(s,
+                    make_generating_reader(s, tests::make_permit(), std::move(get_next_mutation_fragment)),
+                    [&sharder, error] (flat_mutation_reader reader) mutable {
+                        if (error) {
+                            return make_exception_future<>(std::runtime_error("Failed to write"));
+                        }
+                        return repeat([&sharder, reader = std::move(reader), error] () mutable {
+                            return reader(db::no_timeout).then([&sharder,  error] (mutation_fragment_opt mf_opt) mutable {
+                                if (mf_opt) {
+                                    if (mf_opt->is_partition_start()) {
+                                        auto shard = sharder.shard_of(mf_opt->as_partition_start().key().token());
+                                        BOOST_REQUIRE_EQUAL(shard, this_shard_id());
+                                    }
+                                    return make_ready_future<stop_iteration>(stop_iteration::no);
+                                } else {
+                                    return make_ready_future<stop_iteration>(stop_iteration::yes);
+                                }
+                            });
+                        });
+                    }
+                ).get0();
+            } catch (...) {
+                // The distribute_reader_and_consume_on_shards is expected to fail and not block forever
+            }
+        };
+
+        test_random_streams(random_mutation_generator(random_mutation_generator::generate_counters::no, local_shard_only::yes), 1000, generate_error::no);
+        test_random_streams(random_mutation_generator(random_mutation_generator::generate_counters::no, local_shard_only::yes), 1000, generate_error::yes);
     });
 }
 
@@ -194,19 +230,19 @@ public:
     stop_iteration consume(static_row&& sr) {
         BOOST_REQUIRE(_current_mutation);
         verify_static_row(sr);
-        _current_mutation->apply(std::move(sr));
+        _current_mutation->apply(mutation_fragment(*_schema, tests::make_permit(), std::move(sr)));
         return stop_iteration::no;
     }
     stop_iteration consume(clustering_row&& cr) {
         BOOST_REQUIRE(_current_mutation);
         verify_clustering_row(cr);
-        _current_mutation->apply(std::move(cr));
+        _current_mutation->apply(mutation_fragment(*_schema, tests::make_permit(), std::move(cr)));
         return stop_iteration::no;
     }
     stop_iteration consume(range_tombstone&& rt) {
         BOOST_REQUIRE(_current_mutation);
         verify_range_tombstone(rt);
-        _current_mutation->apply(std::move(rt));
+        _current_mutation->apply(mutation_fragment(*_schema, tests::make_permit(), std::move(rt)));
         return stop_iteration::no;
     }
     stop_iteration consume_end_of_partition() {
@@ -268,13 +304,13 @@ SEASTAR_THREAD_TEST_CASE(test_timestamp_based_splitting_mutation_writer) {
         });
     };
 
-    segregate_by_timestamp(flat_mutation_reader_from_mutations(muts), classify_fn, std::move(consumer)).get();
+    segregate_by_timestamp(flat_mutation_reader_from_mutations(tests::make_permit(), muts), classify_fn, std::move(consumer)).get();
 
     testlog.debug("Data split into {} buckets: {}", buckets.size(), boost::copy_range<std::vector<int64_t>>(buckets | boost::adaptors::map_keys));
 
     auto bucket_readers = boost::copy_range<std::vector<flat_mutation_reader>>(buckets | boost::adaptors::map_values |
-            boost::adaptors::transformed([] (std::vector<mutation> muts) { return flat_mutation_reader_from_mutations(std::move(muts)); }));
-    auto reader = make_combined_reader(random_schema.schema(), std::move(bucket_readers), streamed_mutation::forwarding::no,
+            boost::adaptors::transformed([] (std::vector<mutation> muts) { return flat_mutation_reader_from_mutations(tests::make_permit(), std::move(muts)); }));
+    auto reader = make_combined_reader(random_schema.schema(), tests::make_permit(), std::move(bucket_readers), streamed_mutation::forwarding::no,
             mutation_reader::forwarding::no);
 
     const auto now = gc_clock::now();

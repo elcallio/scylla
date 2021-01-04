@@ -32,13 +32,13 @@ class result_set_builder {
     const partition_slice& _slice;
     std::vector<result_set_row> _rows;
     std::unordered_map<sstring, non_null_data_value> _pkey_cells;
-    uint32_t _row_count;
+    uint64_t _row_count;
 public:
     // Keep slice live as long as the builder is used.
     result_set_builder(schema_ptr schema, const partition_slice& slice);
     result_set build();
-    void accept_new_partition(const partition_key& key, uint32_t row_count);
-    void accept_new_partition(uint32_t row_count);
+    void accept_new_partition(const partition_key& key, uint64_t row_count);
+    void accept_new_partition(uint64_t row_count);
     void accept_new_row(const clustering_key& key, const result_row_view& static_row, const result_row_view& row);
     void accept_new_row(const result_row_view &static_row, const result_row_view &row);
     void accept_partition_end(const result_row_view& static_row);
@@ -80,13 +80,13 @@ result_set result_set_builder::build() {
     return { _schema, std::move(_rows) };
 }
 
-void result_set_builder::accept_new_partition(const partition_key& key, uint32_t row_count)
+void result_set_builder::accept_new_partition(const partition_key& key, uint64_t row_count)
 {
     _pkey_cells = deserialize(key);
     accept_new_partition(row_count);
 }
 
-void result_set_builder::accept_new_partition(uint32_t row_count)
+void result_set_builder::accept_new_partition(uint64_t row_count)
 {
     _row_count = row_count;
 }
@@ -175,25 +175,21 @@ result_set_builder::deserialize(const result_row_view& row, bool is_static)
         if (col.is_atomic()) {
             auto cell = i.next_atomic_cell();
             if (cell) {
-                cell->value().with_linearized([&] (bytes_view value_view) {
-                    cells.emplace(col.name_as_text(), col.type->deserialize_value(value_view));
-                });
+                cells.emplace(col.name_as_text(), col.type->deserialize_value(cell->value()));
             }
         } else {
             auto cell = i.next_collection_cell();
             if (cell) {
-                cell->with_linearized([&] (bytes_view value_view) {
                     if (col.type->is_collection()) {
                         auto ctype = static_pointer_cast<const collection_type_impl>(col.type);
                         if (_slice.options.contains<partition_slice::option::collections_as_maps>()) {
                             ctype = map_type_impl::get_instance(ctype->name_comparator(), ctype->value_comparator(), true);
                         }
 
-                        cells.emplace(col.name_as_text(), ctype->deserialize_value(value_view, _slice.cql_format()));
+                        cells.emplace(col.name_as_text(), ctype->deserialize_value(*cell, _slice.cql_format()));
                     } else {
-                        cells.emplace(col.name_as_text(), col.type->deserialize_value(value_view));
+                        cells.emplace(col.name_as_text(), col.type->deserialize_value(*cell));
                     }
-                });
             }
         }
         index++;
@@ -214,7 +210,7 @@ result_set::from_raw_result(schema_ptr s, const partition_slice& slice, const re
 
 result_set::result_set(const mutation& m) : result_set([&m] {
     auto slice = partition_slice_builder(*m.schema()).build();
-    auto qr = mutation(m).query(slice, result_options::only_result());
+    auto qr = mutation(m).query(slice, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size }, result_options::only_result());
     return result_set::from_raw_result(m.schema(), slice, qr);
 }())
 { }

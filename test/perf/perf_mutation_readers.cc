@@ -5,19 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- *
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <boost/range/adaptors.hpp>
@@ -26,6 +14,8 @@
 #include "seastar/include/seastar/testing/perf_tests.hh"
 
 #include "test/lib/simple_schema.hh"
+#include "test/lib/reader_permit.hh"
+#include "test/lib/simple_position_reader_queue.hh"
 
 #include "mutation_reader.hh"
 #include "flat_mutation_reader.hh"
@@ -158,19 +148,19 @@ future<> combined::consume_all(flat_mutation_reader mr) const
 PERF_TEST_F(combined, one_row)
 {
     std::vector<flat_mutation_reader> mrs;
-    mrs.emplace_back(flat_mutation_reader_from_mutations(one_row_stream()));
-    return consume_all(make_combined_reader(schema().schema(), std::move(mrs)));
+    mrs.emplace_back(flat_mutation_reader_from_mutations(tests::make_permit(), one_row_stream()));
+    return consume_all(make_combined_reader(schema().schema(), tests::make_permit(), std::move(mrs)));
 }
 
 PERF_TEST_F(combined, single_active)
 {
     std::vector<flat_mutation_reader> mrs;
     mrs.reserve(4);
-    mrs.emplace_back(flat_mutation_reader_from_mutations(single_stream()));
+    mrs.emplace_back(flat_mutation_reader_from_mutations(tests::make_permit(), single_stream()));
     for (auto i = 0; i < 3; i++) {
-        mrs.emplace_back(make_empty_flat_reader(schema().schema()));
+        mrs.emplace_back(make_empty_flat_reader(schema().schema(), tests::make_permit()));
     }
-    return consume_all(make_combined_reader(schema().schema(), std::move(mrs)));
+    return consume_all(make_combined_reader(schema().schema(), tests::make_permit(), std::move(mrs)));
 }
 
 PERF_TEST_F(combined, many_overlapping)
@@ -178,18 +168,18 @@ PERF_TEST_F(combined, many_overlapping)
     std::vector<flat_mutation_reader> mrs;
     mrs.reserve(4);
     for (auto i = 0; i < 4; i++) {
-        mrs.emplace_back(flat_mutation_reader_from_mutations(single_stream()));
+        mrs.emplace_back(flat_mutation_reader_from_mutations(tests::make_permit(), single_stream()));
     }
-    return consume_all(make_combined_reader(schema().schema(), std::move(mrs)));
+    return consume_all(make_combined_reader(schema().schema(), tests::make_permit(), std::move(mrs)));
 }
 
 PERF_TEST_F(combined, disjoint_interleaved)
 {
-    return consume_all(make_combined_reader(schema().schema(),
+    return consume_all(make_combined_reader(schema().schema(), tests::make_permit(),
         boost::copy_range<std::vector<flat_mutation_reader>>(
             disjoint_interleaved_streams()
             | boost::adaptors::transformed([] (auto&& ms) {
-                return flat_mutation_reader_from_mutations(std::move(ms));
+                return flat_mutation_reader_from_mutations(tests::make_permit(), std::move(ms));
             })
         )
     ));
@@ -197,11 +187,11 @@ PERF_TEST_F(combined, disjoint_interleaved)
 
 PERF_TEST_F(combined, disjoint_ranges)
 {
-    return consume_all(make_combined_reader(schema().schema(),
+    return consume_all(make_combined_reader(schema().schema(), tests::make_permit(),
         boost::copy_range<std::vector<flat_mutation_reader>>(
             disjoint_ranges_streams()
             | boost::adaptors::transformed([] (auto&& ms) {
-                return flat_mutation_reader_from_mutations(std::move(ms));
+                return flat_mutation_reader_from_mutations(tests::make_permit(), std::move(ms));
             })
         )
     ));
@@ -209,14 +199,92 @@ PERF_TEST_F(combined, disjoint_ranges)
 
 PERF_TEST_F(combined, overlapping_partitions_disjoint_rows)
 {
-    return consume_all(make_combined_reader(schema().schema(),
+    return consume_all(make_combined_reader(schema().schema(), tests::make_permit(),
         boost::copy_range<std::vector<flat_mutation_reader>>(
             overlapping_partitions_disjoint_rows_streams()
             | boost::adaptors::transformed([] (auto&& ms) {
-                return flat_mutation_reader_from_mutations(std::move(ms));
+                return flat_mutation_reader_from_mutations(tests::make_permit(), std::move(ms));
             })
         )
     ));
+}
+
+struct mutation_bounds {
+    mutation m;
+    position_in_partition lower;
+    position_in_partition upper;
+};
+
+class clustering_combined {
+    mutable simple_schema _schema;
+    std::vector<mutation_bounds> _almost_disjoint_ranges;
+private:
+    static std::vector<mutation_bounds> create_almost_disjoint_ranges(simple_schema&);
+protected:
+    simple_schema& schema() const { return _schema; }
+    const std::vector<mutation_bounds>& almost_disjoint_clustering_ranges() const {
+        return _almost_disjoint_ranges;
+    }
+    future<size_t> consume_all(flat_mutation_reader mr) const;
+public:
+    clustering_combined()
+        : _almost_disjoint_ranges(create_almost_disjoint_ranges(_schema))
+    { }
+};
+
+std::vector<mutation_bounds> clustering_combined::create_almost_disjoint_ranges(simple_schema& s) {
+    auto pk = s.make_pkey();
+    std::vector<mutation_bounds> mbs;
+    for (int i = 0; i < 150; i += 30) {
+        auto m = mutation(s.schema(), pk);
+        for (int j = 0; j < 32; ++j) {
+            m.apply(s.make_row(s.make_ckey(i + j), "value"));
+        }
+        mbs.push_back(mutation_bounds{std::move(m),
+                position_in_partition::for_key(s.make_ckey(i)),
+                position_in_partition::for_key(s.make_ckey(i + 31))});
+    }
+    return mbs;
+}
+
+future<size_t> clustering_combined::consume_all(flat_mutation_reader mr) const
+{
+    return do_with(std::move(mr), size_t(0), [] (auto& mr, size_t& num_mfs) {
+        perf_tests::start_measuring_time();
+        return mr.consume_pausable([&num_mfs] (mutation_fragment mf) {
+            ++num_mfs;
+            perf_tests::do_not_optimize(mf);
+            return stop_iteration::no;
+        }, db::no_timeout).then([&num_mfs] {
+            perf_tests::stop_measuring_time();
+            return num_mfs;
+        });
+    });
+}
+
+PERF_TEST_F(clustering_combined, ranges_generic)
+{
+    return consume_all(make_combined_reader(schema().schema(), tests::make_permit(),
+        boost::copy_range<std::vector<flat_mutation_reader>>(
+            almost_disjoint_clustering_ranges()
+            | boost::adaptors::transformed([] (auto&& mb) {
+                return flat_mutation_reader_from_mutations(tests::make_permit(), {std::move(mb.m)});
+            })
+        )
+    ));
+}
+
+PERF_TEST_F(clustering_combined, ranges_specialized)
+{
+    auto rbs = boost::copy_range<std::vector<reader_bounds>>(
+        almost_disjoint_clustering_ranges() | boost::adaptors::transformed([] (auto&& mb) {
+            return reader_bounds{
+                flat_mutation_reader_from_mutations(tests::make_permit(), {std::move(mb.m)}),
+                std::move(mb.lower), std::move(mb.upper)};
+        }));
+    auto q = std::make_unique<simple_position_reader_queue>(*schema().schema(), std::move(rbs));
+    return consume_all(make_clustering_combined_reader(
+        schema().schema(), tests::make_permit(), streamed_mutation::forwarding::no, std::move(q)));
 }
 
 class memtable {
@@ -291,22 +359,22 @@ protected:
 
 PERF_TEST_F(memtable, one_partition_one_row)
 {
-    return consume_all(single_row_mt().make_flat_reader(schema(), single_partition_range()));
+    return consume_all(single_row_mt().make_flat_reader(schema(), tests::make_permit(), single_partition_range()));
 }
 
 PERF_TEST_F(memtable, one_partition_many_rows)
 {
-    return consume_all(multi_row_mt().make_flat_reader(schema(), single_partition_range()));
+    return consume_all(multi_row_mt().make_flat_reader(schema(), tests::make_permit(), single_partition_range()));
 }
 
 PERF_TEST_F(memtable, many_partitions_one_row)
 {
-    return consume_all(single_row_mt().make_flat_reader(schema(), multi_partition_range(25)));
+    return consume_all(single_row_mt().make_flat_reader(schema(), tests::make_permit(), multi_partition_range(25)));
 }
 
 PERF_TEST_F(memtable, many_partitions_many_rows)
 {
-    return consume_all(multi_row_mt().make_flat_reader(schema(), multi_partition_range(25)));
+    return consume_all(multi_row_mt().make_flat_reader(schema(), tests::make_permit(), multi_partition_range(25)));
 }
 
 }

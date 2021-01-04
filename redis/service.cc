@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "timeout_config.hh"
@@ -77,16 +66,16 @@ future<> redis_service::listen(distributed<auth::service>& auth_service, db::con
                 cred->set_dh_level(seastar::tls::dh_params::level::MEDIUM);
                 cred->set_priority_string(db::config::default_tls_priority);
 
-                if (ceo.count("priority_string")) {
+                if (ceo.contains("priority_string")) {
                     cred->set_priority_string(ceo.at("priority_string"));
                 }
-                if (ceo.count("require_client_auth") && ceo.at("require_client_auth") == "true") {
+                if (ceo.contains("require_client_auth") && ceo.at("require_client_auth") == "true") {
                     cred->set_client_auth(seastar::tls::client_auth::REQUIRE);
                 }
 
                 f = cred->set_x509_key_file(ceo.at("certificate"), ceo.at("keyfile"), seastar::tls::x509_crt_format::PEM);
 
-                if (ceo.count("truststore")) {
+                if (ceo.contains("truststore")) {
                     f = f.then([cred, f = ceo.at("truststore")] { return cred->set_x509_trust_file(f, seastar::tls::x509_crt_format::PEM); });
                 }
 
@@ -106,6 +95,10 @@ future<> redis_service::listen(distributed<auth::service>& auth_service, db::con
                     });
                 });
             });
+        });
+    }).handle_exception([this](auto ep) {
+        return _server->stop().then([ep = std::move(ep)]() mutable {
+            return make_exception_future<>(std::move(ep));
         });
     });
 }

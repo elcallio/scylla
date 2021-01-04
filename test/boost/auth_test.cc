@@ -22,6 +22,7 @@
 #include <seastar/testing/test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/exception_utils.hh"
 
 #include "auth/allow_all_authenticator.hh"
 #include "auth/authenticator.hh"
@@ -37,19 +38,19 @@ SEASTAR_TEST_CASE(test_default_authenticator) {
     return do_with_cql_env([](cql_test_env& env) {
         auto& a = env.local_auth_service().underlying_authenticator();
         BOOST_REQUIRE(!a.require_authentication());
-        BOOST_REQUIRE_EQUAL(a.qualified_java_name(), auth::allow_all_authenticator_name());
+        BOOST_REQUIRE_EQUAL(a.qualified_java_name(), auth::allow_all_authenticator_name);
         return make_ready_future();
     });
 }
 
 SEASTAR_TEST_CASE(test_password_authenticator_attributes) {
     auto cfg = make_shared<db::config>();
-    cfg->authenticator(auth::password_authenticator_name());
+    cfg->authenticator(sstring(auth::password_authenticator_name));
 
     return do_with_cql_env([](cql_test_env& env) {
         auto& a = env.local_auth_service().underlying_authenticator();
         BOOST_REQUIRE(a.require_authentication());
-        BOOST_REQUIRE_EQUAL(a.qualified_java_name(), auth::password_authenticator_name());
+        BOOST_REQUIRE_EQUAL(a.qualified_java_name(), auth::password_authenticator_name);
         return make_ready_future();
     }, cfg);
 }
@@ -85,7 +86,7 @@ future<> require_throws(seastar::future<Args...> fut) {
 
 SEASTAR_TEST_CASE(test_password_authenticator_operations) {
     auto cfg = make_shared<db::config>();
-    cfg->authenticator(auth::password_authenticator_name());
+    cfg->authenticator(sstring(auth::password_authenticator_name));
 
     /**
      * Not using seastar::async due to apparent ASan bug.
@@ -154,4 +155,53 @@ SEASTAR_TEST_CASE(test_password_authenticator_operations) {
             });
         });
     }, cfg);
+}
+
+namespace {
+
+/// Asserts that table is protected from alterations that can brick a node.
+void require_table_protected(cql_test_env& env, const char* table) {
+    using exception_predicate::message_contains;
+    using unauth = exceptions::unauthorized_exception;
+    const auto q = [&] (const char* stmt) { return env.execute_cql(fmt::format(stmt, table)).get(); };
+    BOOST_TEST_INFO(table);
+    BOOST_REQUIRE_EXCEPTION(q("ALTER TABLE {} ALTER role TYPE blob"), unauth, message_contains("is protected"));
+    BOOST_REQUIRE_EXCEPTION(q("ALTER TABLE {} RENAME role TO user"), unauth, message_contains("is protected"));
+    BOOST_REQUIRE_EXCEPTION(q("ALTER TABLE {} DROP role"), unauth, message_contains("is protected"));
+    BOOST_REQUIRE_EXCEPTION(q("DROP TABLE {}"), unauth, message_contains("is protected"));
+}
+
+cql_test_config auth_on() {
+    cql_test_config cfg;
+    cfg.db_config->authorizer("CassandraAuthorizer");
+    cfg.db_config->authenticator("PasswordAuthenticator");
+    return cfg;
+}
+
+} // anonymous namespace
+
+SEASTAR_TEST_CASE(roles_table_is_protected) {
+    return do_with_cql_env_thread([] (cql_test_env& env) {
+        require_table_protected(env, "system_auth.roles");
+    }, auth_on());
+}
+
+SEASTAR_TEST_CASE(role_members_table_is_protected) {
+    return do_with_cql_env_thread([] (cql_test_env& env) {
+        require_table_protected(env, "system_auth.role_members");
+    }, auth_on());
+}
+
+SEASTAR_TEST_CASE(role_permissions_table_is_protected) {
+    return do_with_cql_env_thread([] (cql_test_env& env) {
+        require_table_protected(env, "system_auth.role_permissions");
+    }, auth_on());
+}
+
+SEASTAR_TEST_CASE(alter_opts_on_system_auth_tables) {
+    return do_with_cql_env_thread([] (cql_test_env& env) {
+        cquery_nofail(env, "ALTER TABLE system_auth.roles WITH speculative_retry = 'NONE'");
+        cquery_nofail(env, "ALTER TABLE system_auth.role_members WITH gc_grace_seconds = 123");
+        cquery_nofail(env, "ALTER TABLE system_auth.role_permissions WITH min_index_interval = 456");
+    }, auth_on());
 }

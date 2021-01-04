@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for the UpdateItem operations with an UpdateExpression parameter
 
@@ -21,7 +10,6 @@ import random
 import string
 import pytest
 from botocore.exceptions import ClientError
-from decimal import Decimal
 from util import random_string
 
 # The simplest test of using UpdateExpression to set a top-level attribute,
@@ -407,21 +395,6 @@ def test_update_expression_plus_basic(test_table_s):
             UpdateExpression='SET b = :val1 + :val2',
             ExpressionAttributeValues={':val1': ['a', 'b'], ':val2': ['1', '2']})
 
-# While most of the Alternator code just saves high-precision numbers
-# unchanged, the "+" and "-" operations need to calculate with them, and
-# we should check the calculation isn't done with some lower-precision
-# representation, e.g., double
-def test_update_expression_plus_precision(test_table_s):
-    p = random_string()
-    test_table_s.update_item(Key={'p': p},
-        UpdateExpression='SET b = :val1 + :val2',
-        ExpressionAttributeValues={':val1': Decimal("1"), ':val2': Decimal("10000000000000000000000")})
-    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'b': Decimal("10000000000000000000001")}
-    test_table_s.update_item(Key={'p': p},
-        UpdateExpression='SET b = :val2 - :val1',
-        ExpressionAttributeValues={':val1': Decimal("1"), ':val2': Decimal("10000000000000000000000")})
-    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'b': Decimal("9999999999999999999999")}
-
 # Test support for "SET a = b + :val2" et al., i.e., a version of the
 # above test_update_expression_plus_basic with read before write.
 def test_update_expression_plus_rmw(test_table_s):
@@ -675,6 +648,24 @@ def test_update_expression_add_numbers(test_table_s):
             UpdateExpression='ADD b :val1',
             ExpressionAttributeValues={':val1': 1})
 
+# In test_update_expression_add_numbers() above we tested ADDing a number to
+# an existing number. The following test check that ADD can be used to
+# create a *new* number, as if it was added to zero.
+def test_update_expression_add_numbers_new(test_table_s):
+    # Test that "ADD" can create a new number attribute:
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a': 'hello'})
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='ADD b :val1',
+        ExpressionAttributeValues={':val1': 7})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['b'] == 7
+    # Test that "ADD" can create an entirely new item:
+    p = random_string()
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='ADD b :val1',
+        ExpressionAttributeValues={':val1': 8})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['b'] == 8
+
 # Test "ADD" operation for sets
 def test_update_expression_add_sets(test_table_s):
     p = random_string()
@@ -702,6 +693,24 @@ def test_update_expression_add_sets(test_table_s):
         test_table_s.update_item(Key={'p': p},
             UpdateExpression='ADD a :val1',
             ExpressionAttributeValues={':val1': 'hello'})
+
+# In test_update_expression_add_sets() above we tested ADDing elements to an
+# existing set. The following test checks that ADD can be used to create a
+# *new* set, by adding its first item.
+def test_update_expression_add_sets_new(test_table_s):
+    # Test that "ADD" can create a new set attribute:
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a': 'hello'})
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='ADD b :val1',
+        ExpressionAttributeValues={':val1': set(['dog'])})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['b'] == set(['dog'])
+    # Test that "ADD" can create an entirely new item:
+    p = random_string()
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='ADD b :val1',
+        ExpressionAttributeValues={':val1': set(['cat'])})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['b'] == set(['cat'])
 
 # Test "DELETE" operation for sets
 def test_update_expression_delete_sets(test_table_s):
@@ -782,6 +791,17 @@ def test_update_expression_nested_attribute_index(test_table_s):
     test_table_s.update_item(Key={'p': p}, UpdateExpression='SET a[1] = :val1',
         ExpressionAttributeValues={':val1': 'hello'})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': ['one', 'hello', 'three']}
+
+# An index into a list must be an actual integer - DynamoDB does not support
+# a value reference (:xyz) to be used as a index. This is the same test as the
+# above test_update_expression_nested_attribute_index() - we just try to use
+# the a reference :xyz for the index 1. And it's considered a syntax error
+def test_update_expression_nested_attribute_index_reference(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a': ['one', 'two', 'three']})
+    with pytest.raises(ClientError, match='ValidationException.*yntax'):
+        test_table_s.update_item(Key={'p': p}, UpdateExpression='SET a[:xyz] = :val1',
+            ExpressionAttributeValues={':val1': 'hello', ':xyz': 1})
 
 # Test that just like happens in top-level attributes, also in nested
 # attributes, setting them replaces the old value - potentially an entire
@@ -871,7 +891,7 @@ def test_nested_attribute_update_bad_path_array(test_table_s):
         test_table_s.update_item(Key={'p': p}, UpdateExpression='SET a[0] = :val1',
             ExpressionAttributeValues={':val1': 7})
 
-# DynamoDB Does not allow empty strings, empty byte arrays, or empty sets.
+# DynamoDB Does not allow empty sets.
 # Trying to ask UpdateItem to put one of these in an attribute should be
 # forbidden. Empty lists and maps *are* allowed.
 # Note that in test_item.py::test_update_item_empty_attribute we checked
@@ -879,16 +899,15 @@ def test_nested_attribute_update_bad_path_array(test_table_s):
 # UpdateExpression syntax.
 def test_update_expression_empty_attribute(test_table_s):
     p = random_string()
-    # Empty string, byte array and set are *not* allowed
-    for v in ['', bytearray('', 'utf-8'), set()]:
-        with pytest.raises(ClientError, match='ValidationException.*empty'):
-            test_table_s.update_item(Key={'p': p},
-                UpdateExpression='SET a = :v',
-                ExpressionAttributeValues={':v': v})
+    # Empty sets are *not* allowed
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET a = :v',
+            ExpressionAttributeValues={':v': set()})
     assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
-    # But empty lists and maps *are* allowed:
+    # But empty lists, maps, strings and binary blobs *are* allowed:
     test_table_s.update_item(Key={'p': p},
-        UpdateExpression='SET d = :v1, e = :v2',
-        ExpressionAttributeValues={':v1': [], ':v2': {}})
-    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'd': [], 'e': {}}
+        UpdateExpression='SET d = :v1, e = :v2, f = :v3, g = :v4',
+        ExpressionAttributeValues={':v1': [], ':v2': {}, ':v3': '', ':v4': b''})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'd': [], 'e': {}, 'f': '', 'g': b''}
 #

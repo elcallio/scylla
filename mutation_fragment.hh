@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -25,12 +14,12 @@
 #include "position_in_partition.hh"
 
 #include <optional>
-#include <seastar/util/gcc6-concepts.hh>
 #include <seastar/util/optimized_optional.hh>
 
 #include "seastar/core/future-util.hh"
 
 #include "db/timeout_clock.hh"
+#include "reader_permit.hh"
 
 // mutation_fragments are the objects that streamed_mutation are going to
 // stream. They can represent:
@@ -44,76 +33,64 @@
 
 class clustering_row {
     clustering_key_prefix _ck;
-    row_tombstone _t;
-    row_marker _marker;
-    row _cells;
+    deletable_row _row;
 public:
     explicit clustering_row(clustering_key_prefix ck) : _ck(std::move(ck)) { }
     clustering_row(clustering_key_prefix ck, row_tombstone t, row_marker marker, row cells)
-            : _ck(std::move(ck)), _t(t), _marker(std::move(marker)), _cells(std::move(cells)) {
-        _t.maybe_shadow(marker);
+            : _ck(std::move(ck)), _row(std::move(t), std::move(marker), std::move(cells)) {
+        _row.maybe_shadow();
     }
     clustering_row(const schema& s, const clustering_row& other)
-        : clustering_row(other._ck, other._t, other._marker, row(s, column_kind::regular_column, other._cells)) { }
+        : _ck(other._ck), _row(s, other._row) { }
     clustering_row(const schema& s, const rows_entry& re)
-            : clustering_row(re.key(), re.row().deleted_at(), re.row().marker(), row(s, column_kind::regular_column, re.row().cells())) { }
+        : _ck(re.key()), _row(s, re.row()) { }
     clustering_row(rows_entry&& re)
-            : clustering_row(std::move(re.key()), re.row().deleted_at(), re.row().marker(), std::move(re.row().cells())) { }
+        : _ck(std::move(re.key())), _row(std::move(re.row())) {}
 
     clustering_key_prefix& key() { return _ck; }
     const clustering_key_prefix& key() const { return _ck; }
 
-    void remove_tombstone() { _t = {}; }
-    row_tombstone tomb() const { return _t; }
+    void remove_tombstone() { _row.remove_tombstone(); }
+    row_tombstone tomb() const { return _row.deleted_at(); }
 
-    const row_marker& marker() const { return _marker; }
-    row_marker& marker() { return _marker; }
+    const row_marker& marker() const { return _row.marker(); }
+    row_marker& marker() { return _row.marker(); }
 
-    const row& cells() const { return _cells; }
-    row& cells() { return _cells; }
+    const row& cells() const { return _row.cells(); }
+    row& cells() { return _row.cells(); }
 
-    bool empty() const {
-        return !_t && _marker.is_missing() && _cells.empty();
-    }
+    bool empty() const { return _row.empty(); }
 
     bool is_live(const schema& s, tombstone base_tombstone = tombstone(), gc_clock::time_point now = gc_clock::time_point::min()) const {
-        base_tombstone.apply(_t.tomb());
-        return _marker.is_live(base_tombstone, now) || _cells.is_live(s, column_kind::regular_column, base_tombstone, now);
+        return _row.is_live(s, std::move(base_tombstone), std::move(now));
     }
 
     void apply(const schema& s, clustering_row&& cr) {
-        _marker.apply(std::move(cr._marker));
-        _t.apply(cr._t, _marker);
-        _cells.apply(s, column_kind::regular_column, std::move(cr._cells));
+        _row.apply(s, std::move(cr._row));
     }
     void apply(const schema& s, const clustering_row& cr) {
-        _marker.apply(cr._marker);
-        _t.apply(cr._t, _marker);
-        _cells.apply(s, column_kind::regular_column, cr._cells);
+        _row.apply(s, deletable_row(s, cr._row));
     }
     void set_cell(const column_definition& def, atomic_cell_or_collection&& value) {
-        _cells.apply(def, std::move(value));
+        _row.cells().apply(def, std::move(value));
     }
     void apply(row_marker rm) {
-        _marker.apply(std::move(rm));
-        _t.maybe_shadow(_marker);
+        _row.apply(std::move(rm));
     }
     void apply(tombstone t) {
-        _t.apply(t);
+        _row.apply(std::move(t));
     }
     void apply(shadowable_tombstone t) {
-        _t.apply(t, _marker);
+        _row.apply(std::move(t));
     }
     void apply(const schema& s, const rows_entry& r) {
-        _marker.apply(r.row().marker());
-        _t.apply(r.row().deleted_at(), _marker);
-        _cells.apply(s, column_kind::regular_column, r.row().cells());
+        _row.apply(s, deletable_row(s, r.row()));
     }
 
     position_in_partition_view position() const;
 
     size_t external_memory_usage(const schema& s) const {
-        return _ck.external_memory_usage() + _cells.external_memory_usage(s, column_kind::regular_column);
+        return _ck.external_memory_usage() + _row.cells().external_memory_usage(s, column_kind::regular_column);
     }
 
     size_t memory_usage(const schema& s) const {
@@ -122,9 +99,7 @@ public:
 
     bool equal(const schema& s, const clustering_row& other) const {
         return _ck.equal(s, other._ck)
-               && _t == other._t
-               && _marker == other._marker
-               && _cells.equal(column_kind::regular_column, s, other._cells, s);
+                && _row.equal(column_kind::regular_column, s, other._row, s);
     }
 
     class printer {
@@ -138,6 +113,9 @@ public:
         friend std::ostream& operator<<(std::ostream& os, const printer& p);
     };
     friend std::ostream& operator<<(std::ostream& os, const printer& p);
+
+    deletable_row as_deletable_row() && { return std::move(_row); }
+    const deletable_row& as_deletable_row() const & { return _row; }
 };
 
 class static_row {
@@ -246,59 +224,44 @@ public:
     friend std::ostream& operator<<(std::ostream& is, const partition_end& row);
 };
 
-GCC6_CONCEPT(
 template<typename T, typename ReturnType>
-concept bool MutationFragmentConsumer() {
-    return requires(T t, static_row sr, clustering_row cr, range_tombstone rt, partition_start ph, partition_end pe) {
-        { t.consume(std::move(sr)) } -> ReturnType;
-        { t.consume(std::move(cr)) } -> ReturnType;
-        { t.consume(std::move(rt)) } -> ReturnType;
-        { t.consume(std::move(ph)) } -> ReturnType;
-        { t.consume(std::move(pe)) } -> ReturnType;
+concept MutationFragmentConsumer =
+    requires(T t, static_row sr, clustering_row cr, range_tombstone rt, partition_start ph, partition_end pe) {
+        { t.consume(std::move(sr)) } -> std::same_as<ReturnType>;
+        { t.consume(std::move(cr)) } -> std::same_as<ReturnType>;
+        { t.consume(std::move(rt)) } -> std::same_as<ReturnType>;
+        { t.consume(std::move(ph)) } -> std::same_as<ReturnType>;
+        { t.consume(std::move(pe)) } -> std::same_as<ReturnType>;
     };
-}
-)
 
-GCC6_CONCEPT(
 template<typename T, typename ReturnType>
-concept bool FragmentConsumerReturning() {
-    return requires(T t, static_row sr, clustering_row cr, range_tombstone rt, tombstone tomb) {
-        { t.consume(std::move(sr)) } -> ReturnType;
-        { t.consume(std::move(cr)) } -> ReturnType;
-        { t.consume(std::move(rt)) } -> ReturnType;
+concept FragmentConsumerReturning =
+    requires(T t, static_row sr, clustering_row cr, range_tombstone rt, tombstone tomb) {
+        { t.consume(std::move(sr)) } -> std::same_as<ReturnType>;
+        { t.consume(std::move(cr)) } -> std::same_as<ReturnType>;
+        { t.consume(std::move(rt)) } -> std::same_as<ReturnType>;
     };
-}
-)
 
-GCC6_CONCEPT(
 template<typename T>
-concept bool FragmentConsumer() {
-    return FragmentConsumerReturning<T, stop_iteration >() || FragmentConsumerReturning<T, future<stop_iteration>>();
-}
-)
+concept FragmentConsumer =
+    FragmentConsumerReturning<T, stop_iteration> || FragmentConsumerReturning<T, future<stop_iteration>>;
 
-GCC6_CONCEPT(
 template<typename T>
-concept bool StreamedMutationConsumer() {
-    return FragmentConsumer<T>() && requires(T t, static_row sr, clustering_row cr, range_tombstone rt, tombstone tomb) {
+concept StreamedMutationConsumer =
+    FragmentConsumer<T> && requires(T t, static_row sr, clustering_row cr, range_tombstone rt, tombstone tomb) {
         t.consume(tomb);
         t.consume_end_of_stream();
     };
-}
-)
 
-GCC6_CONCEPT(
 template<typename T, typename ReturnType>
-concept bool MutationFragmentVisitor() {
-    return requires(T t, const static_row& sr, const clustering_row& cr, const range_tombstone& rt, const partition_start& ph, const partition_end& eop) {
-        { t(sr) } -> ReturnType;
-        { t(cr) } -> ReturnType;
-        { t(rt) } -> ReturnType;
-        { t(ph) } -> ReturnType;
-        { t(eop) } -> ReturnType;
+concept MutationFragmentVisitor =
+    requires(T t, const static_row& sr, const clustering_row& cr, const range_tombstone& rt, const partition_start& ph, const partition_end& eop) {
+        { t(sr) } -> std::same_as<ReturnType>;
+        { t(cr) } -> std::same_as<ReturnType>;
+        { t(rt) } -> std::same_as<ReturnType>;
+        { t(ph) } -> std::same_as<ReturnType>;
+        { t(eop) } -> std::same_as<ReturnType>;
     };
-}
-)
 
 class mutation_fragment {
 public:
@@ -311,10 +274,10 @@ public:
     };
 private:
     struct data {
-        data() { }
+        data(reader_permit permit) :  _memory(permit.consume_memory()) { }
         ~data() { }
 
-        std::optional<size_t> _size_in_bytes;
+        reader_permit::resource_units _memory;
         union {
             static_row _static_row;
             clustering_row _clustering_row;
@@ -337,22 +300,23 @@ public:
     struct clustering_row_tag_t { };
 
     template<typename... Args>
-    mutation_fragment(clustering_row_tag_t, Args&&... args)
+    mutation_fragment(clustering_row_tag_t, const schema& s, reader_permit permit, Args&&... args)
         : _kind(kind::clustering_row)
-        , _data(std::make_unique<data>())
+        , _data(std::make_unique<data>(std::move(permit)))
     {
         new (&_data->_clustering_row) clustering_row(std::forward<Args>(args)...);
+        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
     }
 
-    mutation_fragment(static_row&& r);
-    mutation_fragment(clustering_row&& r);
-    mutation_fragment(range_tombstone&& r);
-    mutation_fragment(partition_start&& r);
-    mutation_fragment(partition_end&& r);
+    mutation_fragment(const schema& s, reader_permit permit, static_row&& r);
+    mutation_fragment(const schema& s, reader_permit permit, clustering_row&& r);
+    mutation_fragment(const schema& s, reader_permit permit, range_tombstone&& r);
+    mutation_fragment(const schema& s, reader_permit permit, partition_start&& r);
+    mutation_fragment(const schema& s, reader_permit permit, partition_end&& r);
 
-    mutation_fragment(const schema& s, const mutation_fragment& o)
-        : _kind(o._kind), _data(std::make_unique<data>()) {
-        switch(_kind) {
+    mutation_fragment(const schema& s, reader_permit permit, const mutation_fragment& o)
+        : _kind(o._kind), _data(std::make_unique<data>(std::move(permit))) {
+        switch (_kind) {
             case kind::static_row:
                 new (&_data->_static_row) static_row(s, o._data->_static_row);
                 break;
@@ -369,6 +333,7 @@ public:
                 new (&_data->_partition_end) partition_end(o._data->_partition_end);
                 break;
         }
+        _data->_memory.reset(o._data->_memory.resources());
     }
     mutation_fragment(mutation_fragment&& other) = default;
     mutation_fragment& operator=(mutation_fragment&& other) noexcept {
@@ -409,25 +374,21 @@ public:
     bool is_partition_start() const { return _kind == kind::partition_start; }
     bool is_end_of_partition() const { return _kind == kind::partition_end; }
 
-    static_row& as_mutable_static_row() {
-        _data->_size_in_bytes = std::nullopt;
-        return _data->_static_row;
+    void mutate_as_static_row(const schema& s, std::invocable<static_row&> auto&& fn) {
+        fn(_data->_static_row);
+        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
     }
-    clustering_row& as_mutable_clustering_row() {
-        _data->_size_in_bytes = std::nullopt;
-        return _data->_clustering_row;
+    void mutate_as_clustering_row(const schema& s, std::invocable<clustering_row&> auto&& fn) {
+        fn(_data->_clustering_row);
+        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
     }
-    range_tombstone& as_mutable_range_tombstone() {
-        _data->_size_in_bytes = std::nullopt;
-        return _data->_range_tombstone;
+    void mutate_as_range_tombstone(const schema& s, std::invocable<range_tombstone&> auto&& fn) {
+        fn(_data->_range_tombstone);
+        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
     }
-    partition_start& as_mutable_partition_start() {
-        _data->_size_in_bytes = std::nullopt;
-        return _data->_partition_start;
-    }
-    partition_end& as_mutable_end_of_partition() {
-        _data->_size_in_bytes = std::nullopt;
-        return _data->_partition_end;
+    void mutate_as_partition_start(const schema& s, std::invocable<partition_start&> auto&& fn) {
+        fn(_data->_partition_start);
+        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
     }
 
     static_row&& as_static_row() && { return std::move(_data->_static_row); }
@@ -446,10 +407,9 @@ public:
     void apply(const schema& s, mutation_fragment&& mf);
 
     template<typename Consumer>
-    GCC6_CONCEPT(
-        requires MutationFragmentConsumer<Consumer, decltype(std::declval<Consumer>().consume(std::declval<range_tombstone>()))>()
-    )
+    requires MutationFragmentConsumer<Consumer, decltype(std::declval<Consumer>().consume(std::declval<range_tombstone>()))>
     decltype(auto) consume(Consumer& consumer) && {
+        _data->_memory.reset();
         switch (_kind) {
         case kind::static_row:
             return consumer.consume(std::move(_data->_static_row));
@@ -466,9 +426,7 @@ public:
     }
 
     template<typename Visitor>
-    GCC6_CONCEPT(
-        requires MutationFragmentVisitor<Visitor, decltype(std::declval<Visitor>()(std::declval<static_row&>()))>()
-    )
+    requires MutationFragmentVisitor<Visitor, decltype(std::declval<Visitor>()(std::declval<static_row&>()))>
     decltype(auto) visit(Visitor&& visitor) const {
         switch (_kind) {
         case kind::static_row:
@@ -485,18 +443,19 @@ public:
         abort();
     }
 
-    size_t memory_usage(const schema& s) const {
-        if (!_data->_size_in_bytes) {
-            _data->_size_in_bytes = sizeof(data) + visit([&s] (auto& mf) -> size_t { return mf.external_memory_usage(s); });
-        }
-        return *_data->_size_in_bytes;
+    size_t memory_usage() const {
+        return _data->_memory.resources().memory;
+    }
+
+    reader_permit permit() const {
+        return _data->_memory.permit();
     }
 
     bool equal(const schema& s, const mutation_fragment& other) const {
         if (other._kind != _kind) {
             return false;
         }
-        switch(_kind) {
+        switch (_kind) {
         case kind::static_row:
             return as_static_row().equal(s, other.as_static_row());
         case kind::clustering_row:
@@ -531,6 +490,11 @@ public:
         friend std::ostream& operator<<(std::ostream& os, const printer& p);
     };
     friend std::ostream& operator<<(std::ostream& os, const printer& p);
+
+private:
+    size_t calculate_memory_usage(const schema& s) const {
+        return sizeof(data) + visit([&s] (auto& mf) -> size_t { return mf.external_memory_usage(s); });
+    }
 };
 
 inline position_in_partition_view static_row::position() const
@@ -601,12 +565,13 @@ namespace streamed_mutation {
 // to the stream.
 class range_tombstone_stream {
     const schema& _schema;
+    reader_permit _permit;
     position_in_partition::less_compare _cmp;
     range_tombstone_list _list;
 private:
     mutation_fragment_opt do_get_next();
 public:
-    range_tombstone_stream(const schema& s) : _schema(s), _cmp(s), _list(s) { }
+    range_tombstone_stream(const schema& s, reader_permit permit) : _schema(s), _permit(std::move(permit)), _cmp(s), _list(s) { }
     mutation_fragment_opt get_next(const rows_entry&);
     mutation_fragment_opt get_next(const mutation_fragment&);
     // Returns next fragment with position before upper_bound or disengaged optional if no such fragments are left.
@@ -622,22 +587,19 @@ public:
         _list.apply(_schema, list);
     }
     // Apply those range tombstones from the list, that overlap with the
-    // range. If `trim_front` is set, range tombstones will be trimmed to the
-    // start of the clustering range.
-    void apply(const range_tombstone_list&, const query::clustering_range&, bool trim_front = false);
+    // range. Range tombstones will be trimmed to the start of the
+    // clustering range.
+    void apply(const range_tombstone_list&, const query::clustering_range&);
     void reset();
     bool empty() const;
     friend std::ostream& operator<<(std::ostream& out, const range_tombstone_stream&);
 };
 
-GCC6_CONCEPT(
-    // F gets a stream element as an argument and returns the new value which replaces that element
-    // in the transformed stream.
-    template<typename F>
-    concept bool StreamedMutationTranformer() {
-        return requires(F f, mutation_fragment mf, schema_ptr s) {
-            { f(std::move(mf)) } -> mutation_fragment;
-            { f(s) } -> schema_ptr;
-        };
-    }
-)
+// F gets a stream element as an argument and returns the new value which replaces that element
+// in the transformed stream.
+template<typename F>
+concept StreamedMutationTranformer =
+    requires(F f, mutation_fragment mf, schema_ptr s) {
+        { f(std::move(mf)) } -> std::same_as<mutation_fragment>;
+        { f(s) } -> std::same_as<schema_ptr>;
+    };

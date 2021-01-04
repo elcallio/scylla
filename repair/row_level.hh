@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -44,12 +33,14 @@ private:
     bool _stopped = false;
 };
 
-future<> repair_init_messaging_service_handler(repair_service& rs, distributed<db::system_distributed_keyspace>& sys_dist_ks, distributed<db::view::view_update_generator>& view_update_generator);
+future<> row_level_repair_init_messaging_service_handler(repair_service& rs, distributed<db::system_distributed_keyspace>& sys_dist_ks,
+        distributed<db::view::view_update_generator>& view_update_generator, sharded<netw::messaging_service>& ms);
+future<> row_level_repair_uninit_messaging_service_handler();
 
 class repair_info;
 
 future<> repair_cf_range_row_level(repair_info& ri,
-        sstring cf_name, dht::token_range range,
+        sstring cf_name, utils::UUID table_id, dht::token_range range,
         const std::vector<gms::inet_address>& all_peer_nodes);
 
 future<> shutdown_all_row_level_repair();

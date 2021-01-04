@@ -50,19 +50,14 @@ public:
         return !(*this == other);
     }
 public:
-    // (Wrong) Counter ID ordering used by Scylla 1.7.4 and earlier.
-    struct less_compare_1_7_4 {
-        bool operator()(const counter_id& a, const counter_id& b) const;
-    };
-public:
-    static counter_id local();
-
     // For tests.
     static counter_id generate_random() {
         return counter_id(utils::make_random_uuid());
     }
 };
-static_assert(std::is_pod<counter_id>::value, "counter_id should be a POD type");
+static_assert(
+        std::is_standard_layout_v<counter_id> && std::is_trivial_v<counter_id>,
+        "counter_id should be a POD type");
 
 std::ostream& operator<<(std::ostream& os, const counter_id& id);
 
@@ -143,10 +138,10 @@ private:
     // Shared logic for applying counter_shards and counter_shard_views.
     // T is either counter_shard or basic_counter_shard_view<U>.
     template<typename T>
-    GCC6_CONCEPT(requires requires(T shard) {
-        { shard.value() } -> int64_t;
-        { shard.logical_clock() } -> int64_t;
-    })
+    requires requires(T shard) {
+        { shard.value() } -> std::same_as<int64_t>;
+        { shard.logical_clock() } -> std::same_as<int64_t>;
+    }
     counter_shard& do_apply(T&& other) noexcept {
         auto other_clock = other.logical_clock();
         if (_logical_clock < other_clock) {
@@ -173,7 +168,7 @@ public:
     int64_t logical_clock() const { return _logical_clock; }
 
     counter_shard& update(int64_t value_delta, int64_t clock_increment) noexcept {
-        _value += value_delta;
+        _value = uint64_t(_value) + uint64_t(value_delta); // signed int overflow is undefined hence the cast
         _logical_clock += clock_increment;
         return *this;
     }
@@ -269,7 +264,14 @@ public:
         return ac;
     }
 
-    class inserter_iterator : public std::iterator<std::output_iterator_tag, counter_shard> {
+    class inserter_iterator {
+    public:
+        using iterator_category = std::output_iterator_tag;
+        using value_type = counter_shard;
+        using difference_type = std::ptrdiff_t;
+        using pointer = counter_shard*;
+        using reference = counter_shard&;
+    private:
         counter_cell_builder* _builder;
     public:
         explicit inserter_iterator(counter_cell_builder& b) : _builder(&b) { }
@@ -278,7 +280,7 @@ public:
             return *this;
         }
         inserter_iterator& operator=(const counter_shard_view& csv) {
-            return operator=(counter_shard(csv));
+            return this->operator=(counter_shard(csv));
         }
         inserter_iterator& operator++() { return *this; }
         inserter_iterator& operator++(int) { return *this; }
@@ -303,7 +305,14 @@ protected:
     basic_atomic_cell_view<is_mutable> _cell;
     linearized_value_view _value;
 private:
-    class shard_iterator : public std::iterator<std::input_iterator_tag, basic_counter_shard_view<is_mutable>> {
+    class shard_iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = basic_counter_shard_view<is_mutable>;
+        using difference_type = std::ptrdiff_t;
+        using pointer = basic_counter_shard_view<is_mutable>*;
+        using reference = basic_counter_shard_view<is_mutable>&;
+    private:
         pointer_type _current;
         basic_counter_shard_view<is_mutable> _current_view;
     public:
@@ -383,11 +392,6 @@ public:
         return *it;
     }
 
-    std::optional<counter_shard_view> local_shard() const {
-        // TODO: consider caching local shard position
-        return get_shard(counter_id::local());
-    }
-
     bool operator==(const basic_counter_cell_view& other) const {
         return timestamp() == other.timestamp() && boost::equal(shards(), other.shards());
     }
@@ -403,9 +407,6 @@ struct counter_cell_view : basic_counter_cell_view<mutable_view::no> {
             return fn(ccv);
         });
     }
-
-    // Returns counter shards in an order that is compatible with Scylla 1.7.4.
-    std::vector<counter_shard> shards_compatible_with_1_7_4() const;
 
     // Reversibly applies two counter cells, at least one of them must be live.
     static void apply(const column_definition& cdef, atomic_cell_or_collection& dst, atomic_cell_or_collection& src);
@@ -432,7 +433,7 @@ struct counter_cell_mutable_view : basic_counter_cell_view<mutable_view::yes> {
 // Transforms mutation dst from counter updates to counter shards using state
 // stored in current_state.
 // If current_state is present it has to be in the same schema as dst.
-void transform_counter_updates_to_shards(mutation& dst, const mutation* current_state, uint64_t clock_offset);
+void transform_counter_updates_to_shards(mutation& dst, const mutation* current_state, uint64_t clock_offset, utils::UUID local_id);
 
 template<>
 struct appending_hash<counter_shard_view> {

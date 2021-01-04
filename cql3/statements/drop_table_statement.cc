@@ -47,7 +47,7 @@ future<> drop_table_statement::check_access(service::storage_proxy& proxy, const
 {
     // invalid_request_exception is only thrown synchronously.
     try {
-        return state.has_column_family_access(keyspace(), column_family(), auth::permission::DROP);
+        return state.has_column_family_access(proxy.local_db(), keyspace(), column_family(), auth::permission::DROP);
     } catch (exceptions::invalid_request_exception&) {
         if (!_if_exists) {
             throw;
@@ -61,10 +61,10 @@ void drop_table_statement::validate(service::storage_proxy&, const service::clie
     // validated in announce_migration()
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> drop_table_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
+future<shared_ptr<cql_transport::event::schema_change>> drop_table_statement::announce_migration(service::storage_proxy& proxy) const
 {
-    return make_ready_future<>().then([this, is_local_only] {
-        return service::get_local_migration_manager().announce_column_family_drop(keyspace(), column_family(), is_local_only);
+    return make_ready_future<>().then([this] {
+        return service::get_local_migration_manager().announce_column_family_drop(keyspace(), column_family());
     }).then_wrapped([this] (auto&& f) {
         try {
             f.get();

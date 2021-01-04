@@ -7,18 +7,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 import os
 import argparse
@@ -26,7 +15,9 @@ import pwd
 import grp
 import sys
 import stat
+import distro
 from scylla_util import *
+from subprocess import run
 
 if __name__ == '__main__':
     if os.getuid() > 0:
@@ -35,10 +26,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Configure RAID volume for Scylla.')
     parser.add_argument('--disks', required=True,
                         help='specify disks for RAID')
-    parser.add_argument('--raiddev', default='/dev/md0',
+    parser.add_argument('--raiddev',
                         help='MD device name for RAID')
-    parser.add_argument('--update-fstab', action='store_true', default=False,
-                        help='update /etc/fstab for RAID')
+    parser.add_argument('--enable-on-nextboot', '--update-fstab', action='store_true', default=False,
+                        help='mount RAID on next boot')
     parser.add_argument('--root', default='/var/lib/scylla',
                         help='specify the root of the tree')
     parser.add_argument('--volume-role', default='all',
@@ -72,35 +63,50 @@ if __name__ == '__main__':
             print('{} is busy'.format(disk))
             sys.exit(1)
 
-    if os.path.exists(args.raiddev):
-        print('{} is already using'.format(args.raiddev))
-        sys.exit(1)
-
-    if os.path.ismount(mount_at):
-        print('{} is already mounted'.format(mount_at))
-        sys.exit(1)
-
-    if is_debian_variant():
-        run('env DEBIAN_FRONTEND=noninteractive apt-get -y install mdadm xfsprogs')
-    elif is_redhat_variant():
-        run('yum install -y mdadm xfsprogs')
-    elif is_gentoo_variant():
-        run('emerge -uq sys-fs/mdadm sys-fs/xfsprogs')
-
     if len(disks) == 1 and not args.force_raid:
         raid = False
         fsdev = disks[0]
     else:
         raid = True
-        fsdev = args.raiddev
+        if args.raiddev is None:
+            raiddevs_to_try = [f'/dev/md{i}' for i in range(10)]
+        else:
+            raiddevs_to_try = [args.raiddev, ]
+        for fsdev in raiddevs_to_try:
+            raiddevname = os.path.basename(fsdev)
+            if not os.path.exists(f'/sys/block/{raiddevname}/md/array_state'):
+                break
+            print(f'{fsdev} is already using')
+        else:
+            if args.raiddev is None:
+                print("Can't find unused /dev/mdX")
+            sys.exit(1)
+        print(f'{fsdev} will be used to setup a RAID')
+
+    if os.path.ismount(mount_at):
+        print('{} is already mounted'.format(mount_at))
+        sys.exit(1)
+
+    mntunit_bn = run('systemd-escape -p --suffix=mount {}'.format(mount_at), shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+    mntunit = Path('/etc/systemd/system/{}'.format(mntunit_bn))
+    if mntunit.exists():
+        print('mount unit {} already exists'.format(mntunit))
+        sys.exit(1)
+
+    if not shutil.which('mkfs.xfs') or not shutil.which('mdadm'):
+        pkg_install('xfsprogs mdadm')
+    try:
+        md_service = systemd_unit('mdmonitor.service')
+    except SystemdException:
+        md_service = systemd_unit('mdadm.service')
 
     print('Creating {type} for scylla using {nr_disk} disk(s): {disks}'.format(type='RAID0' if raid else 'XFS volume', nr_disk=len(disks), disks=args.disks))
-    if dist_name() == 'Ubuntu' and dist_ver() == '14.04':
+    if distro.name() == 'Ubuntu' and distro.version() == '14.04':
         if raid:
-            run('udevadm settle')
-            run('mdadm --create --verbose --force --run {raid} --level=0 -c1024 --raid-devices={nr_disk} {disks}'.format(raid=fsdev, nr_disk=len(disks), disks=args.disks.replace(',', ' ')))
-            run('udevadm settle')
-        run('mkfs.xfs {} -f'.format(fsdev))
+            run('udevadm settle', shell=True, check=True)
+            run('mdadm --create --verbose --force --run {raid} --level=0 -c1024 --raid-devices={nr_disk} {disks}'.format(raid=fsdev, nr_disk=len(disks), disks=args.disks.replace(',', ' ')), shell=True, check=True)
+            run('udevadm settle', shell=True, check=True)
+        run('mkfs.xfs {} -f'.format(fsdev), shell=True, check=True)
     else:
         procs=[]
         for disk in disks:
@@ -115,10 +121,10 @@ if __name__ == '__main__':
         for proc in procs:
             proc.wait()
         if raid:
-            run('udevadm settle')
-            run('mdadm --create --verbose --force --run {raid} --level=0 -c1024 --raid-devices={nr_disk} {disks}'.format(raid=fsdev, nr_disk=len(disks), disks=args.disks.replace(',', ' ')))
-            run('udevadm settle')
-        run('mkfs.xfs {} -f -K'.format(fsdev))
+            run('udevadm settle', shell=True, check=True)
+            run('mdadm --create --verbose --force --run {raid} --level=0 -c1024 --raid-devices={nr_disk} {disks}'.format(raid=fsdev, nr_disk=len(disks), disks=args.disks.replace(',', ' ')), shell=True, check=True)
+            run('udevadm settle', shell=True, check=True)
+        run('mkfs.xfs {} -f -K'.format(fsdev), shell=True, check=True)
 
     if is_debian_variant():
         confpath = '/etc/mdadm/mdadm.conf'
@@ -126,35 +132,58 @@ if __name__ == '__main__':
         confpath = '/etc/mdadm.conf'
 
     if raid:
-        res = out('mdadm --detail --scan')
+        res = run('mdadm --detail --scan', shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
         with open(confpath, 'w') as f:
             f.write(res)
+            f.write('\nMAILADDR root')
 
-    makedirs(mount_at)
-    run('mount -t xfs -o noatime {raid} "{mount_at}"'.format(raid=fsdev, mount_at=mount_at))
+    os.makedirs(mount_at, exist_ok=True)
+
+    uuid = run(f'blkid -s UUID -o value {fsdev}', shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+    after = 'local-fs.target'
+    if raid:
+        after += f' {md_service}'
+    unit_data = f'''
+[Unit]
+Description=Scylla data directory
+Before=scylla-server.service
+After={after}
+
+[Mount]
+What=UUID={uuid}
+Where={mount_at}
+Type=xfs
+Options=noatime
+
+[Install]
+WantedBy=multi-user.target
+'''[1:-1]
+    with open(f'/etc/systemd/system/{mntunit_bn}', 'w') as f:
+        f.write(unit_data)
+    mounts_conf = '/etc/systemd/system/scylla-server.service.d/mounts.conf'
+    if not os.path.exists(mounts_conf):
+        os.makedirs('/etc/systemd/system/scylla-server.service.d/', exist_ok=True)
+        with open(mounts_conf, 'w') as f:
+            f.write(f'[Unit]\nRequiresMountsFor={mount_at}\n')
+    else:
+        with open(mounts_conf, 'a') as f:
+            f.write(f'RequiresMountsFor={mount_at}\n')
+
+    systemd_unit.reload()
+    md_service.enable()
+    md_service.start()
+    mount = systemd_unit(mntunit_bn)
+    mount.start()
+    if args.enable_on_nextboot:
+        mount.enable()
     uid = pwd.getpwnam('scylla').pw_uid
     gid = grp.getgrnam('scylla').gr_gid
     os.chown(root, uid, gid)
 
     for d in ['coredump', 'data', 'commitlog', 'hints', 'view_hints', 'saved_caches']:
         dpath = '{}/{}'.format(root, d)
-        makedirs(dpath)
+        os.makedirs(dpath, exist_ok=True)
         os.chown(dpath, uid, gid)
 
-    if args.update_fstab:
-        res = out('blkid {}'.format(fsdev))
-        match = re.search(r'^/dev/\S+: (UUID="\S+")', res.strip())
-        uuid = match.group(1)
-        with open('/etc/fstab', 'a') as f:
-            f.write('{uuid} {mount_at} xfs noatime,nofail 0 0\n'.format(uuid=uuid, mount_at=mount_at))
-        mounts_conf = '/etc/systemd/system/scylla-server.service.d/mounts.conf'
-        if not os.path.exists(mounts_conf):
-            makedirs('/etc/systemd/system/scylla-server.service.d/')
-            with open(mounts_conf, 'w') as f:
-                f.write('[Unit]\nRequiresMountsFor={mount_at}\n'.format(mount_at=mount_at))
-        else:
-            with open(mounts_conf, 'a') as f:
-                f.write('RequiresMountsFor={mount_at}\n'.format(mount_at=mount_at))
-
     if is_debian_variant():
-        run('update-initramfs -u')
+        run('update-initramfs -u', shell=True, check=True)

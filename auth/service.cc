@@ -19,9 +19,7 @@
 #include "auth/allow_all_authenticator.hh"
 #include "auth/allow_all_authorizer.hh"
 #include "auth/common.hh"
-#include "auth/password_authenticator.hh"
 #include "auth/role_or_anonymous.hh"
-#include "auth/standard_role_manager.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/untyped_result_set.hh"
 #include "db/consistency_level_type.hh"
@@ -113,18 +111,7 @@ service::service(
             , _authorizer(std::move(z))
             , _authenticator(std::move(a))
             , _role_manager(std::move(r))
-            , _migration_listener(std::make_unique<auth_migration_listener>(*_authorizer)) {
-    // The password authenticator requires that the `standard_role_manager` is running so that the roles metadata table
-    // it manages is created and updated. This cross-module dependency is rather gross, but we have to maintain it for
-    // the sake of compatibility with Apache Cassandra and its choice of auth. schema.
-    if ((_authenticator->qualified_java_name() == password_authenticator_name())
-            && (_role_manager->qualified_java_name() != standard_role_manager_name())) {
-        throw incompatible_module_combination(
-                format("The {} authenticator must be loaded alongside the {} role-manager.",
-                        password_authenticator_name(),
-                        standard_role_manager_name()));
-    }
-}
+            , _migration_listener(std::make_unique<auth_migration_listener>(*_authorizer)) {}
 
 service::service(
         permissions_cache_config c,
@@ -155,7 +142,7 @@ future<> service::create_keyspace_if_missing(::service::migration_manager& mm) c
 
         // We use min_timestamp so that default keyspace metadata will loose with any manual adjustments.
         // See issue #2129.
-        return mm.announce_new_keyspace(ksm, api::min_timestamp, false);
+        return mm.announce_new_keyspace(ksm, api::min_timestamp);
     }
 
     return make_ready_future<>();
@@ -166,7 +153,7 @@ future<> service::start(::service::migration_manager& mm) {
         return create_keyspace_if_missing(mm);
     }).then([this] {
         return _role_manager->start().then([this] {
-            return when_all_succeed(_authorizer->start(), _authenticator->start());
+            return when_all_succeed(_authorizer->start(), _authenticator->start()).discard_result();
         });
     }).then([this] {
         _permissions_cache = std::make_unique<permissions_cache>(_permissions_cache_config, *this, log);
@@ -189,7 +176,7 @@ future<> service::stop() {
         }
         return make_ready_future<>();
     }).then([this] {
-        return when_all_succeed(_role_manager->stop(), _authorizer->stop(), _authenticator->stop());
+        return when_all_succeed(_role_manager->stop(), _authorizer->stop(), _authenticator->stop()).discard_result();
     });
 }
 
@@ -369,25 +356,28 @@ future<permission_set> get_permissions(const service& ser, const authenticated_u
 }
 
 bool is_enforcing(const service& ser)  {
-    const bool enforcing_authorizer = ser.underlying_authorizer().qualified_java_name() != allow_all_authorizer_name();
+    const bool enforcing_authorizer = ser.underlying_authorizer().qualified_java_name() != allow_all_authorizer_name;
 
     const bool enforcing_authenticator = ser.underlying_authenticator().qualified_java_name()
-            != allow_all_authenticator_name();
+            != allow_all_authenticator_name;
 
     return enforcing_authorizer || enforcing_authenticator;
 }
 
-bool is_protected(const service& ser, const resource& r) noexcept {
-    return ser.underlying_role_manager().protected_resources().count(r)
-            || ser.underlying_authenticator().protected_resources().count(r)
-            || ser.underlying_authorizer().protected_resources().count(r);
+bool is_protected(const service& ser, command_desc cmd) noexcept {
+    if (cmd.type_ == command_desc::type::ALTER_WITH_OPTS) {
+        return false; // Table attributes are OK to modify; see #7057.
+    }
+    return ser.underlying_role_manager().protected_resources().contains(cmd.resource)
+            || ser.underlying_authenticator().protected_resources().contains(cmd.resource)
+            || ser.underlying_authorizer().protected_resources().contains(cmd.resource);
 }
 
 static void validate_authentication_options_are_supported(
         const authentication_options& options,
         const authentication_option_set& supported) {
     const auto check = [&supported](authentication_option k) {
-        if (supported.count(k) == 0) {
+        if (!supported.contains(k)) {
             throw unsupported_authentication_option(k);
         }
     };
@@ -451,7 +441,9 @@ future<> drop_role(const service& ser, std::string_view name) {
 
         return when_all_succeed(
                 a.revoke_all(name),
-                a.revoke_all(r)).handle_exception_type([](const unsupported_authorization_operation&) {
+                a.revoke_all(r))
+                    .discard_result()
+                    .handle_exception_type([](const unsupported_authorization_operation&) {
             // Nothing.
         });
     }).then([&ser, name] {
@@ -464,8 +456,8 @@ future<> drop_role(const service& ser, std::string_view name) {
 future<bool> has_role(const service& ser, std::string_view grantee, std::string_view name) {
     return when_all_succeed(
             validate_role_exists(ser, name),
-            ser.get_roles(grantee)).then([name](role_set all_roles) {
-        return make_ready_future<bool>(all_roles.count(sstring(name)) != 0);
+            ser.get_roles(grantee)).then_unpack([name](role_set all_roles) {
+        return make_ready_future<bool>(all_roles.contains(sstring(name)));
     });
 }
 future<bool> has_role(const service& ser, const authenticated_user& u, std::string_view name) {
@@ -522,14 +514,9 @@ future<std::vector<permission_details>> list_filtered_permissions(
                     ? auth::expand_resource_family(r)
                     : auth::resource_set{r};
 
-            all_details.erase(
-                    std::remove_if(
-                            all_details.begin(),
-                            all_details.end(),
-                            [&resources](const permission_details& pd) {
-                        return resources.count(pd.resource) == 0;
-                    }),
-                    all_details.end());
+            std::erase_if(all_details, [&resources](const permission_details& pd) {
+                return !resources.contains(pd.resource);
+            });
         }
 
         std::transform(
@@ -542,11 +529,9 @@ future<std::vector<permission_details>> list_filtered_permissions(
                 });
 
         // Eliminate rows with an empty permission set.
-        all_details.erase(
-                std::remove_if(all_details.begin(), all_details.end(), [](const permission_details& pd) {
-                    return pd.permissions.mask() == 0;
-                }),
-                all_details.end());
+        std::erase_if(all_details, [](const permission_details& pd) {
+            return pd.permissions.mask() == 0;
+        });
 
         if (!role_name) {
             return make_ready_future<std::vector<permission_details>>(std::move(all_details));
@@ -558,14 +543,9 @@ future<std::vector<permission_details>> list_filtered_permissions(
 
         return do_with(std::move(all_details), [&ser, role_name](auto& all_details) {
             return ser.get_roles(*role_name).then([&all_details](role_set all_roles) {
-                all_details.erase(
-                        std::remove_if(
-                                all_details.begin(),
-                                all_details.end(),
-                                [&all_roles](const permission_details& pd) {
-                            return all_roles.count(pd.role_name) == 0;
-                        }),
-                        all_details.end());
+                std::erase_if(all_details, [&all_roles](const permission_details& pd) {
+                    return !all_roles.contains(pd.role_name);
+                });
 
                 return make_ready_future<std::vector<permission_details>>(std::move(all_details));
             });

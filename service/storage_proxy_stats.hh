@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -74,7 +63,7 @@ public:
      *
      * @return a reference to the requested counter
      */
-    uint64_t& get_ep_stat(gms::inet_address ep);
+    uint64_t& get_ep_stat(gms::inet_address ep) noexcept;
 };
 
 struct write_stats {
@@ -90,13 +79,13 @@ struct write_stats {
     utils::timed_rate_moving_average write_timeouts;
 
     utils::timed_rate_moving_average_and_histogram write;
-    utils::estimated_histogram estimated_write;
+    utils::time_estimated_histogram estimated_write;
 
     utils::timed_rate_moving_average cas_write_unavailables;
     utils::timed_rate_moving_average cas_write_timeouts;
 
     utils::timed_rate_moving_average_and_histogram cas_write;
-    utils::estimated_histogram estimated_cas_write;
+    utils::time_estimated_histogram estimated_cas_write;
 
     utils::estimated_histogram cas_write_contention;
 
@@ -111,6 +100,7 @@ struct write_stats {
     uint64_t throttled_writes = 0; // total number of writes ever delayed due to throttling
     uint64_t throttled_base_writes = 0; // current number of base writes delayed due to view update backlog
     uint64_t background_writes_failed = 0;
+    uint64_t writes_failed_due_to_too_many_in_flight_hints = 0;
 
     uint64_t cas_write_unfinished_commit = 0;
     uint64_t cas_write_condition_not_met = 0;
@@ -169,11 +159,11 @@ struct stats : public write_stats {
 
     utils::timed_rate_moving_average_and_histogram read;
     utils::timed_rate_moving_average_and_histogram range;
-    utils::estimated_histogram estimated_read;
-    utils::estimated_histogram estimated_range;
+    utils::time_estimated_histogram estimated_read;
+    utils::time_estimated_histogram estimated_range;
 
     utils::timed_rate_moving_average_and_histogram cas_read;
-    utils::estimated_histogram estimated_cas_read;
+    utils::time_estimated_histogram estimated_cas_read;
 
     uint64_t reads = 0;
     uint64_t foreground_reads = 0; // client still waits for the read
@@ -182,6 +172,9 @@ struct stats : public write_stats {
     uint64_t speculative_data_reads = 0;
 
     uint64_t cas_read_unfinished_commit = 0;
+    uint64_t cas_foreground = 0;
+    uint64_t cas_total_running = 0;
+    uint64_t cas_total_operations = 0;
 
     // Data read attempts
     split_stats data_read_attempts;

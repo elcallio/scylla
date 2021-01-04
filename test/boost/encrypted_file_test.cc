@@ -28,13 +28,13 @@ using namespace encryption;
 
 static tmpdir dir;
 
-static future<file, ::shared_ptr<symmetric_key>> make_file(const sstring& name, open_flags mode, ::shared_ptr<symmetric_key> k = nullptr) {
+static future<std::tuple<file, ::shared_ptr<symmetric_key>>> make_file(const sstring& name, open_flags mode, ::shared_ptr<symmetric_key> k = nullptr) {
     return open_file_dma(sstring(dir.path() / std::string(name)), mode).then([k](file f) mutable {
         if (k == nullptr) {
             key_info info{"AES/CBC", 256};
             k = ::make_shared<symmetric_key>(info);
         }
-        return make_ready_future<file, ::shared_ptr<symmetric_key>>(file(make_encrypted_file(f, k)), k);
+        return make_ready_future<std::tuple<file, ::shared_ptr<symmetric_key>>>(std::tuple(file(make_encrypted_file(f, k)), k));
     });
 }
 
@@ -51,7 +51,7 @@ static temporary_buffer<uint8_t> generate_random(size_t n, size_t align) {
 static future<> test_random_data_disk(size_t n) {
     return seastar::async([n] {
         auto name = "test_rand_" + std::to_string(n);
-        auto t = make_file(name, open_flags::rw|open_flags::create).get();
+        auto t = make_file(name, open_flags::rw|open_flags::create).get0();
         auto f = std::get<0>(t);
         auto close_file = defer([&] { f.close().get(); });
         auto k = std::get<1>(t);
@@ -67,7 +67,7 @@ static future<> test_random_data_disk(size_t n) {
         BOOST_REQUIRE_EQUAL(w, buf.size());
 
         auto k2 = ::make_shared<symmetric_key>(k->info(), k->key());
-        auto f2 = make_file(name, open_flags::ro, k2).get0();
+        auto f2 = std::get<0>(make_file(name, open_flags::ro, k2).get0());
 
         auto tmp = temporary_buffer<uint8_t>::aligned(a, buf.size());
         auto n2 = f2.dma_read(0, tmp.get_write(), tmp.size()).get0();
@@ -152,7 +152,7 @@ SEASTAR_TEST_CASE(test_encrypted_file_data_unaligned2) {
 SEASTAR_TEST_CASE(test_truncating_empty) {
     return seastar::async([] {
         auto name = "test_truncating_empty";
-        auto t = make_file(name, open_flags::rw|open_flags::create).get();
+        auto t = make_file(name, open_flags::rw|open_flags::create).get0();
         auto f = std::get<0>(t);
         auto k = std::get<1>(t);
         auto s = 64 * f.memory_dma_alignment();
@@ -175,7 +175,7 @@ SEASTAR_TEST_CASE(test_truncating_empty) {
 SEASTAR_TEST_CASE(test_truncating_extend) {
     return seastar::async([] {
         auto name = "test_truncating_extend";
-        auto t = make_file(name, open_flags::rw|open_flags::create).get();
+        auto t = make_file(name, open_flags::rw|open_flags::create).get0();
         auto f = std::get<0>(t);
         auto k = std::get<1>(t);
         auto a = f.memory_dma_alignment();

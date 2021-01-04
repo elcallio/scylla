@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <stack>
@@ -30,8 +19,8 @@
 std::ostream&
 operator<<(std::ostream& os, const clustering_row::printer& p) {
     auto& row = p._clustering_row;
-    return os << "{clustering_row: ck " << row._ck << " t " << row._t << " row_marker " << row._marker << " cells "
-              << row::printer(p._schema, column_kind::regular_column, row._cells) << "}";
+    return os << "{clustering_row: ck " << row._ck << " dr "
+              << deletable_row::printer(p._schema, row._row) << "}";
 }
 
 std::ostream&
@@ -89,34 +78,39 @@ std::ostream& operator<<(std::ostream& out, const position_range& range) {
     return out << "{" << range.start() << ", " << range.end() << "}";
 }
 
-mutation_fragment::mutation_fragment(static_row&& r)
-    : _kind(kind::static_row), _data(std::make_unique<data>())
+mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, static_row&& r)
+    : _kind(kind::static_row), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_static_row) static_row(std::move(r));
+    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
 }
 
-mutation_fragment::mutation_fragment(clustering_row&& r)
-    : _kind(kind::clustering_row), _data(std::make_unique<data>())
+mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, clustering_row&& r)
+    : _kind(kind::clustering_row), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_clustering_row) clustering_row(std::move(r));
+    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
 }
 
-mutation_fragment::mutation_fragment(range_tombstone&& r)
-    : _kind(kind::range_tombstone), _data(std::make_unique<data>())
+mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, range_tombstone&& r)
+    : _kind(kind::range_tombstone), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_range_tombstone) range_tombstone(std::move(r));
+    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
 }
 
-mutation_fragment::mutation_fragment(partition_start&& r)
-        : _kind(kind::partition_start), _data(std::make_unique<data>())
+mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, partition_start&& r)
+        : _kind(kind::partition_start), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_partition_start) partition_start(std::move(r));
+    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
 }
 
-mutation_fragment::mutation_fragment(partition_end&& r)
-        : _kind(kind::partition_end), _data(std::make_unique<data>())
+mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, partition_end&& r)
+        : _kind(kind::partition_end), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_partition_end) partition_end(std::move(r));
+    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
 }
 
 void mutation_fragment::destroy_data() noexcept
@@ -160,7 +154,6 @@ const clustering_key_prefix& mutation_fragment::key() const
 void mutation_fragment::apply(const schema& s, mutation_fragment&& mf)
 {
     assert(mergeable_with(mf));
-    _data->_size_in_bytes = std::nullopt;
     switch (_kind) {
     case mutation_fragment::kind::partition_start:
         _data->_partition_start.partition_tombstone().apply(mf._data->_partition_start.partition_tombstone());
@@ -168,10 +161,12 @@ void mutation_fragment::apply(const schema& s, mutation_fragment&& mf)
         break;
     case kind::static_row:
         _data->_static_row.apply(s, std::move(mf._data->_static_row));
+        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
         mf._data->_static_row.~static_row();
         break;
     case kind::clustering_row:
         _data->_clustering_row.apply(s, std::move(mf._data->_clustering_row));
+        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
         mf._data->_clustering_row.~clustering_row();
         break;
     case mutation_fragment::kind::partition_end:
@@ -231,11 +226,7 @@ std::ostream& operator<<(std::ostream& os, const mutation_fragment::printer& p) 
 
 mutation_fragment_opt range_tombstone_stream::do_get_next()
 {
-    auto& rt = *_list.tombstones().begin();
-    auto mf = mutation_fragment(std::move(rt));
-    _list.tombstones().erase(_list.begin());
-    current_deleter<range_tombstone>()(&rt);
-    return mf;
+    return mutation_fragment(_schema, _permit, _list.pop_as<range_tombstone>(_list.begin()));
 }
 
 mutation_fragment_opt range_tombstone_stream::get_next(const rows_entry& re)
@@ -276,11 +267,9 @@ void range_tombstone_stream::forward_to(position_in_partition_view pos) {
     });
 }
 
-void range_tombstone_stream::apply(const range_tombstone_list& list, const query::clustering_range& range, bool trim_front) {
+void range_tombstone_stream::apply(const range_tombstone_list& list, const query::clustering_range& range) {
     for (range_tombstone rt : list.slice(_schema, range)) {
-        if (trim_front) {
-            rt.trim_front(_schema, position_in_partition_view::for_range_start(range));
-        }
+        rt.trim_front(_schema, position_in_partition_view::for_range_start(range));
         _list.apply(_schema, std::move(rt));
     }
 }

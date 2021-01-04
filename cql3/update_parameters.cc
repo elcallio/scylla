@@ -83,7 +83,7 @@ class prefetch_data_builder {
     schema_ptr _schema;
     std::optional<partition_key> _pkey;
     // Number of regular rows in the current partition
-    uint32_t _row_count;
+    uint64_t _row_count;
 
     // Add partition key columns to the current full row
     void add_partition_key(update_parameters::prefetch_data::row& cells, const partition_key& key)
@@ -122,9 +122,7 @@ class prefetch_data_builder {
             auto ctype = static_pointer_cast<const collection_type_impl>(type);
             type = map_type_impl::get_instance(ctype->name_comparator(), ctype->value_comparator(), true);
         }
-        cell->with_linearized([&] (bytes_view cell_view) {
-            cells.cells.emplace(def.ordinal_id, type->deserialize(cell_view));
-        });
+        cells.cells.emplace(def.ordinal_id, type->deserialize(*cell));
     };
 public:
     prefetch_data_builder(schema_ptr s, update_parameters::prefetch_data& data, const query::partition_slice& ps)
@@ -134,12 +132,12 @@ public:
         , _row_count(0)
     { }
 
-    void accept_new_partition(const partition_key& key, uint32_t row_count) {
+    void accept_new_partition(const partition_key& key, uint64_t row_count) {
         _pkey = key;
         _row_count = row_count;
     }
 
-    void accept_new_partition(uint32_t row_count) {
+    void accept_new_partition(uint64_t row_count) {
         assert(0);
     }
 

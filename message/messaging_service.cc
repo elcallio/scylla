@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "message/messaging_service.hh"
@@ -34,6 +23,8 @@
 #include "query-request.hh"
 #include "query-result.hh"
 #include <seastar/rpc/rpc.hh>
+#include "canonical_mutation.hh"
+#include "schema_mutations.hh"
 #include "db/config.hh"
 #include "db/system_keyspace.hh"
 #include "db/view/view_update_backlog.hh"
@@ -97,8 +88,13 @@
 #include "flat_mutation_reader.hh"
 #include "streaming/stream_manager.hh"
 #include "streaming/stream_mutation_fragments_cmd.hh"
+#include "locator/snitch_base.hh"
 
 namespace netw {
+
+static_assert(!std::is_default_constructible_v<msg_addr>);
+static_assert(std::is_nothrow_copy_constructible_v<msg_addr>);
+static_assert(std::is_nothrow_move_constructible_v<msg_addr>);
 
 // thunk from rpc serializers to generate serializers
 template <typename T, typename Output>
@@ -125,7 +121,7 @@ void write(serializer s, Output& out, const lw_shared_ptr<T>& v) {
 }
 template <typename Input, typename T>
 lw_shared_ptr<T> read(serializer s, Input& in, boost::type<lw_shared_ptr<T>>) {
-    return make_lw_shared(read(s, in, boost::type<T>()));
+    return make_lw_shared<T>(read(s, in, boost::type<T>()));
 }
 
 static logging::logger mlogger("messaging_service");
@@ -188,12 +184,12 @@ constexpr int32_t messaging_service::current_version;
 
 distributed<messaging_service> _the_messaging_service;
 
-bool operator==(const msg_addr& x, const msg_addr& y) {
+bool operator==(const msg_addr& x, const msg_addr& y) noexcept {
     // Ignore cpu id for now since we do not really support shard to shard connections
     return x.addr == y.addr;
 }
 
-bool operator<(const msg_addr& x, const msg_addr& y) {
+bool operator<(const msg_addr& x, const msg_addr& y) noexcept {
     // Ignore cpu id for now since we do not really support shard to shard connections
     if (x.addr < y.addr) {
         return true;
@@ -206,7 +202,7 @@ std::ostream& operator<<(std::ostream& os, const msg_addr& x) {
     return os << x.addr << ":" << x.cpu_id;
 }
 
-size_t msg_addr::hash::operator()(const msg_addr& id) const {
+size_t msg_addr::hash::operator()(const msg_addr& id) const noexcept {
     // Ignore cpu id for now since we do not really support // shard to shard connections
     return std::hash<bytes_view>()(id.addr.bytes());
 }
@@ -278,9 +274,8 @@ future<> messaging_service::unregister_handler(messaging_verb verb) {
     return _rpc->unregister_handler(verb);
 }
 
-messaging_service::messaging_service(qos::service_level_controller& sl_controller, gms::inet_address ip, uint16_t port, bool listen_now)
-    : messaging_service(sl_controller, std::move(ip), port, encrypt_what::none, compress_what::none, tcp_nodelay_what::all, 0, nullptr, memory_config{1'000'000},
-            scheduling_config{}, false, listen_now)
+messaging_service::messaging_service(qos::service_level_controller& sl_controller, gms::inet_address ip, uint16_t port)
+    : messaging_service(sl_controller, config{std::move(ip), port}, scheduling_config{{{{}, "$default"}}, {}, {}}, nullptr)
 {}
 
 static
@@ -293,10 +288,27 @@ rpc_resource_limits(size_t memory_limit) {
     return limits;
 }
 
-void messaging_service::start_listen() {
-    bool listen_to_bc = _should_listen_to_broadcast_address && _listen_address != utils::fb_utilities::get_broadcast_address();
+future<> messaging_service::start_listen() {
+    if (_credentials_builder && !_credentials) {
+        return _credentials_builder->build_reloadable_server_credentials([](const std::unordered_set<sstring>& files, std::exception_ptr ep) {
+            if (ep) {
+                mlogger.warn("Exception loading {}: {}", files, ep);
+            } else {
+                mlogger.info("Reloaded {}", files);
+            }
+        }).then([this](shared_ptr<seastar::tls::server_credentials> creds) {
+            _credentials = std::move(creds);
+            do_start_listen();
+        });
+    }
+    do_start_listen();
+    return make_ready_future<>();
+}
+
+void messaging_service::do_start_listen() {
+    bool listen_to_bc = _cfg.listen_on_broadcast_address && _cfg.ip != utils::fb_utilities::get_broadcast_address();
     rpc::server_options so;
-    if (_compress_what != compress_what::none) {
+    if (_cfg.compress != compress_what::none) {
         so.compressor_factory = &compressor_factory;
     }
     so.load_balancing_algorithm = server_socket::load_balancing_algorithm::port;
@@ -304,20 +316,20 @@ void messaging_service::start_listen() {
     // FIXME: we don't set so.tcp_nodelay, because we can't tell at this point whether the connection will come from a
     //        local or remote datacenter, and whether or not the connection will be used for gossip. We can fix
     //        the first by wrapping its server_socket, but not the second.
-    auto limits = rpc_resource_limits(_mcfg.rpc_memory_limit);
+    auto limits = rpc_resource_limits(_cfg.rpc_memory_limit);
     limits.isolate_connection = [this] (sstring isolation_cookie) {
         rpc::isolation_config cfg;
-        cfg.sched_group = _sl_controller.get_scheduling_group(isolation_cookie);
+        cfg.sched_group = scheduling_group_for_isolation_cookie(isolation_cookie);
         return cfg;
     };
     if (!_server[0]) {
         auto listen = [&] (const gms::inet_address& a, rpc::streaming_domain_type sdomain) {
             so.streaming_domain = sdomain;
-            auto addr = socket_address{a, _port};
+            auto addr = socket_address{a, _cfg.port};
             return std::unique_ptr<rpc_protocol_server_wrapper>(new rpc_protocol_server_wrapper(*_rpc,
                     so, addr, limits));
         };
-        _server[0] = listen(_listen_address, rpc::streaming_domain_type(0x55AA));
+        _server[0] = listen(_cfg.ip, rpc::streaming_domain_type(0x55AA));
         if (listen_to_bc) {
             _server[1] = listen(utils::fb_utilities::get_broadcast_address(), rpc::streaming_domain_type(0x66BB));
         }
@@ -328,18 +340,21 @@ void messaging_service::start_listen() {
             so.streaming_domain = sdomain;
             return std::unique_ptr<rpc_protocol_server_wrapper>(
                     [this, &so, &a, limits] () -> std::unique_ptr<rpc_protocol_server_wrapper>{
-                if (_encrypt_what == encrypt_what::none) {
+                if (_cfg.encrypt == encrypt_what::none) {
                     return nullptr;
+                }
+                if (!_credentials) {
+                    throw std::invalid_argument("No certificates specified for encrypted service");
                 }
                 listen_options lo;
                 lo.reuse_address = true;
                 lo.lba =  server_socket::load_balancing_algorithm::port;
-                auto addr = socket_address{a, _ssl_port};
+                auto addr = socket_address{a, _cfg.ssl_port};
                 return std::make_unique<rpc_protocol_server_wrapper>(*_rpc,
                         so, seastar::tls::listen(_credentials, addr, lo), limits);
             }());
         };
-        _server_tls[0] = listen(_listen_address, rpc::streaming_domain_type(0x77CC));
+        _server_tls[0] = listen(_cfg.ip, rpc::streaming_domain_type(0x77CC));
         if (listen_to_bc) {
             _server_tls[1] = listen(utils::fb_utilities::get_broadcast_address(), rpc::streaming_domain_type(0x88DD));
         }
@@ -347,50 +362,38 @@ void messaging_service::start_listen() {
     // Do this on just cpu 0, to avoid duplicate logs.
     if (this_shard_id() == 0) {
         if (_server_tls[0]) {
-            mlogger.info("Starting Encrypted Messaging Service on SSL port {}", _ssl_port);
+            mlogger.info("Starting Encrypted Messaging Service on SSL port {}", _cfg.ssl_port);
         }
-        mlogger.info("Starting Messaging Service on port {}", _port);
+        mlogger.info("Starting Messaging Service on port {}", _cfg.port);
     }
 }
 
-messaging_service::messaging_service(qos::service_level_controller& sl_controller
-        , gms::inet_address ip
-        , uint16_t port
-        , encrypt_what ew
-        , compress_what cw
-        , tcp_nodelay_what tnw
-        , uint16_t ssl_port
-        , std::shared_ptr<seastar::tls::credentials_builder> credentials
-        , messaging_service::memory_config mcfg
-        , scheduling_config scfg
-        , bool sltba
-        , bool listen_now)
-    :_listen_address(ip)
-    , _port(port)
-    , _ssl_port(ssl_port)
-    , _encrypt_what(ew)
-    , _compress_what(cw)
-    , _tcp_nodelay_what(tnw)
-    , _should_listen_to_broadcast_address(sltba)
+messaging_service::messaging_service(qos::service_level_controller& sl_controller,
+        config cfg, scheduling_config scfg, std::shared_ptr<seastar::tls::credentials_builder> credentials)
+    : _cfg(std::move(cfg))
     , _rpc(new rpc_protocol_wrapper(serializer { }))
-    , _credentials(credentials ? credentials->build_server_credentials() : nullptr)
-    , _mcfg(mcfg)
+    , _credentials_builder(credentials ? std::make_unique<seastar::tls::credentials_builder>(*credentials) : nullptr)
+    , _clients(2 + scfg.statement_tenants.size() * 2)
     , _scheduling_config(scfg)
+    , _scheduling_info_for_connection_index(initial_scheduling_info())
     , _sl_controller(sl_controller)
 {
-    _rpc->set_logger([] (const sstring& log) {
-            rpc_logger.info("{}", log);
-    });
+    _rpc->set_logger(&rpc_logger);
+
+    // this initialization should be done before any handler registration
+    // this is because register_handler calls to: scheduling_group_for_verb
+    // which in turn relies on _connection_index_for_tenant to be initialized.
+    _connection_index_for_tenant.reserve(_scheduling_config.statement_tenants.size());
+    for (unsigned i = 0; i <  _scheduling_config.statement_tenants.size(); ++i) {
+        _connection_index_for_tenant.push_back({_scheduling_config.statement_tenants[i].sched_group, i});
+    }
+
     register_handler(this, messaging_verb::CLIENT_ID, [] (rpc::client_info& ci, gms::inet_address broadcast_address, uint32_t src_cpu_id, rpc::optional<uint64_t> max_result_size) {
         ci.attach_auxiliary("baddr", broadcast_address);
         ci.attach_auxiliary("src_cpu_id", src_cpu_id);
         ci.attach_auxiliary("max_result_size", max_result_size.value_or(query::result_memory_limiter::maximum_result_size));
         return rpc::no_wait;
     });
-
-    if (listen_now) {
-        start_listen();
-    }
 }
 
 msg_addr messaging_service::get_source(const rpc::client_info& cinfo) {
@@ -403,11 +406,11 @@ msg_addr messaging_service::get_source(const rpc::client_info& cinfo) {
 messaging_service::~messaging_service() = default;
 
 uint16_t messaging_service::port() {
-    return _port;
+    return _cfg.port;
 }
 
 gms::inet_address messaging_service::listen_address() {
-    return _listen_address;
+    return _cfg.ip;
 }
 
 static future<> stop_servers(std::array<std::unique_ptr<messaging_service::rpc_protocol_server_wrapper>, 2>& servers) {
@@ -432,9 +435,27 @@ future<> messaging_service::stop_client() {
     });
 }
 
-future<> messaging_service::stop() {
-    _stopping = true;
+future<> messaging_service::shutdown() {
+    _shutting_down = true;
     return when_all(stop_nontls_server(), stop_tls_server(), stop_client()).discard_result();
+}
+
+future<> messaging_service::stop() {
+    return unregister_handler(messaging_verb::CLIENT_ID).then([this] {
+        if (_rpc->has_handlers()) {
+            mlogger.error("RPC server still has handlers registered");
+            for (auto verb = messaging_verb::MUTATION; verb < messaging_verb::LAST;
+                    verb = messaging_verb(int(verb) + 1)) {
+                if (_rpc->has_handler(verb)) {
+                    mlogger.error(" - {}", verb);
+                }
+            }
+
+            std::abort();
+        }
+
+        return make_ready_future<>();
+    });
 }
 
 rpc::no_wait_type messaging_service::no_wait() {
@@ -444,24 +465,6 @@ rpc::no_wait_type messaging_service::no_wait() {
 
 static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     switch (verb) {
-    case messaging_verb::CLIENT_ID:
-    case messaging_verb::MUTATION:
-    case messaging_verb::READ_DATA:
-    case messaging_verb::READ_MUTATION_DATA:
-    case messaging_verb::READ_DIGEST:
-    case messaging_verb::GOSSIP_DIGEST_ACK:
-    case messaging_verb::DEFINITIONS_UPDATE:
-    case messaging_verb::TRUNCATE:
-    case messaging_verb::MIGRATION_REQUEST:
-    case messaging_verb::SCHEMA_CHECK:
-    case messaging_verb::COUNTER_MUTATION:
-    // Use the same RPC client for light weight transaction
-    // protocol steps as for standard mutations and read requests.
-    case messaging_verb::PAXOS_PREPARE:
-    case messaging_verb::PAXOS_ACCEPT:
-    case messaging_verb::PAXOS_LEARN:
-    case messaging_verb::PAXOS_PRUNE:
-        return 0;
     // GET_SCHEMA_VERSION is sent from read/mutate verbs so should be
     // sent on a different connection to avoid potential deadlocks
     // as well as reduce latency as there are potentially many requests
@@ -470,11 +473,12 @@ static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     case messaging_verb::GOSSIP_DIGEST_ACK2:
     case messaging_verb::GOSSIP_SHUTDOWN:
     case messaging_verb::GOSSIP_ECHO:
+    case messaging_verb::GOSSIP_GET_ENDPOINT_STATES:
     case messaging_verb::GET_SCHEMA_VERSION:
-        return 1;
+        return 0;
     case messaging_verb::PREPARE_MESSAGE:
     case messaging_verb::PREPARE_DONE_MESSAGE:
-    case messaging_verb::STREAM_MUTATION:
+    case messaging_verb::UNUSED__STREAM_MUTATION:
     case messaging_verb::STREAM_MUTATION_DONE:
     case messaging_verb::COMPLETE_MESSAGE:
     case messaging_verb::REPLICATION_FINISHED:
@@ -493,7 +497,26 @@ static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     case messaging_verb::REPAIR_GET_ROW_DIFF_WITH_RPC_STREAM:
     case messaging_verb::REPAIR_PUT_ROW_DIFF_WITH_RPC_STREAM:
     case messaging_verb::REPAIR_GET_FULL_ROW_HASHES_WITH_RPC_STREAM:
+    case messaging_verb::NODE_OPS_CMD:
     case messaging_verb::HINT_MUTATION:
+        return 1;
+    case messaging_verb::CLIENT_ID:
+    case messaging_verb::MUTATION:
+    case messaging_verb::READ_DATA:
+    case messaging_verb::READ_MUTATION_DATA:
+    case messaging_verb::READ_DIGEST:
+    case messaging_verb::GOSSIP_DIGEST_ACK:
+    case messaging_verb::DEFINITIONS_UPDATE:
+    case messaging_verb::TRUNCATE:
+    case messaging_verb::MIGRATION_REQUEST:
+    case messaging_verb::SCHEMA_CHECK:
+    case messaging_verb::COUNTER_MUTATION:
+    // Use the same RPC client for light weight transaction
+    // protocol steps as for standard mutations and read requests.
+    case messaging_verb::PAXOS_PREPARE:
+    case messaging_verb::PAXOS_ACCEPT:
+    case messaging_verb::PAXOS_LEARN:
+    case messaging_verb::PAXOS_PRUNE:
         return 2;
     case messaging_verb::MUTATION_DONE:
     case messaging_verb::MUTATION_FAILED:
@@ -513,32 +536,133 @@ static constexpr std::array<uint8_t, static_cast<size_t>(messaging_verb::LAST)> 
 
 static std::array<uint8_t, static_cast<size_t>(messaging_verb::LAST)> s_rpc_client_idx_table = make_rpc_client_idx_table();
 
-unsigned messaging_service::get_rpc_client_idx(messaging_verb verb) {
+unsigned
+messaging_service::get_rpc_client_idx(messaging_verb verb) {
     auto idx = s_rpc_client_idx_table[static_cast<size_t>(verb)];
-    std::optional<sstring> service_level = _sl_controller.get_active_service_level();
-    if (service_level) {
-        auto it = _service_level_to_client_idx.find(*service_level);
-        unsigned new_idx;
-        if (it != _service_level_to_client_idx.end()) {
-            new_idx = it->second;
-        } else {
-            new_idx = add_service_level_config(*service_level);
-        }
-        return new_idx + (idx != 0);
+
+    if (idx < 2) {
+        return idx;
     }
-    return idx;
+
+    // this is just a workaround for a wrong initialization order in messaging_service's
+    // constructor that causes _connection_index_for_tenant to be queried before it is
+    // initialized. This WA makes the behaviour match OSS in this case and it should be
+    // removed once it is fixed in OSS. If it isn't removed the behaviour will still be
+    // correct but we will lose cycles on an unnecesairy check.
+    if (_connection_index_for_tenant.size() == 0) {
+        return idx;
+    }
+    // A statement or statement-ack verb
+    const auto curr_sched_group = current_scheduling_group();
+    for (unsigned i = 0; i < _connection_index_for_tenant.size(); ++i) {
+        if (_connection_index_for_tenant[i].sched_group == curr_sched_group) {
+            // i == 0: the default tenant maps to the default client indexes of 2 and 3.
+            idx += i * 2;
+            return idx;
+        }
+
+    }
+
+    // if we got here - it means that two conditions are met:
+    // 1. We are trying to get a client for a statement/statement_ack verb.
+    // 2. We are running in a scheduling group that is not assigned to one of the
+    // static tenants (e.g $system)
+    // If this scheduling group is of one of the system's static statement tenants we
+    // whould have caught it in the loop above.
+    // The other posibility is that we are running in a scheduling group belongs to
+    // a service level, maybe a deleted one, this is why it is possible that we will
+    // not find the service level name.
+
+    std::optional<sstring> service_level = _sl_controller.get_active_service_level();
+    scheduling_group sg_for_tenant = curr_sched_group;
+    if (!service_level) {
+        service_level = qos::service_level_controller::default_service_level_name;
+        sg_for_tenant = _sl_controller.get_default_scheduling_group();
+    }
+    auto it = _dynamic_tenants_to_client_idx.find(*service_level);
+    // the second part of this condition checks that the service level didn't "suddenly"
+    // changed scheduling group. If it did, it means probably that it was dropped and
+    // added again, if it happens we will update it's connection indexes since it is
+    // basically a new tenant with the same name.
+    if (it == _dynamic_tenants_to_client_idx.end() ||
+            _scheduling_info_for_connection_index[it->second].sched_group != sg_for_tenant) {
+        return add_statement_tenant(*service_level,sg_for_tenant) + (idx - 2);
+    }
+    return it->second;
 }
+
+std::vector<messaging_service::scheduling_info_for_connection_index>
+messaging_service::initial_scheduling_info() const {
+    if (_scheduling_config.statement_tenants.empty()) {
+        throw std::runtime_error("messaging_service::initial_scheduling_info(): must have at least one tenant configured");
+    }
+    auto sched_infos = std::vector<scheduling_info_for_connection_index>({
+        { _scheduling_config.gossip, "gossip" },
+        { _scheduling_config.streaming, "streaming", },
+    });
+    sched_infos.reserve(sched_infos.size() + _scheduling_config.statement_tenants.size() * 2);
+    for (const auto& tenant : _scheduling_config.statement_tenants) {
+        sched_infos.push_back({ tenant.sched_group, "statement:" + tenant.name });
+        sched_infos.push_back({ tenant.sched_group, "statement-ack:" + tenant.name });
+    }
+    return sched_infos;
+};
 
 scheduling_group
 messaging_service::scheduling_group_for_verb(messaging_verb verb) const {
-    static const scheduling_group scheduling_config::*idx_to_group[] = {
-        &scheduling_config::statement,
-        &scheduling_config::gossip,
-        &scheduling_config::streaming,
-        &scheduling_config::statement,
-    };
-    return _scheduling_config.*(idx_to_group[s_rpc_client_idx_table[(size_t)verb]]);
+    // We are not using get_rpc_client_idx() because it figures out the client
+    // index based on the current scheduling group, which is relevant when
+    // selecting the right client for sending a message, but is not relevant
+    // when registering handlers.
+    const auto idx = s_rpc_client_idx_table[static_cast<size_t>(verb)];
+    return _scheduling_info_for_connection_index[idx].sched_group;
 }
+
+scheduling_group
+messaging_service::scheduling_group_for_isolation_cookie(const sstring& isolation_cookie) const {
+    scheduling_group ret;
+
+    // Once per connection, so a loop is fine.
+    for (auto&& info : _scheduling_info_for_connection_index) {
+        if (info.isolation_cookie == isolation_cookie) {
+            ret =  info.sched_group;
+            break;
+        }
+    }
+
+    // We first check if this is a statement isolation cookie - it it is we will search for the
+    // appropriate service level in the service_level_controlle since in can be that
+    // _scheduling_info_for_connection_index is not yet updated (drop readd case for example)
+    // in the future we will only fall back here for new service levels that havn't been referenced
+    // before.
+    if (isolation_cookie.find("statement:") == 0 || isolation_cookie.find("statement-ack:") == 0) {
+        // if the statement cookie is not present, the service level controller will return the default service
+        // level scheduling group.
+        std::string service_level_name = isolation_cookie.substr(std::string(isolation_cookie).find_first_of(':') + 1);
+        ret = _sl_controller.get_scheduling_group(service_level_name);
+    } else if (_sl_controller.has_service_level(isolation_cookie)) {
+        // Backward Compatibility Code - This entire "else if" block should be removed
+        // in the major version that follows the one that contains this code.
+        // When upgrading from an older enterprise version the isolation cookie is not
+        // prefixed with "statement:", so an isolation cookie that comes from an older node
+        // will simply contain the service level name.
+        // we do an extra step to be also future proof and make sure it is indeed a service
+        // level's name, since if this is the older version and we upgrade to a new one
+        // we could have more connection classes (eg: streaming,gossip etc...) and we wouldn't
+        // want it to overload the default statement's scheduling group.
+        // it is not bulet proof in the sense that if a new tenant class happens to have the exact
+        // name as one of the service levels it will be diverted to the default statement scheduling
+        // group but it has a small chance of happening.
+        ret =  _sl_controller.get_scheduling_group(isolation_cookie);
+    } else {
+        // Client is using a new connection class that the server doesn't recognize yet.
+        // Assume it's important, after server upgrade we'll recognize it.
+        ret = default_scheduling_group();
+    }
+
+    return ret;
+}
+
 
 /**
  * Get an IP for a given endpoint to connect to
@@ -584,7 +708,7 @@ void messaging_service::cache_preferred_ip(gms::inet_address ep, gms::inet_addre
 }
 
 shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::get_rpc_client(messaging_verb verb, msg_addr id) {
-    assert(!_stopping);
+    assert(!_shutting_down);
     auto idx = get_rpc_client_idx(verb);
     auto it = _clients[idx].find(id);
 
@@ -596,16 +720,16 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
         remove_error_rpc_client(verb, id);
     }
     auto must_encrypt = [&id, this] {
-        if (_encrypt_what == encrypt_what::none) {
+        if (_cfg.encrypt == encrypt_what::none) {
             return false;
         }
-        if (_encrypt_what == encrypt_what::all) {
+        if (_cfg.encrypt == encrypt_what::all) {
             return true;
         }
 
         auto& snitch_ptr = locator::i_endpoint_snitch::get_local_snitch_ptr();
 
-        if (_encrypt_what == encrypt_what::dc) {
+        if (_cfg.encrypt == encrypt_what::dc) {
             return snitch_ptr->get_datacenter(id.addr)
                             != snitch_ptr->get_datacenter(utils::fb_utilities::get_broadcast_address());
         }
@@ -614,11 +738,11 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
     }();
 
     auto must_compress = [&id, this] {
-        if (_compress_what == compress_what::none) {
+        if (_cfg.compress == compress_what::none) {
             return false;
         }
 
-        if (_compress_what == compress_what::dc) {
+        if (_cfg.compress == compress_what::dc) {
             auto& snitch_ptr = locator::i_endpoint_snitch::get_local_snitch_ptr();
             return snitch_ptr->get_datacenter(id.addr)
                             != snitch_ptr->get_datacenter(utils::fb_utilities::get_broadcast_address());
@@ -631,7 +755,7 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
         if (idx == 1) {
             return true; // gossip
         }
-        if (_tcp_nodelay_what == tcp_nodelay_what::local) {
+        if (_cfg.tcp_nodelay == tcp_nodelay_what::local) {
             auto& snitch_ptr = locator::i_endpoint_snitch::get_local_snitch_ptr();
             return snitch_ptr->get_datacenter(id.addr)
                             == snitch_ptr->get_datacenter(utils::fb_utilities::get_broadcast_address());
@@ -639,7 +763,7 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
         return true;
     }();
 
-    auto remote_addr = socket_address(get_preferred_ip(id.addr), must_encrypt ? _ssl_port : _port);
+    auto remote_addr = socket_address(get_preferred_ip(id.addr), must_encrypt ? _cfg.ssl_port : _cfg.port);
 
     rpc::client_options opts;
     // send keepalive messages each minute if connection is idle, drop connection after 10 failures
@@ -649,16 +773,11 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
     }
     opts.tcp_nodelay = must_tcp_nodelay;
     opts.reuseaddr = true;
-
-    // isolate connections meant for statements
+    // We send cookies only for non-default statement tenant clients.
     if (idx > 3) {
-        std::optional<sstring> service_level = _sl_controller.get_active_service_level();
-        // this check is redundant since if we have an index greater than 3 it means that we are in an active service level for sure,
-        // but i put it here for compeleteness - it doesn't happen a lot anyway (only on new rpc creation).
-        if (service_level) {
-            opts.isolation_cookie = *service_level;
-        }
+        opts.isolation_cookie = _scheduling_info_for_connection_index[idx].isolation_cookie;
     }
+
     auto client = must_encrypt ?
                     ::make_shared<rpc_protocol_client_wrapper>(*_rpc, std::move(opts),
                                     remote_addr, socket_address(), _credentials) :
@@ -678,7 +797,7 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
 }
 
 bool messaging_service::remove_rpc_client_one(clients_map& clients, msg_addr id, bool dead_only) {
-    if (_stopping) {
+    if (_shutting_down) {
         // if messaging service is in a processed of been stopped no need to
         // stop and remove connection here since they are being stopped already
         // and we'll just interfere
@@ -726,17 +845,18 @@ rpc::sink<int32_t> messaging_service::make_sink_for_stream_mutation_fragments(rp
     return source.make_sink<netw::serializer, int32_t>();
 }
 
-future<rpc::sink<frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd>, rpc::source<int32_t>>
+future<std::tuple<rpc::sink<frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd>, rpc::source<int32_t>>>
 messaging_service::make_sink_and_source_for_stream_mutation_fragments(utils::UUID schema_id, utils::UUID plan_id, utils::UUID cf_id, uint64_t estimated_partitions, streaming::stream_reason reason, msg_addr id) {
-    if (is_stopping()) {
-        return make_exception_future<rpc::sink<frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd>, rpc::source<int32_t>>(rpc::closed_error());
+    using value_type = std::tuple<rpc::sink<frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd>, rpc::source<int32_t>>;
+    if (is_shutting_down()) {
+        return make_exception_future<value_type>(rpc::closed_error());
     }
     auto rpc_client = get_rpc_client(messaging_verb::STREAM_MUTATION_FRAGMENTS, id);
     return rpc_client->make_stream_sink<netw::serializer, frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd>().then([this, plan_id, schema_id, cf_id, estimated_partitions, reason, rpc_client] (rpc::sink<frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd> sink) mutable {
         auto rpc_handler = rpc()->make_client<rpc::source<int32_t> (utils::UUID, utils::UUID, utils::UUID, uint64_t, streaming::stream_reason, rpc::sink<frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd>)>(messaging_verb::STREAM_MUTATION_FRAGMENTS);
         return rpc_handler(*rpc_client , plan_id, schema_id, cf_id, estimated_partitions, reason, sink).then_wrapped([sink, rpc_client] (future<rpc::source<int32_t>> source) mutable {
             return (source.failed() ? sink.close() : make_ready_future<>()).then([sink = std::move(sink), source = std::move(source)] () mutable {
-                return make_ready_future<rpc::sink<frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd>, rpc::source<int32_t>>(std::move(sink), std::move(source.get0()));
+                return make_ready_future<value_type>(value_type(std::move(sink), std::move(source.get0())));
             });
         });
     });
@@ -746,25 +866,30 @@ void messaging_service::register_stream_mutation_fragments(std::function<future<
     register_handler(this, messaging_verb::STREAM_MUTATION_FRAGMENTS, std::move(func));
 }
 
+future<> messaging_service::unregister_stream_mutation_fragments() {
+    return unregister_handler(messaging_verb::STREAM_MUTATION_FRAGMENTS);
+}
+
 template<class SinkType, class SourceType>
-future<rpc::sink<SinkType>, rpc::source<SourceType>>
+future<std::tuple<rpc::sink<SinkType>, rpc::source<SourceType>>>
 do_make_sink_source(messaging_verb verb, uint32_t repair_meta_id, shared_ptr<messaging_service::rpc_protocol_client_wrapper> rpc_client, std::unique_ptr<messaging_service::rpc_protocol_wrapper>& rpc) {
+    using value_type = std::tuple<rpc::sink<SinkType>, rpc::source<SourceType>>;
     return rpc_client->make_stream_sink<netw::serializer, SinkType>().then([&rpc, verb, repair_meta_id, rpc_client] (rpc::sink<SinkType> sink) mutable {
         auto rpc_handler = rpc->make_client<rpc::source<SourceType> (uint32_t, rpc::sink<SinkType>)>(verb);
         return rpc_handler(*rpc_client, repair_meta_id, sink).then_wrapped([sink, rpc_client] (future<rpc::source<SourceType>> source) mutable {
             return (source.failed() ? sink.close() : make_ready_future<>()).then([sink = std::move(sink), source = std::move(source)] () mutable {
-                return make_ready_future<rpc::sink<SinkType>, rpc::source<SourceType>>(std::move(sink), std::move(source.get0()));
+                return make_ready_future<value_type>(value_type(std::move(sink), std::move(source.get0())));
             });
         });
     });
 }
 
 // Wrapper for REPAIR_GET_ROW_DIFF_WITH_RPC_STREAM
-future<rpc::sink<repair_hash_with_cmd>, rpc::source<repair_row_on_wire_with_cmd>>
+future<std::tuple<rpc::sink<repair_hash_with_cmd>, rpc::source<repair_row_on_wire_with_cmd>>>
 messaging_service::make_sink_and_source_for_repair_get_row_diff_with_rpc_stream(uint32_t repair_meta_id, msg_addr id) {
     auto verb = messaging_verb::REPAIR_GET_ROW_DIFF_WITH_RPC_STREAM;
-    if (is_stopping()) {
-        return make_exception_future<rpc::sink<repair_hash_with_cmd>, rpc::source<repair_row_on_wire_with_cmd>>(rpc::closed_error());
+    if (is_shutting_down()) {
+        return make_exception_future<std::tuple<rpc::sink<repair_hash_with_cmd>, rpc::source<repair_row_on_wire_with_cmd>>>(rpc::closed_error());
     }
     auto rpc_client = get_rpc_client(verb, id);
     return do_make_sink_source<repair_hash_with_cmd, repair_row_on_wire_with_cmd>(verb, repair_meta_id, std::move(rpc_client), rpc());
@@ -777,13 +902,16 @@ rpc::sink<repair_row_on_wire_with_cmd> messaging_service::make_sink_for_repair_g
 void messaging_service::register_repair_get_row_diff_with_rpc_stream(std::function<future<rpc::sink<repair_row_on_wire_with_cmd>> (const rpc::client_info& cinfo, uint32_t repair_meta_id, rpc::source<repair_hash_with_cmd> source)>&& func) {
     register_handler(this, messaging_verb::REPAIR_GET_ROW_DIFF_WITH_RPC_STREAM, std::move(func));
 }
+future<> messaging_service::unregister_repair_get_row_diff_with_rpc_stream() {
+    return unregister_handler(messaging_verb::REPAIR_GET_ROW_DIFF_WITH_RPC_STREAM);
+}
 
 // Wrapper for REPAIR_PUT_ROW_DIFF_WITH_RPC_STREAM
-future<rpc::sink<repair_row_on_wire_with_cmd>, rpc::source<repair_stream_cmd>>
+future<std::tuple<rpc::sink<repair_row_on_wire_with_cmd>, rpc::source<repair_stream_cmd>>>
 messaging_service::make_sink_and_source_for_repair_put_row_diff_with_rpc_stream(uint32_t repair_meta_id, msg_addr id) {
     auto verb = messaging_verb::REPAIR_PUT_ROW_DIFF_WITH_RPC_STREAM;
-    if (is_stopping()) {
-        return make_exception_future<rpc::sink<repair_row_on_wire_with_cmd>, rpc::source<repair_stream_cmd>>(rpc::closed_error());
+    if (is_shutting_down()) {
+        return make_exception_future<std::tuple<rpc::sink<repair_row_on_wire_with_cmd>, rpc::source<repair_stream_cmd>>>(rpc::closed_error());
     }
     auto rpc_client = get_rpc_client(verb, id);
     return do_make_sink_source<repair_row_on_wire_with_cmd, repair_stream_cmd>(verb, repair_meta_id, std::move(rpc_client), rpc());
@@ -796,13 +924,16 @@ rpc::sink<repair_stream_cmd> messaging_service::make_sink_for_repair_put_row_dif
 void messaging_service::register_repair_put_row_diff_with_rpc_stream(std::function<future<rpc::sink<repair_stream_cmd>> (const rpc::client_info& cinfo, uint32_t repair_meta_id, rpc::source<repair_row_on_wire_with_cmd> source)>&& func) {
     register_handler(this, messaging_verb::REPAIR_PUT_ROW_DIFF_WITH_RPC_STREAM, std::move(func));
 }
+future<> messaging_service::unregister_repair_put_row_diff_with_rpc_stream() {
+    return unregister_handler(messaging_verb::REPAIR_PUT_ROW_DIFF_WITH_RPC_STREAM);
+}
 
 // Wrapper for REPAIR_GET_FULL_ROW_HASHES_WITH_RPC_STREAM
-future<rpc::sink<repair_stream_cmd>, rpc::source<repair_hash_with_cmd>>
+future<std::tuple<rpc::sink<repair_stream_cmd>, rpc::source<repair_hash_with_cmd>>>
 messaging_service::make_sink_and_source_for_repair_get_full_row_hashes_with_rpc_stream(uint32_t repair_meta_id, msg_addr id) {
     auto verb = messaging_verb::REPAIR_GET_FULL_ROW_HASHES_WITH_RPC_STREAM;
-    if (is_stopping()) {
-        return make_exception_future<rpc::sink<repair_stream_cmd>, rpc::source<repair_hash_with_cmd>>(rpc::closed_error());
+    if (is_shutting_down()) {
+        return make_exception_future<std::tuple<rpc::sink<repair_stream_cmd>, rpc::source<repair_hash_with_cmd>>>(rpc::closed_error());
     }
     auto rpc_client = get_rpc_client(verb, id);
     return do_make_sink_source<repair_stream_cmd, repair_hash_with_cmd>(verb, repair_meta_id, std::move(rpc_client), rpc());
@@ -815,12 +946,15 @@ rpc::sink<repair_hash_with_cmd> messaging_service::make_sink_for_repair_get_full
 void messaging_service::register_repair_get_full_row_hashes_with_rpc_stream(std::function<future<rpc::sink<repair_hash_with_cmd>> (const rpc::client_info& cinfo, uint32_t repair_meta_id, rpc::source<repair_stream_cmd> source)>&& func) {
     register_handler(this, messaging_verb::REPAIR_GET_FULL_ROW_HASHES_WITH_RPC_STREAM, std::move(func));
 }
+future<> messaging_service::unregister_repair_get_full_row_hashes_with_rpc_stream() {
+    return unregister_handler(messaging_verb::REPAIR_GET_FULL_ROW_HASHES_WITH_RPC_STREAM);
+}
 
 // Send a message for verb
 template <typename MsgIn, typename... MsgOut>
 auto send_message(messaging_service* ms, messaging_verb verb, msg_addr id, MsgOut&&... msg) {
     auto rpc_handler = ms->rpc()->make_client<MsgIn(MsgOut...)>(verb);
-    if (ms->is_stopping()) {
+    if (ms->is_shutting_down()) {
         using futurator = futurize<std::result_of_t<decltype(rpc_handler)(rpc_protocol::client&, MsgOut...)>>;
         return futurator::make_exception_future(rpc::closed_error());
     }
@@ -849,7 +983,7 @@ auto send_message(messaging_service* ms, messaging_verb verb, msg_addr id, MsgOu
 template <typename MsgIn, typename Timeout, typename... MsgOut>
 auto send_message_timeout(messaging_service* ms, messaging_verb verb, msg_addr id, Timeout timeout, MsgOut&&... msg) {
     auto rpc_handler = ms->rpc()->make_client<MsgIn(MsgOut...)>(verb);
-    if (ms->is_stopping()) {
+    if (ms->is_shutting_down()) {
         using futurator = futurize<std::result_of_t<decltype(rpc_handler)(rpc_protocol::client&, MsgOut...)>>;
         return futurator::make_exception_future(rpc::closed_error());
     }
@@ -898,6 +1032,9 @@ future<streaming::prepare_message> messaging_service::send_prepare_message(msg_a
     return send_message<streaming::prepare_message>(this, messaging_verb::PREPARE_MESSAGE, id,
         std::move(msg), plan_id, std::move(description), reason);
 }
+future<> messaging_service::unregister_prepare_message() {
+    return unregister_handler(messaging_verb::PREPARE_MESSAGE);
+}
 
 // PREPARE_DONE_MESSAGE
 void messaging_service::register_prepare_done_message(std::function<future<> (const rpc::client_info& cinfo, UUID plan_id, unsigned dst_cpu_id)>&& func) {
@@ -907,14 +1044,8 @@ future<> messaging_service::send_prepare_done_message(msg_addr id, UUID plan_id,
     return send_message<void>(this, messaging_verb::PREPARE_DONE_MESSAGE, id,
         plan_id, dst_cpu_id);
 }
-
-// STREAM_MUTATION
-void messaging_service::register_stream_mutation(std::function<future<> (const rpc::client_info& cinfo, UUID plan_id, frozen_mutation fm, unsigned dst_cpu_id, rpc::optional<bool> fragmented, rpc::optional<streaming::stream_reason> reason)>&& func) {
-    register_handler(this, messaging_verb::STREAM_MUTATION, std::move(func));
-}
-future<> messaging_service::send_stream_mutation(msg_addr id, UUID plan_id, frozen_mutation fm, unsigned dst_cpu_id, bool fragmented, streaming::stream_reason reason) {
-    return send_message<void>(this, messaging_verb::STREAM_MUTATION, id,
-        plan_id, std::move(fm), dst_cpu_id, fragmented, reason);
+future<> messaging_service::unregister_prepare_done_message() {
+    return unregister_handler(messaging_verb::PREPARE_DONE_MESSAGE);
 }
 
 // STREAM_MUTATION_DONE
@@ -931,6 +1062,9 @@ future<> messaging_service::send_stream_mutation_done(msg_addr id, UUID plan_id,
     return send_message<void>(this, messaging_verb::STREAM_MUTATION_DONE, id,
         plan_id, std::move(ranges), cf_id, dst_cpu_id);
 }
+future<> messaging_service::unregister_stream_mutation_done() {
+    return unregister_handler(messaging_verb::STREAM_MUTATION_DONE);
+}
 
 // COMPLETE_MESSAGE
 void messaging_service::register_complete_message(std::function<future<> (const rpc::client_info& cinfo, UUID plan_id, unsigned dst_cpu_id, rpc::optional<bool> failed)>&& func) {
@@ -940,6 +1074,9 @@ future<> messaging_service::send_complete_message(msg_addr id, UUID plan_id, uns
     return send_message<void>(this, messaging_verb::COMPLETE_MESSAGE, id,
         plan_id, dst_cpu_id, failed);
 }
+future<> messaging_service::unregister_complete_message() {
+    return unregister_handler(messaging_verb::COMPLETE_MESSAGE);
+}
 
 void messaging_service::register_gossip_echo(std::function<future<> ()>&& func) {
     register_handler(this, messaging_verb::GOSSIP_ECHO, std::move(func));
@@ -948,7 +1085,7 @@ future<> messaging_service::unregister_gossip_echo() {
     return unregister_handler(netw::messaging_verb::GOSSIP_ECHO);
 }
 future<> messaging_service::send_gossip_echo(msg_addr id) {
-    return send_message_timeout<void>(this, messaging_verb::GOSSIP_ECHO, std::move(id), 3000ms);
+    return send_message_timeout<void>(this, messaging_verb::GOSSIP_ECHO, std::move(id), 15000ms);
 }
 
 void messaging_service::register_gossip_shutdown(std::function<rpc::no_wait_type (inet_address from)>&& func) {
@@ -992,6 +1129,16 @@ future<> messaging_service::unregister_gossip_digest_ack2() {
 }
 future<> messaging_service::send_gossip_digest_ack2(msg_addr id, gossip_digest_ack2 msg) {
     return send_message_oneway(this, messaging_verb::GOSSIP_DIGEST_ACK2, std::move(id), std::move(msg));
+}
+
+void messaging_service::register_gossip_get_endpoint_states(std::function<future<gms::gossip_get_endpoint_states_response> (const rpc::client_info& cinfo, gms::gossip_get_endpoint_states_request request)>&& func) {
+    register_handler(this, messaging_verb::GOSSIP_GET_ENDPOINT_STATES, std::move(func));
+}
+future<> messaging_service::unregister_gossip_get_endpoint_states() {
+    return unregister_handler(messaging_verb::GOSSIP_GET_ENDPOINT_STATES);
+}
+future<gms::gossip_get_endpoint_states_response> messaging_service::send_gossip_get_endpoint_states(msg_addr id, std::chrono::milliseconds timeout, gms::gossip_get_endpoint_states_request request) {
+    return send_message_timeout<future<gms::gossip_get_endpoint_states_response>>(this, messaging_verb::GOSSIP_GET_ENDPOINT_STATES, std::move(id), std::move(timeout), std::move(request));
 }
 
 void messaging_service::register_definitions_update(std::function<rpc::no_wait_type (const rpc::client_info& cinfo, std::vector<frozen_mutation> fm,
@@ -1154,25 +1301,38 @@ future<partition_checksum> messaging_service::send_repair_checksum_range(
 }
 
 // Wrapper for REPAIR_GET_FULL_ROW_HASHES
-void messaging_service::register_repair_get_full_row_hashes(std::function<future<std::unordered_set<repair_hash>> (const rpc::client_info& cinfo, uint32_t repair_meta_id)>&& func) {
+void messaging_service::register_repair_get_full_row_hashes(std::function<future<repair_hash_set> (const rpc::client_info& cinfo, uint32_t repair_meta_id)>&& func) {
     register_handler(this, messaging_verb::REPAIR_GET_FULL_ROW_HASHES, std::move(func));
 }
 future<> messaging_service::unregister_repair_get_full_row_hashes() {
     return unregister_handler(messaging_verb::REPAIR_GET_FULL_ROW_HASHES);
 }
-future<std::unordered_set<repair_hash>> messaging_service::send_repair_get_full_row_hashes(msg_addr id, uint32_t repair_meta_id) {
-    return send_message<future<std::unordered_set<repair_hash>>>(this, messaging_verb::REPAIR_GET_FULL_ROW_HASHES, std::move(id), repair_meta_id);
+future<repair_hash_set> messaging_service::send_repair_get_full_row_hashes(msg_addr id, uint32_t repair_meta_id) {
+    return send_message<future<repair_hash_set>>(this, messaging_verb::REPAIR_GET_FULL_ROW_HASHES, std::move(id), repair_meta_id);
 }
 
-unsigned messaging_service::add_service_level_config(sstring service_level_name) {
+unsigned messaging_service::add_statement_tenant(sstring tenant_name, scheduling_group sg) {
     auto idx = _clients.size();
+    auto scheduling_info_for_connection_index_size = _scheduling_info_for_connection_index.size();
     auto undo = defer([&] {
         _clients.resize(idx);
-        _service_level_to_client_idx.erase(service_level_name);
+        _scheduling_info_for_connection_index.resize(scheduling_info_for_connection_index_size);
     });
-    _clients.emplace_back();
-    _clients.emplace_back();
-    _service_level_to_client_idx[service_level_name] = idx;
+    sstring statement_cookie = sstring("statement:") + tenant_name;
+    sstring statement_ack_cookie = sstring("statement-ack:") + tenant_name;
+    _clients.resize(_clients.size() + 2);
+    // this functions as a way to delete an obsolete tenant with the same name but keeping _clients
+    // indexing and _scheduling_info_for_connection_index indexing in sync.
+    for (unsigned i = 0; i < _scheduling_info_for_connection_index.size(); i++) {
+        if (_scheduling_info_for_connection_index[i].isolation_cookie == statement_cookie) {
+            _scheduling_info_for_connection_index[i].isolation_cookie = "";
+            _scheduling_info_for_connection_index[i+1].isolation_cookie = "";
+            break;
+        }
+    }
+    _scheduling_info_for_connection_index.emplace_back(scheduling_info_for_connection_index{sg, statement_cookie});
+    _scheduling_info_for_connection_index.emplace_back(scheduling_info_for_connection_index{sg, statement_ack_cookie});
+    _dynamic_tenants_to_client_idx.insert_or_assign(tenant_name, idx);
     undo.cancel();
     return idx;
 }
@@ -1199,13 +1359,13 @@ future<get_sync_boundary_response> messaging_service::send_repair_get_sync_bound
 }
 
 // Wrapper for REPAIR_GET_ROW_DIFF
-void messaging_service::register_repair_get_row_diff(std::function<future<repair_rows_on_wire> (const rpc::client_info& cinfo, uint32_t repair_meta_id, std::unordered_set<repair_hash> set_diff, bool needs_all_rows)>&& func) {
+void messaging_service::register_repair_get_row_diff(std::function<future<repair_rows_on_wire> (const rpc::client_info& cinfo, uint32_t repair_meta_id, repair_hash_set set_diff, bool needs_all_rows)>&& func) {
     register_handler(this, messaging_verb::REPAIR_GET_ROW_DIFF, std::move(func));
 }
 future<> messaging_service::unregister_repair_get_row_diff() {
     return unregister_handler(messaging_verb::REPAIR_GET_ROW_DIFF);
 }
-future<repair_rows_on_wire> messaging_service::send_repair_get_row_diff(msg_addr id, uint32_t repair_meta_id, std::unordered_set<repair_hash> set_diff, bool needs_all_rows) {
+future<repair_rows_on_wire> messaging_service::send_repair_get_row_diff(msg_addr id, uint32_t repair_meta_id, repair_hash_set set_diff, bool needs_all_rows) {
     return send_message<future<repair_rows_on_wire>>(this, messaging_verb::REPAIR_GET_ROW_DIFF, std::move(id), repair_meta_id, std::move(set_diff), needs_all_rows);
 }
 
@@ -1221,14 +1381,14 @@ future<> messaging_service::send_repair_put_row_diff(msg_addr id, uint32_t repai
 }
 
 // Wrapper for REPAIR_ROW_LEVEL_START
-void messaging_service::register_repair_row_level_start(std::function<future<> (const rpc::client_info& cinfo, uint32_t repair_meta_id, sstring keyspace_name, sstring cf_name, dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size, uint64_t seed, unsigned remote_shard, unsigned remote_shard_count, unsigned remote_ignore_msb, sstring remote_partitioner_name, table_schema_version schema_version, rpc::optional<streaming::stream_reason> reason)>&& func) {
+void messaging_service::register_repair_row_level_start(std::function<future<repair_row_level_start_response> (const rpc::client_info& cinfo, uint32_t repair_meta_id, sstring keyspace_name, sstring cf_name, dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size, uint64_t seed, unsigned remote_shard, unsigned remote_shard_count, unsigned remote_ignore_msb, sstring remote_partitioner_name, table_schema_version schema_version, rpc::optional<streaming::stream_reason> reason)>&& func) {
     register_handler(this, messaging_verb::REPAIR_ROW_LEVEL_START, std::move(func));
 }
 future<> messaging_service::unregister_repair_row_level_start() {
     return unregister_handler(messaging_verb::REPAIR_ROW_LEVEL_START);
 }
-future<> messaging_service::send_repair_row_level_start(msg_addr id, uint32_t repair_meta_id, sstring keyspace_name, sstring cf_name, dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size, uint64_t seed, unsigned remote_shard, unsigned remote_shard_count, unsigned remote_ignore_msb, sstring remote_partitioner_name, table_schema_version schema_version, streaming::stream_reason reason) {
-    return send_message<void>(this, messaging_verb::REPAIR_ROW_LEVEL_START, std::move(id), repair_meta_id, std::move(keyspace_name), std::move(cf_name), std::move(range), algo, max_row_buf_size, seed, remote_shard, remote_shard_count, remote_ignore_msb, std::move(remote_partitioner_name), std::move(schema_version), reason);
+future<rpc::optional<repair_row_level_start_response>> messaging_service::send_repair_row_level_start(msg_addr id, uint32_t repair_meta_id, sstring keyspace_name, sstring cf_name, dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size, uint64_t seed, unsigned remote_shard, unsigned remote_shard_count, unsigned remote_ignore_msb, sstring remote_partitioner_name, table_schema_version schema_version, streaming::stream_reason reason) {
+    return send_message<rpc::optional<repair_row_level_start_response>>(this, messaging_verb::REPAIR_ROW_LEVEL_START, std::move(id), repair_meta_id, std::move(keyspace_name), std::move(cf_name), std::move(range), algo, max_row_buf_size, seed, remote_shard, remote_shard_count, remote_ignore_msb, std::move(remote_partitioner_name), std::move(schema_version), reason);
 }
 
 // Wrapper for REPAIR_ROW_LEVEL_STOP
@@ -1273,6 +1433,17 @@ future<> messaging_service::unregister_repair_get_diff_algorithms() {
 }
 future<std::vector<row_level_diff_detect_algorithm>> messaging_service::send_repair_get_diff_algorithms(msg_addr id) {
     return send_message<future<std::vector<row_level_diff_detect_algorithm>>>(this, messaging_verb::REPAIR_GET_DIFF_ALGORITHMS, std::move(id));
+}
+
+// Wrapper for NODE_OPS_CMD
+void messaging_service::register_node_ops_cmd(std::function<future<node_ops_cmd_response> (const rpc::client_info& cinfo, node_ops_cmd_request)>&& func) {
+    register_handler(this, messaging_verb::NODE_OPS_CMD, std::move(func));
+}
+future<> messaging_service::unregister_node_ops_cmd() {
+    return unregister_handler(messaging_verb::NODE_OPS_CMD);
+}
+future<node_ops_cmd_response> messaging_service::send_node_ops_cmd(msg_addr id, node_ops_cmd_request req) {
+    return send_message<future<node_ops_cmd_response>>(this, messaging_verb::NODE_OPS_CMD, std::move(id), std::move(req));
 }
 
 void
@@ -1347,6 +1518,47 @@ future<> messaging_service::send_hint_mutation(msg_addr id, clock_type::time_poi
         inet_address reply_to, unsigned shard, response_id_type response_id, std::optional<tracing::trace_info> trace_info) {
     return send_message_oneway_timeout(this, timeout, messaging_verb::HINT_MUTATION, std::move(id), fm, std::move(forward),
         std::move(reply_to), shard, std::move(response_id), std::move(trace_info));
+}
+
+void init_messaging_service(sharded<messaging_service>& ms,
+                sharded<qos::service_level_controller>& sl_controller,
+                messaging_service::config mscfg, netw::messaging_service::scheduling_config scfg,
+                sstring ms_trust_store, sstring ms_cert, sstring ms_key, sstring ms_tls_prio, bool ms_client_auth) {
+    using encrypt_what = messaging_service::encrypt_what;
+    using namespace seastar::tls;
+
+    std::shared_ptr<credentials_builder> creds;
+
+    if (mscfg.encrypt != encrypt_what::none) {
+        creds = std::make_shared<credentials_builder>();
+        creds->set_dh_level(dh_params::level::MEDIUM);
+
+        creds->set_x509_key_file(ms_cert, ms_key, x509_crt_format::PEM).get();
+        if (ms_trust_store.empty()) {
+            creds->set_system_trust().get();
+        } else {
+            creds->set_x509_trust_file(ms_trust_store, x509_crt_format::PEM).get();
+        }
+
+        creds->set_priority_string(db::config::default_tls_priority);
+
+        if (!ms_tls_prio.empty()) {
+            creds->set_priority_string(ms_tls_prio);
+        }
+        if (ms_client_auth) {
+            creds->set_client_auth(seastar::tls::client_auth::REQUIRE);
+        }
+    }
+
+    // Init messaging_service
+    // Delay listening messaging_service until gossip message handlers are registered
+
+    ms.start(std::ref(sl_controller), mscfg, scfg, creds).get();
+}
+
+future<> uninit_messaging_service(sharded<messaging_service>& ms) {
+    // Do not destroy instances for real, as other services need them, just call .stop()
+    return ms.invoke_on_all(&messaging_service::stop);
 }
 
 } // namespace net

@@ -7,18 +7,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <boost/range/adaptor/indirected.hpp>
@@ -67,7 +56,14 @@ struct virtual_row_comparator {
 };
 
 // Iterating over the cartesian product of cf_names and token_ranges.
-class virtual_row_iterator : public std::iterator<std::input_iterator_tag, const virtual_row> {
+class virtual_row_iterator {
+public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = const virtual_row;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const virtual_row*;
+    using reference = const virtual_row&;
+private:
     std::reference_wrapper<const std::vector<bytes>> _cf_names;
     std::reference_wrapper<const std::vector<token_range>> _ranges;
     size_t _cf_names_idx = 0;
@@ -201,10 +197,10 @@ static future<std::vector<token_range>> get_local_ranges(database& db) {
         // All queries will be on that table, where all entries are text and there's no notion of
         // token ranges form the CQL point of view.
         auto left_inf = boost::find_if(ranges, [] (auto&& r) {
-            return !r.start() || r.start()->value() == dht::minimum_token();
+            return r.end() && (!r.start() || r.start()->value() == dht::minimum_token());
         });
         auto right_inf = boost::find_if(ranges, [] (auto&& r) {
-            return !r.end() || r.start()->value() == dht::maximum_token();
+            return r.start() && (!r.end() || r.end()->value() == dht::maximum_token());
         });
         if (left_inf != right_inf && left_inf != ranges.end() && right_inf != ranges.end()) {
             local_ranges.push_back(token_range{to_bytes(right_inf->start()), to_bytes(left_inf->end())});
@@ -225,9 +221,9 @@ future<std::vector<token_range>> test_get_local_ranges(database& db) {
     return get_local_ranges(db);
 }
 
-size_estimates_mutation_reader::size_estimates_mutation_reader(schema_ptr schema, const dht::partition_range& prange, const query::partition_slice& slice, streamed_mutation::forwarding fwd)
-            : impl(schema)
-            , _schema(std::move(schema))
+size_estimates_mutation_reader::size_estimates_mutation_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& prange,
+        const query::partition_slice& slice, streamed_mutation::forwarding fwd)
+            : impl(std::move(schema), std::move(permit))
             , _prange(&prange)
             , _slice(slice)
             , _fwd(fwd)
@@ -249,7 +245,7 @@ future<> size_estimates_mutation_reader::get_next_partition() {
         ++_current_partition;
         std::vector<mutation> ms;
         ms.emplace_back(std::move(mutations));
-        _partition_reader = flat_mutation_reader_from_mutations(std::move(ms), _fwd);
+        _partition_reader = flat_mutation_reader_from_mutations(_permit, std::move(ms), _fwd);
     });
 }
 
@@ -292,13 +288,6 @@ future<> size_estimates_mutation_reader::fast_forward_to(position_range pr, db::
         return _partition_reader->fast_forward_to(std::move(pr), timeout);
     }
     return make_ready_future<>();
-}
-
-size_t size_estimates_mutation_reader::buffer_size() const {
-    if (_partition_reader) {
-        return flat_mutation_reader::impl::buffer_size() + _partition_reader->buffer_size();
-    }
-    return flat_mutation_reader::impl::buffer_size();
 }
 
 std::vector<db::system_keyspace::range_estimates>

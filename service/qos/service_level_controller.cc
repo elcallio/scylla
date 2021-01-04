@@ -19,10 +19,11 @@ sstring service_level_controller::default_service_level_name = "default";
 
 
 
-service_level_controller::service_level_controller(service_level_options default_service_level_config):
-        _sl_data_accessor(nullptr)
+service_level_controller::service_level_controller(sharded<auth::service>& auth_service, service_level_options default_service_level_config)
+        : _sl_data_accessor(nullptr)
+        , _auth_service(auth_service)
 {
-    if (engine().cpu_id() == global_controller) {
+    if (this_shard_id() == global_controller) {
         _global_controller_db = std::make_unique<global_controller_data>();
         _global_controller_db->default_service_level_config = default_service_level_config;
     }
@@ -45,7 +46,7 @@ future<>  service_level_controller::remove_service_level(sstring name, bool remo
 }
 
 future<> service_level_controller::start() {
-    if (engine().cpu_id() != global_controller) {
+    if (this_shard_id() != global_controller) {
         return make_ready_future();
     }
     return with_semaphore(_global_controller_db->notifications_serializer, 1, [this] () {
@@ -78,7 +79,7 @@ future<> service_level_controller::stop() {
     _sl_data_accessor = nullptr;
     //unregister from the priority manager
     service::get_local_priority_manager().set_service_level_controller(nullptr);
-    if (engine().cpu_id() == global_controller) {
+    if (this_shard_id() == global_controller) {
         // abort the loop of the distributed data checking if it is running
         _global_controller_db->dist_data_update_aborter.request_abort();
         _global_controller_db->notifications_serializer.broken();
@@ -189,7 +190,7 @@ future<sstring> service_level_controller::find_service_level(auth::role_set role
         return _service_levels_db[service_level1].slo.shares <
                 _service_levels_db[service_level2].slo.shares;
     };
-    auto& role_manager = service::get_local_storage_service().get_local_auth_service().underlying_role_manager();
+    auto& role_manager = _auth_service.local().underlying_role_manager();
 
     // converts a list of roles into the chosen service level.
     return ::map_reduce(roles.begin(), roles.end(), [&role_manager, this] (const sstring& role) {
@@ -255,7 +256,7 @@ future<> service_level_controller::notify_service_level_removed(sstring name) {
         unsigned sl_idx = internal::scheduling_group_index(sl_it->second.sg);
         _sl_lookup[sl_idx].first = nullptr;
         _sl_lookup[sl_idx].second = nullptr;
-        if (engine().cpu_id() == global_controller) {
+        if (this_shard_id() == global_controller) {
             _global_controller_db->deleted_scheduling_groups.emplace(sl_it->second.sg);
             _global_controller_db->deleted_priority_classes.emplace(sl_it->second.pc);
         }
@@ -354,7 +355,7 @@ future<> service_level_controller::drop_distributed_service_level(sstring name, 
                 return make_exception_future(nonexistant_service_level_exception(name));
             }
         } else {
-            auto& role_manager = service::get_local_storage_service().get_local_auth_service().underlying_role_manager();
+            auto& role_manager = _auth_service.local().underlying_role_manager();
             return role_manager.query_attribute_for_all("service_level").then( [&role_manager, name] (auth::role_manager::attribute_vals attributes) {
                 return parallel_for_each(attributes.begin(), attributes.end(), [&role_manager, name] (auto&& attr) {
                     if (attr.second == name) {

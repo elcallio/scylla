@@ -92,10 +92,6 @@ public:
         return params.make_counter_update_cell(delta);
     }
 
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const {
-        return _t && _t->uses_function(ks_name, function_name);
-    }
-
     virtual bool is_raw_counter_shard_write() const {
         return false;
     }
@@ -157,7 +153,7 @@ public:
          * @return whether this operation can be applied alongside the {@code
          * other} update (in the same UPDATE statement for the same column).
          */
-        virtual bool is_compatible_with(::shared_ptr<raw_update> other) const = 0;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const = 0;
     };
 
     /**
@@ -170,7 +166,7 @@ public:
      */
     class raw_deletion {
     public:
-        ~raw_deletion() {}
+        virtual ~raw_deletion() = default;
 
         /**
          * The name of the column affected by this delete operation.
@@ -207,7 +203,7 @@ public:
 
         virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
 
-        virtual bool is_compatible_with(shared_ptr<raw_update> other) const override;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
 
     // Set a single field inside a user-defined type.
@@ -223,7 +219,7 @@ public:
 
         virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
 
-        virtual bool is_compatible_with(shared_ptr<raw_update> other) const override;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
 
     // Delete a single field inside a user-defined type.
@@ -252,7 +248,7 @@ public:
 
         virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
 
-        virtual bool is_compatible_with(shared_ptr<raw_update> other) const override;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
 
     class subtraction : public raw_update {
@@ -266,7 +262,7 @@ public:
 
         virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
 
-        virtual bool is_compatible_with(shared_ptr<raw_update> other) const override;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
 
     class prepend : public raw_update {
@@ -280,7 +276,7 @@ public:
 
         virtual shared_ptr<operation> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const override;
 
-        virtual bool is_compatible_with(shared_ptr<raw_update> other) const override;
+        virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
 
     class column_deletion;

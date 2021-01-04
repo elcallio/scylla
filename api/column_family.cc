@@ -238,6 +238,12 @@ static future<json::json_return_type> sum_sstable(http_context& ctx, bool total)
     });
 }
 
+future<json::json_return_type> map_reduce_cf_time_histogram(http_context& ctx, const sstring& name, std::function<utils::time_estimated_histogram(const column_family&)> f) {
+    return map_reduce_cf_raw(ctx, name, utils::time_estimated_histogram(), f, utils::time_estimated_histogram_merge).then([](const utils::time_estimated_histogram& res) {
+        return make_ready_future<json::json_return_type>(time_to_json_histogram(res));
+    });
+}
+
 template <typename T>
 class sum_ratio {
     uint64_t _n = 0;
@@ -785,24 +791,21 @@ void set_column_family(http_context& ctx, routes& r) {
     });
 
     cf::get_cas_prepare.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, req->param["name"], utils::estimated_histogram(0), [](column_family& cf) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
             return cf.get_stats().estimated_cas_prepare;
-        },
-        utils::estimated_histogram_merge, utils_json::estimated_histogram());
+        });
     });
 
     cf::get_cas_propose.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, req->param["name"], utils::estimated_histogram(0), [](column_family& cf) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
             return cf.get_stats().estimated_cas_accept;
-        },
-        utils::estimated_histogram_merge, utils_json::estimated_histogram());
+        });
     });
 
     cf::get_cas_commit.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, req->param["name"], utils::estimated_histogram(0), [](column_family& cf) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
             return cf.get_stats().estimated_cas_learn;
-        },
-        utils::estimated_histogram_merge, utils_json::estimated_histogram());
+        });
     });
 
     cf::get_sstables_per_read_histogram.set(r, [&ctx] (std::unique_ptr<request> req) {
@@ -828,15 +831,32 @@ void set_column_family(http_context& ctx, routes& r) {
         return make_ready_future<json::json_return_type>(res);
     });
 
-    cf::is_auto_compaction_disabled.set(r, [] (const_req req) {
-        // FIXME
-        // currently auto compaction is disable
-        // it should be changed when it would have an API
-        return true;
+    cf::get_auto_compaction.set(r, [&ctx] (const_req req) {
+        const utils::UUID& uuid = get_uuid(req.param["name"], ctx.db.local());
+        column_family& cf = ctx.db.local().find_column_family(uuid);
+        return !cf.is_auto_compaction_disabled_by_user();
+    });
+
+    cf::enable_auto_compaction.set(r, [&ctx](std::unique_ptr<request> req) {
+        return foreach_column_family(ctx, req->param["name"], [](column_family &cf) {
+            cf.enable_auto_compaction();
+        }).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+    });
+
+    cf::disable_auto_compaction.set(r, [&ctx](std::unique_ptr<request> req) {
+        return foreach_column_family(ctx, req->param["name"], [](column_family &cf) {
+            cf.disable_auto_compaction();
+        }).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
     });
 
     cf::get_built_indexes.set(r, [&ctx](std::unique_ptr<request> req) {
-        auto [ks, cf_name] = parse_fully_qualified_cf_name(req->param["name"]);
+        auto ks_cf = parse_fully_qualified_cf_name(req->param["name"]);
+        auto&& ks = std::get<0>(ks_cf);
+        auto&& cf_name = std::get<1>(ks_cf);
         return db::system_keyspace::load_view_build_progress().then([ks, cf_name, &ctx](const std::vector<db::system_keyspace::view_build_progress>& vb) mutable {
             std::set<sstring> vp;
             for (auto b : vb) {
@@ -849,7 +869,7 @@ void set_column_family(http_context& ctx, routes& r) {
             column_family& cf = ctx.db.local().find_column_family(uuid);
             res.reserve(cf.get_index_manager().list_indexes().size());
             for (auto&& i : cf.get_index_manager().list_indexes()) {
-                if (vp.find(secondary_index::index_table_name(i.metadata().name())) == vp.end()) {
+                if (!vp.contains(secondary_index::index_table_name(i.metadata().name()))) {
                     res.emplace_back(i.metadata().name());
                 }
             }
@@ -883,17 +903,15 @@ void set_column_family(http_context& ctx, routes& r) {
     });
 
     cf::get_read_latency_estimated_histogram.set(r, [&ctx](std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, req->param["name"], utils::estimated_histogram(0), [](column_family& cf) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
             return cf.get_stats().estimated_read;
-        },
-        utils::estimated_histogram_merge, utils_json::estimated_histogram());
+        });
     });
 
     cf::get_write_latency_estimated_histogram.set(r, [&ctx](std::unique_ptr<request> req) {
-        return map_reduce_cf(ctx, req->param["name"], utils::estimated_histogram(0), [](column_family& cf) {
+        return map_reduce_cf_time_histogram(ctx, req->param["name"], [](const column_family& cf) {
             return cf.get_stats().estimated_write;
-        },
-        utils::estimated_histogram_merge, utils_json::estimated_histogram());
+        });
     });
 
     cf::set_compaction_strategy_class.set(r, [&ctx](std::unique_ptr<request> req) {
@@ -961,6 +979,9 @@ void set_column_family(http_context& ctx, routes& r) {
                     return q.gather(q.capacity()).then([&q] (auto topk_results) {
                         apilog.debug("toppartitions query: processing results");
                         cf::toppartitions_query_results results;
+
+                        results.read_cardinality = topk_results.read.size();
+                        results.write_cardinality = topk_results.write.size();
 
                         for (auto& d: topk_results.read.top(q.list_size())) {
                             cf::toppartitions_record r;

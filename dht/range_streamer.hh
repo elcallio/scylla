@@ -49,6 +49,7 @@ class range_streamer {
 public:
     using inet_address = gms::inet_address;
     using token_metadata = locator::token_metadata;
+    using token_metadata_ptr = locator::token_metadata_ptr;
     using stream_plan = streaming::stream_plan;
     using stream_state = streaming::stream_state;
     static bool use_strict_consistency();
@@ -71,7 +72,7 @@ public:
         std::set<gms::inet_address> _down_nodes;
     public:
         failure_detector_source_filter(std::set<gms::inet_address> down_nodes) : _down_nodes(std::move(down_nodes)) { }
-        virtual bool should_include(inet_address endpoint) override { return !_down_nodes.count(endpoint); }
+        virtual bool should_include(inet_address endpoint) override { return !_down_nodes.contains(endpoint); }
     };
 
     /**
@@ -90,9 +91,9 @@ public:
         }
     };
 
-    range_streamer(distributed<database>& db, token_metadata& tm, abort_source& abort_source, std::unordered_set<token> tokens, inet_address address, sstring description, streaming::stream_reason reason)
+    range_streamer(distributed<database>& db, const token_metadata_ptr tmptr, abort_source& abort_source, std::unordered_set<token> tokens, inet_address address, sstring description, streaming::stream_reason reason)
         : _db(db)
-        , _metadata(tm)
+        , _token_metadata_ptr(std::move(tmptr))
         , _abort_source(abort_source)
         , _tokens(std::move(tokens))
         , _address(address)
@@ -102,8 +103,8 @@ public:
         _abort_source.check();
     }
 
-    range_streamer(distributed<database>& db, token_metadata& tm, abort_source& abort_source, inet_address address, sstring description, streaming::stream_reason reason)
-        : range_streamer(db, tm, abort_source, std::unordered_set<token>(), address, description, reason) {
+    range_streamer(distributed<database>& db, const token_metadata_ptr tmptr, abort_source& abort_source, inet_address address, sstring description, streaming::stream_reason reason)
+        : range_streamer(db, std::move(tmptr), abort_source, std::unordered_set<token>(), address, description, reason) {
     }
 
     void add_source_filter(std::unique_ptr<i_source_filter> filter) {
@@ -135,7 +136,7 @@ private:
      *                      here, we always exclude ourselves.
      * @return
      */
-    static std::unordered_map<inet_address, dht::token_range_vector>
+    std::unordered_map<inet_address, dht::token_range_vector>
     get_range_fetch_map(const std::unordered_map<dht::token_range, std::vector<inet_address>>& ranges_with_sources,
                         const std::unordered_set<std::unique_ptr<i_source_filter>>& source_filters,
                         const sstring& keyspace);
@@ -148,13 +149,17 @@ private:
         return toFetch;
     }
 #endif
+
+    const token_metadata& get_token_metadata() {
+        return *_token_metadata_ptr;
+    }
 public:
     future<> stream_async();
     future<> do_stream_async();
     size_t nr_ranges_to_stream();
 private:
     distributed<database>& _db;
-    token_metadata& _metadata;
+    const token_metadata_ptr _token_metadata_ptr;
     abort_source& _abort_source;
     std::unordered_set<token> _tokens;
     inet_address _address;

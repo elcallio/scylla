@@ -42,7 +42,7 @@ std::vector<const column_definition*> cql3::token_relation::get_column_definitio
     return res;
 }
 
-std::vector<::shared_ptr<cql3::column_specification>> cql3::token_relation::to_receivers(
+std::vector<lw_shared_ptr<cql3::column_specification>> cql3::token_relation::to_receivers(
         const schema& schema,
         const std::vector<const column_definition*>& column_defs) const {
     auto pk = schema.partition_key_columns();
@@ -63,7 +63,7 @@ std::vector<::shared_ptr<cql3::column_specification>> cql3::token_relation::to_r
                         std::to_string(column_defs)));
     }
     //auto* c = column_defs.front();
-    return {::make_shared<column_specification>(schema.ks_name(), schema.cf_name(),
+    return {make_lw_shared<column_specification>(schema.ks_name(), schema.cf_name(),
                 ::make_shared<column_identifier>("partition key token", true),
                 dht::token::get_token_validator())};
 }
@@ -74,7 +74,10 @@ std::vector<::shared_ptr<cql3::column_specification>> cql3::token_relation::to_r
     auto column_defs = get_column_definitions(*schema);
     auto term = to_term(to_receivers(*schema, column_defs), *_value, db,
             schema->ks_name(), bound_names);
-    return ::make_shared<restrictions::token_restriction::EQ>(column_defs, term);
+    auto r = ::make_shared<restrictions::token_restriction>(column_defs);
+    using namespace expr;
+    r->expression = binary_operator{token{}, oper_t::EQ, std::move(term)};
+    return r;
 }
 
 ::shared_ptr<cql3::restrictions::restriction> cql3::token_relation::new_IN_restriction(
@@ -93,8 +96,10 @@ std::vector<::shared_ptr<cql3::column_specification>> cql3::token_relation::to_r
     auto column_defs = get_column_definitions(*schema);
     auto term = to_term(to_receivers(*schema, column_defs), *_value, db,
             schema->ks_name(), bound_names);
-    return ::make_shared<restrictions::token_restriction::slice>(column_defs,
-            bound, inclusive, term);
+    auto r = ::make_shared<restrictions::token_restriction>(column_defs);
+    using namespace expr;
+    r->expression = binary_operator{token{}, pick_operator(bound, inclusive), std::move(term)};
+    return r;
 }
 
 ::shared_ptr<cql3::restrictions::restriction> cql3::token_relation::new_contains_restriction(
@@ -115,7 +120,7 @@ sstring cql3::token_relation::to_string() const {
 }
 
 ::shared_ptr<cql3::term> cql3::token_relation::to_term(
-        const std::vector<::shared_ptr<column_specification>>& receivers,
+        const std::vector<lw_shared_ptr<column_specification>>& receivers,
         const term::raw& raw, database& db, const sstring& keyspace,
         variable_specifications& bound_names) const {
     auto term = raw.prepare(db, keyspace, receivers.front());

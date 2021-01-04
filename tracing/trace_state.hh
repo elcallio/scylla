@@ -34,11 +34,12 @@
 #include <seastar/util/lazy.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/core/checked_ptr.hh>
-#include "mutation.hh"
 #include "utils/UUID_gen.hh"
 #include "tracing/tracing.hh"
 #include "gms/inet_address.hh"
 #include "auth/authenticated_user.hh"
+#include "db/consistency_level_type.hh"
+#include "types.hh"
 
 namespace cql3{
 class query_options;
@@ -261,9 +262,9 @@ private:
      * This overload is meant for secondary sessions.
      */
     void begin() {
-        std::atomic_signal_fence(std::memory_order::memory_order_seq_cst);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
         _start = elapsed_clock::now();
-        std::atomic_signal_fence(std::memory_order::memory_order_seq_cst);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
         set_state(state::foreground);
     }
 
@@ -498,7 +499,7 @@ public:
     trace_state_ptr(lw_shared_ptr<trace_state> state_ptr)
         : _state_ptr(std::move(state_ptr))
     {}
-    trace_state_ptr(nullptr_t)
+    trace_state_ptr(std::nullptr_t)
         : _state_ptr(nullptr)
     {}
 
@@ -572,9 +573,9 @@ void trace_state::trace(const char* fmt, A&&... a) noexcept {
 
 inline elapsed_clock::duration trace_state::elapsed() {
     using namespace std::chrono;
-    std::atomic_signal_fence(std::memory_order::memory_order_seq_cst);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
     elapsed_clock::duration elapsed = elapsed_clock::now() - _start;
-    std::atomic_signal_fence(std::memory_order::memory_order_seq_cst);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 
     return elapsed;
 }

@@ -67,7 +67,7 @@ const sstring& alter_type_statement::keyspace() const
     return _name.get_keyspace();
 }
 
-void alter_type_statement::do_announce_migration(database& db, ::keyspace& ks, bool is_local_only) const
+void alter_type_statement::do_announce_migration(database& db, ::keyspace& ks) const
 {
     auto&& all_types = ks.metadata()->user_types().get_all_types();
     auto to_update = all_types.find(_name.get_user_type_name());
@@ -76,11 +76,20 @@ void alter_type_statement::do_announce_migration(database& db, ::keyspace& ks, b
         throw exceptions::invalid_request_exception(format("No user type named {} exists.", _name.to_string()));
     }
 
+    for (auto&& schema : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
+        for (auto&& column : schema->partition_key_columns()) {
+            if (column.type->references_user_type(_name.get_keyspace(), _name.get_user_type_name())) {
+                throw exceptions::invalid_request_exception(format("Cannot add new field to type {} because it is used in the partition key column {} of table {}.{}",
+                    _name.to_string(), column.name_as_text(), schema->ks_name(), schema->cf_name()));
+            }
+        }
+    }
+
     auto&& updated = make_updated_type(db, to_update->second);
 
     // Now, we need to announce the type update to basically change it for new tables using this type,
     // but we also need to find all existing user types and CF using it and change them.
-    service::get_local_migration_manager().announce_type_update(updated, is_local_only).get();
+    service::get_local_migration_manager().announce_type_update(updated).get();
 
     for (auto&& schema : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
         auto cfm = schema_builder(schema);
@@ -95,21 +104,21 @@ void alter_type_statement::do_announce_migration(database& db, ::keyspace& ks, b
         }
         if (modified) {
             if (schema->is_view()) {
-                service::get_local_migration_manager().announce_view_update(view_ptr(cfm.build()), is_local_only).get();
+                service::get_local_migration_manager().announce_view_update(view_ptr(cfm.build())).get();
             } else {
-                service::get_local_migration_manager().announce_column_family_update(cfm.build(), false, {}, is_local_only).get();
+                service::get_local_migration_manager().announce_column_family_update(cfm.build(), false, {}).get();
             }
         }
     }
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> alter_type_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
+future<shared_ptr<cql_transport::event::schema_change>> alter_type_statement::announce_migration(service::storage_proxy& proxy) const
 {
-    return seastar::async([this, &proxy, is_local_only] {
+    return seastar::async([this, &proxy] {
         auto&& db = proxy.get_db().local();
         try {
             auto&& ks = db.find_keyspace(keyspace());
-            do_announce_migration(db, ks, is_local_only);
+            do_announce_migration(db, ks);
             using namespace cql_transport;
             return ::make_shared<event::schema_change>(
                     event::schema_change::change_type::UPDATED,

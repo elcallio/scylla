@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -24,6 +13,7 @@
 #include "sstables.hh"
 #include "schema_fwd.hh"
 #include "mutation_fragment.hh"
+#include "metadata_collector.hh"
 
 namespace sstables {
 
@@ -32,12 +22,17 @@ struct sstable_writer::writer_impl {
     const schema& _schema;
     const io_priority_class& _pc;
     const sstable_writer_config _cfg;
+    // NOTE: _collector and _c_stats are used to generation of statistics file
+    // when writing a new sstable.
+    metadata_collector _collector;
+    column_stats _c_stats;
 
     writer_impl(sstable& sst, const schema& schema, const io_priority_class& pc, const sstable_writer_config& cfg)
         : _sst(sst)
         , _schema(schema)
         , _pc(pc)
         , _cfg(cfg)
+        , _collector(_schema, sst.get_filename())
     {}
 
     virtual void consume_new_partition(const dht::decorated_key& dk) = 0;

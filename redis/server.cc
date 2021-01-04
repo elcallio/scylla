@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "redis/server.hh"
@@ -74,19 +63,30 @@ future<> redis_server::stop() {
 }
 
 future<> redis_server::listen(socket_address addr, std::shared_ptr<seastar::tls::credentials_builder> creds, bool keepalive) {
-    listen_options lo;
-    lo.reuse_address = true;
-    server_socket ss;
-    try {
-        ss = creds
-          ? seastar::tls::listen(creds->build_server_credentials(), addr, lo)
-          : seastar::listen(addr, lo);
-    } catch (...) {
-        throw std::runtime_error(sprint("Redis server error while listening on %s -> %s", addr, std::current_exception()));
+    auto f = make_ready_future<shared_ptr<seastar::tls::server_credentials>>(nullptr);
+    if (creds) {
+        f = creds->build_reloadable_server_credentials([](const std::unordered_set<sstring>& files, std::exception_ptr ep) {
+            if (ep) {
+                logging.warn("Exception loading {}: {}", files, ep);
+            } else {
+                logging.info("Reloaded {}", files);
+            }
+        });
     }
-    _listeners.emplace_back(std::move(ss));
-    _stopped = when_all(std::move(_stopped), do_accepts(_listeners.size() - 1, keepalive, addr)).discard_result();
-    return make_ready_future<>();
+    return f.then([this, addr, keepalive](shared_ptr<seastar::tls::server_credentials> creds) {
+        listen_options lo;
+        lo.reuse_address = true;
+        server_socket ss;
+        try {
+            ss = creds
+                ? seastar::tls::listen(std::move(creds), addr, lo)
+                : seastar::listen(addr, lo);
+        } catch (...) {
+            throw std::runtime_error(sprint("Redis server error while listening on %s -> %s", addr, std::current_exception()));
+        }
+        _listeners.emplace_back(std::move(ss));
+        _stopped = when_all(std::move(_stopped), do_accepts(_listeners.size() - 1, keepalive, addr)).discard_result();
+    });
 }
 
 future<> redis_server::do_accepts(int which, bool keepalive, socket_address server_addr) {
@@ -193,7 +193,7 @@ future<> redis_server::connection::shutdown()
 thread_local redis_server::connection::execution_stage_type redis_server::connection::_process_request_stage {"redis_transport", &connection::process_request_one};
 
 future<redis_server::result> redis_server::connection::process_request_internal() {
-    return _process_request_stage(this, std::move(_parser.get_request()), seastar::ref(_options), empty_service_permit());
+    return _process_request_stage(this, _parser.get_request(), seastar::ref(_options), empty_service_permit());
 }
 
 void redis_server::connection::write_reply(const redis_exception& e)

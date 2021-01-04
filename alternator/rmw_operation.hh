@@ -5,26 +5,15 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
 
-#include <seastarx.hh>
-#include <service/storage_proxy.hh>
-#include <service/storage_proxy.hh>
-#include "rjson.hh"
+#include "seastarx.hh"
+#include "service/storage_proxy.hh"
+#include "service/storage_proxy.hh"
+#include "utils/rjson.hh"
 #include "executor.hh"
 
 namespace alternator {
@@ -63,6 +52,10 @@ public:
 
     static write_isolation get_write_isolation_for_schema(schema_ptr schema);
 
+    static write_isolation default_write_isolation;
+public:
+    static void set_default_write_isolation(std::string_view mode);
+
 protected:
     // The full request JSON
     rjson::value _request;
@@ -83,7 +76,11 @@ protected:
     // When _returnvalues != NONE, apply() should store here, in JSON form,
     // the values which are to be returned in the "Attributes" field.
     // The default null JSON means do not return an Attributes field at all.
-    rjson::value _return_attributes;
+    // This field is marked "mutable" so that the const apply() can modify
+    // it (see explanation below), but note that because apply() may be
+    // called more than once, if apply() will sometimes set this field it
+    // must set it (even if just to the default empty value) every time.
+    mutable rjson::value _return_attributes;
 public:
     // The constructor of a rmw_operation subclass should parse the request
     // and try to discover as many input errors as it can before really
@@ -96,9 +93,14 @@ public:
     // conditional expression, apply() should return an empty optional.
     // apply() may throw if it encounters input errors not discovered during
     // the constructor.
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) = 0;
+    // apply() may be called more than once in case of contention, so it must
+    // not change the state saved in the object (issue #7218 was caused by
+    // violating this). We mark apply() "const" to let the compiler validate
+    // this for us. The output-only field _return_attributes is marked
+    // "mutable" above so that apply() can still write to it.
+    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const = 0;
     // Convert the above apply() into the signature needed by cas_request:
-    virtual std::optional<mutation> apply(query::result& qr, const query::partition_slice& slice, api::timestamp_type ts) override;
+    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) override;
     virtual ~rmw_operation() = default;
     schema_ptr schema() const { return _schema; }
     const rjson::value& request() const { return _request; }

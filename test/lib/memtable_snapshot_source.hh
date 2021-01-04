@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -24,6 +13,7 @@
 #include "mutation_reader.hh"
 #include "memtable.hh"
 #include "utils/phased_barrier.hh"
+#include "test/lib/reader_permit.hh"
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/condition-variable.hh>
@@ -66,6 +56,7 @@ private:
         std::vector<flat_mutation_reader> readers;
         for (auto&& mt : _memtables) {
             readers.push_back(mt->make_flat_reader(new_mt->schema(),
+                 tests::make_permit(),
                  query::full_partition_range,
                  new_mt->schema()->full_slice(),
                  default_priority_class(),
@@ -74,7 +65,7 @@ private:
                  mutation_reader::forwarding::yes));
         }
         _memtables.push_back(new_memtable());
-        auto&& rd = make_combined_reader(new_mt->schema(), std::move(readers));
+        auto&& rd = make_combined_reader(new_mt->schema(), tests::make_permit(), std::move(readers));
         consume_partitions(rd, [&] (mutation&& m) {
             new_mt->apply(std::move(m));
             return stop_iteration::no;
@@ -87,9 +78,10 @@ public:
         : _s(s)
         , _compactor(seastar::async([this] () noexcept {
             while (!_closed) {
+                // condition_variable::wait() also allocates memory
+                memory::scoped_critical_alloc_section dfg;
                 _should_compact.wait().get();
                 while (should_compact()) {
-                    memory::disable_failure_guard dfg;
                     compact();
                 }
             }
@@ -121,7 +113,7 @@ public:
     void apply(memtable& mt) {
         auto op = _apply.start();
         auto new_mt = new_memtable();
-        new_mt->apply(mt).get();
+        new_mt->apply(mt, tests::make_permit()).get();
         _memtables.push_back(new_mt);
     }
     // mt must not change from now on.

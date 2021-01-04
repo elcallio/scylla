@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 
@@ -35,6 +24,7 @@
 #include "test/lib/dummy_sharder.hh"
 #include "test/lib/reader_lifecycle_policy.hh"
 #include "test/lib/log.hh"
+#include "test/lib/reader_permit.hh"
 
 #include "dht/sharder.hh"
 #include "mutation_reader.hh"
@@ -50,10 +40,11 @@ SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_as_mutation_source) {
 
     // It has to be a container that does not invalidate pointers
     std::list<dummy_sharder> keep_alive_sharder;
+    test_reader_lifecycle_policy::operations_gate operations_gate;
 
-    do_with_cql_env([&keep_alive_sharder] (cql_test_env& env) -> future<> {
-        auto make_populate = [&keep_alive_sharder, &env] (bool evict_paused_readers, bool single_fragment_buffer) {
-            return [&keep_alive_sharder, &env, evict_paused_readers, single_fragment_buffer] (schema_ptr s, const std::vector<mutation>& mutations) mutable {
+    do_with_cql_env([&] (cql_test_env& env) -> future<> {
+        auto make_populate = [&] (bool evict_paused_readers, bool single_fragment_buffer) {
+            return [&, evict_paused_readers, single_fragment_buffer] (schema_ptr s, const std::vector<mutation>& mutations) mutable {
                 // We need to group mutations that have the same token so they land on the same shard.
                 std::map<dht::token, std::vector<frozen_mutation>> mutations_by_token;
 
@@ -83,7 +74,7 @@ SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_as_mutation_source) {
                 }
                 keep_alive_sharder.push_back(sharder);
 
-                return mutation_source([&keep_alive_sharder, remote_memtables, evict_paused_readers, single_fragment_buffer] (schema_ptr s,
+                return mutation_source([&, remote_memtables, evict_paused_readers, single_fragment_buffer] (schema_ptr s,
                         reader_permit,
                         const dht::partition_range& range,
                         const query::partition_slice& slice,
@@ -98,7 +89,7 @@ SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_as_mutation_source) {
                             const io_priority_class& pc,
                             tracing::trace_state_ptr trace_state,
                             mutation_reader::forwarding fwd_mr) {
-                            auto reader = remote_memtables->at(this_shard_id())->make_flat_reader(s, range, slice, pc, std::move(trace_state),
+                            auto reader = remote_memtables->at(this_shard_id())->make_flat_reader(s, tests::make_permit(), range, slice, pc, std::move(trace_state),
                                     streamed_mutation::forwarding::no, fwd_mr);
                             if (single_fragment_buffer) {
                                 reader.set_max_buffer_size(1);
@@ -106,8 +97,9 @@ SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_as_mutation_source) {
                             return reader;
                     };
 
-                    auto lifecycle_policy = seastar::make_shared<test_reader_lifecycle_policy>(std::move(factory), evict_paused_readers);
-                    auto mr = make_multishard_combining_reader_for_tests(keep_alive_sharder.back(), std::move(lifecycle_policy), s, range, slice, pc, trace_state, fwd_mr);
+                    auto lifecycle_policy = seastar::make_shared<test_reader_lifecycle_policy>(std::move(factory), operations_gate, evict_paused_readers);
+                    auto mr = make_multishard_combining_reader_for_tests(keep_alive_sharder.back(), std::move(lifecycle_policy), s,
+                            tests::make_permit(), range, slice, pc, trace_state, fwd_mr);
                     if (fwd_sm == streamed_mutation::forwarding::yes) {
                         return make_forwardable(std::move(mr));
                     }
@@ -125,6 +117,6 @@ SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_as_mutation_source) {
         testlog.info("run_mutation_source_tests(evict_readers=true, single_fragment_buffer=true)");
         run_mutation_source_tests(make_populate(true, true));
 
-        return make_ready_future<>();
+        return operations_gate.close();
     }).get();
 }

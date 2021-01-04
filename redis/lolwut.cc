@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 
@@ -104,8 +93,8 @@ public:
     static canvas draw_schotter(const int cols, const int squares_per_row, const int squares_per_col) {
         const int width = cols * 2;
         const int padding = width > 4 ? 2 : 0;
-        const float side = static_cast<float>((width - padding * 1) / squares_per_row);
-        const int height = side * squares_per_col + padding * 0;
+        const float side = static_cast<float>((width - padding * 2) / squares_per_row);
+        const int height = side * squares_per_col + padding * 2;
         canvas c {width, height};
         std::random_device seed_gen;
         std::default_random_engine engine(seed_gen());

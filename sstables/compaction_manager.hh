@@ -18,11 +18,13 @@
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/scheduling.hh>
+#include <seastar/core/abort_source.hh>
 #include "log.hh"
 #include "utils/exponential_backoff_retry.hh"
 #include <vector>
 #include <list>
 #include <functional>
+#include <algorithm>
 #include "sstables/compaction.hh"
 #include "compaction_weight_registration.hh"
 #include "compaction_backlog_manager.hh"
@@ -56,11 +58,26 @@ private:
     // compaction manager may have N fibers to allow parallel compaction per shard.
     std::list<lw_shared_ptr<task>> _tasks;
 
-    // Used to assert that compaction_manager was explicitly stopped, if started.
-    bool _stopped = true;
+    // Possible states in which the compaction manager can be found.
+    //
+    // none: started, but not yet enabled. Once the compaction manager moves out of "none", it can
+    //       never legally move back
+    // stopped: stop() was called. The compaction_manager will never be enabled or disabled again
+    //          and can no longer be used (although it is possible to still grab metrics, stats,
+    //          etc)
+    // enabled: accepting compactions
+    // disabled: not accepting compactions
+    //
+    // Moving the compaction manager to and from enabled and disable states is legal, as many times
+    // as necessary.
+    enum class state { none, stopped, disabled, enabled };
+    state _state = state::none;
+
+    std::optional<future<>> _stop_future;
 
     stats _stats;
     seastar::metrics::metric_groups _metrics;
+    double _last_backlog = 0.0f;
 
     std::list<lw_shared_ptr<sstables::compaction_info>> _compactions;
 
@@ -82,7 +99,7 @@ private:
     // Prevents column family from running major and minor compaction at same time.
     std::unordered_map<column_family*, rwlock> _compaction_locks;
 
-    semaphore _resharding_sem{1};
+    semaphore _custom_job_sem{1};
 
     std::function<void()> compaction_submission_callback();
     // all registered column families are submitted for compaction at a constant interval.
@@ -99,11 +116,6 @@ private:
     void register_weight(int weight);
     // Deregister weight for a column family.
     void deregister_weight(int weight);
-
-    // If weight of compaction job is taken, it will be trimmed until its new
-    // weight is not taken or its size is equal to minimum threshold.
-    // Return weight of compaction job.
-    int trim_to_compact(column_family* cf, sstables::compaction_descriptor& descriptor);
 
     // Get candidates for compaction strategy, which are all sstables but the ones being compacted.
     std::vector<sstables::shared_sstable> get_candidates(const column_family& cf);
@@ -138,21 +150,36 @@ private:
     using get_candidates_func = std::function<std::vector<sstables::shared_sstable>(const column_family&)>;
 
     future<> rewrite_sstables(column_family* cf, sstables::compaction_options options, get_candidates_func);
+
+    future<> stop_ongoing_compactions(sstring reason);
+    optimized_optional<abort_source::subscription> _early_abort_subscription;
 public:
-    compaction_manager(seastar::scheduling_group sg, const ::io_priority_class& iop, size_t available_memory);
-    compaction_manager(seastar::scheduling_group sg, const ::io_priority_class& iop, size_t available_memory, uint64_t shares);
+    compaction_manager(seastar::scheduling_group sg, const ::io_priority_class& iop, size_t available_memory, abort_source& as);
+    compaction_manager(seastar::scheduling_group sg, const ::io_priority_class& iop, size_t available_memory, uint64_t shares, abort_source& as);
     compaction_manager();
     ~compaction_manager();
 
     void register_metrics();
 
-    // Start compaction manager.
-    void start();
+    // enable/disable compaction manager.
+    void enable();
+    void disable();
 
-    // Stop all fibers. Ongoing compactions will be waited.
+    // Stop all fibers. Ongoing compactions will be waited. Should only be called
+    // once, from main teardown path.
     future<> stop();
 
-    bool stopped() const { return _stopped; }
+    // cancels all running compactions and moves the compaction manager into disabled state.
+    // The compaction manager is still alive after drain but it will not accept new compactions
+    // unless it is moved back to enabled state.
+    future<> drain();
+
+    // FIXME: should not be public. It's not anyone's business if we are enabled.
+    // distributed_loader.cc uses for resharding, remove this when the new resharding series lands.
+    bool enabled() const { return _state == state::enabled; }
+    // Stop all fibers, without waiting. Safe to be called multiple times.
+    void do_stop() noexcept;
+    void really_do_stop();
 
     // Submit a column family to be compacted.
     void submit(column_family* cf);
@@ -164,10 +191,10 @@ public:
     // Cleanup is about discarding keys that are no longer relevant for a
     // given sstable, e.g. after node loses part of its token range because
     // of a newly added node.
-    future<> perform_cleanup(column_family* cf);
+    future<> perform_cleanup(database& db, column_family* cf);
 
     // Submit a column family to be upgraded and wait for its termination.
-    future<> perform_sstable_upgrade(column_family* cf, bool exclude_current_version);
+    future<> perform_sstable_upgrade(database& db, column_family* cf, bool exclude_current_version);
 
     // Submit a column family to be scrubbed and wait for its termination.
     future<> perform_sstable_scrub(column_family* cf, bool skip_corrupted);
@@ -175,15 +202,13 @@ public:
     // Submit a column family for major compaction.
     future<> submit_major_compaction(column_family* cf);
 
-    // Run a resharding job for a given column family.
+
+    // Run a custom job for a given column family, defined by a function
     // it completes when future returned by job is ready or returns immediately
     // if manager was asked to stop.
     //
-    // parameter job is a function that will carry the reshard operation on a set
-    // of sstables that belong to different shards for this column family using
-    // sstables::reshard_sstables(), and in the end, it will forward unshared
-    // sstables created by the process to their owner shards.
-    future<> run_resharding_job(column_family* cf, std::function<future<>()> job);
+    // parameter job is a function that will carry the operation
+    future<> run_custom_job(column_family* cf, sstring name, noncopyable_function<future<>()> job);
 
     // Remove a column family from the compaction manager.
     // Cancel requests on cf and wait for a possible ongoing compaction on cf.
@@ -209,6 +234,13 @@ public:
         return _compactions;
     }
 
+    // Returns true if table has an ongoing compaction, running on its behalf
+    bool has_table_ongoing_compaction(column_family* cf) const {
+        return std::any_of(_tasks.begin(), _tasks.end(), [cf] (const lw_shared_ptr<task>& task) {
+            return task->compacting_cf == cf && task->compaction_running;
+        });
+    };
+
     // Stops ongoing compaction of a given type.
     void stop_compaction(sstring type);
 
@@ -217,7 +249,7 @@ public:
     // called before compaction seals sstable and such and after all compaction work is done.
     void on_compaction_complete(compaction_weight_registration& weight_registration);
 
-    float backlog() {
+    double backlog() {
         return _backlog_manager.backlog();
     }
 
@@ -231,4 +263,6 @@ public:
     friend class compacting_sstable_registration;
     friend class compaction_weight_registration;
 };
+
+bool needs_cleanup(const sstables::shared_sstable& sst, const dht::token_range_vector& owned_ranges, schema_ptr s);
 

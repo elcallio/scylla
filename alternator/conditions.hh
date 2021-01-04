@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 /*
@@ -33,6 +22,7 @@
 
 #include "cql3/restrictions/statement_restrictions.hh"
 #include "serialization.hh"
+#include "expressions_types.hh"
 
 namespace alternator {
 
@@ -42,8 +32,18 @@ enum class comparison_operator_type {
 
 comparison_operator_type get_comparison_operator(const rjson::value& comparison_operator);
 
-::shared_ptr<cql3::restrictions::statement_restrictions> get_filtering_restrictions(schema_ptr schema, const column_definition& attrs_col, const rjson::value& query_filter);
+enum class conditional_operator_type {
+    AND, OR, MISSING
+};
+conditional_operator_type get_conditional_operator(const rjson::value& req);
 
-bool verify_expected(const rjson::value& req, const std::unique_ptr<rjson::value>& previous_item);
+bool verify_expected(const rjson::value& req, const rjson::value* previous_item);
+bool verify_condition(const rjson::value& condition, bool require_all, const rjson::value* previous_item);
+
+bool check_CONTAINS(const rjson::value* v1, const rjson::value& v2);
+
+bool verify_condition_expression(
+        const parsed::condition_expression& condition_expression,
+        const rjson::value* previous_item);
 
 }

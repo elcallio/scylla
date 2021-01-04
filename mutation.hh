@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -108,25 +97,27 @@ public:
 public:
     // The supplied partition_slice must be governed by this mutation's schema
     query::result query(const query::partition_slice&,
+        query::result_memory_accounter&& accounter,
         query::result_options opts = query::result_options::only_result(),
         gc_clock::time_point now = gc_clock::now(),
-        uint32_t row_limit = query::max_rows) &&;
+        uint64_t row_limit = query::max_rows) &&;
 
     // The supplied partition_slice must be governed by this mutation's schema
     // FIXME: Slower than the r-value version
     query::result query(const query::partition_slice&,
+        query::result_memory_accounter&& accounter,
         query::result_options opts = query::result_options::only_result(),
         gc_clock::time_point now = gc_clock::now(),
-        uint32_t row_limit = query::max_rows) const&;
+        uint64_t row_limit = query::max_rows) const&;
 
     // The supplied partition_slice must be governed by this mutation's schema
     void query(query::result::builder& builder,
         const query::partition_slice& slice,
         gc_clock::time_point now = gc_clock::now(),
-        uint32_t row_limit = query::max_rows) &&;
+        uint64_t row_limit = query::max_rows) &&;
 
     // See mutation_partition::live_row_count()
-    size_t live_row_count(gc_clock::time_point query_time = gc_clock::time_point::min()) const;
+    uint64_t live_row_count(gc_clock::time_point query_time = gc_clock::time_point::min()) const;
 
     void apply(mutation&&);
     void apply(const mutation&);

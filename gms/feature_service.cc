@@ -1,18 +1,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  *
  * Copyright (C) 2020 ScyllaDB
  */
@@ -27,6 +16,8 @@
 #include "gms/feature_service.hh"
 
 namespace gms {
+
+// Deprecated features - sent to other nodes via gossip, but assumed true in the code
 constexpr std::string_view features::RANGE_TOMBSTONES = "RANGE_TOMBSTONES";
 constexpr std::string_view features::LARGE_PARTITIONS = "LARGE_PARTITIONS";
 constexpr std::string_view features::MATERIALIZED_VIEWS = "MATERIALIZED_VIEWS";
@@ -38,11 +29,14 @@ constexpr std::string_view features::SCHEMA_TABLES_V3 = "SCHEMA_TABLES_V3";
 constexpr std::string_view features::CORRECT_NON_COMPOUND_RANGE_TOMBSTONES = "CORRECT_NON_COMPOUND_RANGE_TOMBSTONES";
 constexpr std::string_view features::WRITE_FAILURE_REPLY = "WRITE_FAILURE_REPLY";
 constexpr std::string_view features::XXHASH = "XXHASH";
-constexpr std::string_view features::UDF = "UDF";
 constexpr std::string_view features::ROLES = "ROLES";
 constexpr std::string_view features::LA_SSTABLE = "LA_SSTABLE_FORMAT";
 constexpr std::string_view features::STREAM_WITH_RPC_STREAM = "STREAM_WITH_RPC_STREAM";
+
+// Up-to-date features
+constexpr std::string_view features::UDF = "UDF";
 constexpr std::string_view features::MC_SSTABLE = "MC_SSTABLE_FORMAT";
+constexpr std::string_view features::MD_SSTABLE = "MD_SSTABLE_FORMAT";
 constexpr std::string_view features::ROW_LEVEL_REPAIR = "ROW_LEVEL_REPAIR";
 constexpr std::string_view features::TRUNCATION_TABLE = "TRUNCATION_TABLE";
 constexpr std::string_view features::CORRECT_STATIC_COMPACT_IN_MC = "CORRECT_STATIC_COMPACT_IN_MC";
@@ -55,7 +49,12 @@ constexpr std::string_view features::NONFROZEN_UDTS = "NONFROZEN_UDTS";
 constexpr std::string_view features::HINTED_HANDOFF_SEPARATE_CONNECTION = "HINTED_HANDOFF_SEPARATE_CONNECTION";
 constexpr std::string_view features::LWT = "LWT";
 constexpr std::string_view features::PER_TABLE_PARTITIONERS = "PER_TABLE_PARTITIONERS";
+constexpr std::string_view features::PER_TABLE_CACHING = "PER_TABLE_CACHING";
+constexpr std::string_view features::DIGEST_FOR_NULL_VALUES = "DIGEST_FOR_NULL_VALUES";
+constexpr std::string_view features::CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX = "CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX";
+constexpr std::string_view features::ALTERNATOR_STREAMS = "ALTERNATOR_STREAMS";
 constexpr std::string_view features::IN_MEMORY_TABLES = "IN_MEMORY_TABLES";
+constexpr std::string_view features::WORKLOAD_PRIORITIZATION = "WORKLOAD_PRIORITIZATION";
 
 static logging::logger logger("features");
 
@@ -63,21 +62,9 @@ feature_config::feature_config() {
 }
 
 feature_service::feature_service(feature_config cfg) : _config(cfg)
-        , _range_tombstones_feature(*this, features::RANGE_TOMBSTONES)
-        , _large_partitions_feature(*this, features::LARGE_PARTITIONS)
-        , _materialized_views_feature(*this, features::MATERIALIZED_VIEWS)
-        , _counters_feature(*this, features::COUNTERS)
-        , _indexes_feature(*this, features::INDEXES)
-        , _digest_multipartition_read_feature(*this, features::DIGEST_MULTIPARTITION_READ)
-        , _correct_counter_order_feature(*this, features::CORRECT_COUNTER_ORDER)
-        , _schema_tables_v3(*this, features::SCHEMA_TABLES_V3)
-        , _correct_non_compound_range_tombstones(*this, features::CORRECT_NON_COMPOUND_RANGE_TOMBSTONES)
-        , _write_failure_reply_feature(*this, features::WRITE_FAILURE_REPLY)
-        , _xxhash_feature(*this, features::XXHASH)
         , _udf_feature(*this, features::UDF)
-        , _roles_feature(*this, features::ROLES)
-        , _stream_with_rpc_stream_feature(*this, features::STREAM_WITH_RPC_STREAM)
         , _mc_sstable_feature(*this, features::MC_SSTABLE)
+        , _md_sstable_feature(*this, features::MD_SSTABLE)
         , _row_level_repair_feature(*this, features::ROW_LEVEL_REPAIR)
         , _truncation_table(*this, features::TRUNCATION_TABLE)
         , _correct_static_compact_in_mc(*this, features::CORRECT_STATIC_COMPACT_IN_MC)
@@ -90,26 +77,44 @@ feature_service::feature_service(feature_config cfg) : _config(cfg)
         , _hinted_handoff_separate_connection(*this, features::HINTED_HANDOFF_SEPARATE_CONNECTION)
         , _lwt_feature(*this, features::LWT)
         , _per_table_partitioners_feature(*this, features::PER_TABLE_PARTITIONERS)
-        , _in_memory_tables(*this, features::IN_MEMORY_TABLES) {
-}
+        , _per_table_caching_feature(*this, features::PER_TABLE_CACHING)
+        , _digest_for_null_values_feature(*this, features::DIGEST_FOR_NULL_VALUES)
+        , _correct_idx_token_in_secondary_index_feature(*this, features::CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX)
+        , _alternator_streams_feature(*this, features::ALTERNATOR_STREAMS)
+        , _in_memory_tables(*this, features::IN_MEMORY_TABLES)
+        , _workload_prioritization(*this, features::WORKLOAD_PRIORITIZATION)
+{}
 
-feature_config feature_config_from_db_config(db::config& cfg) {
+feature_config feature_config_from_db_config(db::config& cfg, std::set<sstring> disabled) {
     feature_config fcfg;
 
-    if (cfg.enable_sstables_mc_format()) {
-        fcfg.enable_sstables_mc_format = true;
+    fcfg._masked_features.insert(sstring(gms::features::UNBOUNDED_RANGE_TOMBSTONES));
+
+    fcfg._disabled_features = std::move(disabled);
+
+    if (!cfg.enable_sstables_mc_format()) {
+        if (cfg.enable_sstables_md_format()) {
+            throw std::runtime_error(
+                    "You must use both enable_sstables_mc_format and enable_sstables_md_format "
+                    "to enable SSTables md format support");
+        }
+        fcfg._disabled_features.insert(sstring(gms::features::MC_SSTABLE));
     }
-    if (cfg.enable_user_defined_functions()) {
+    if (!cfg.enable_sstables_md_format()) {
+        fcfg._disabled_features.insert(sstring(gms::features::MD_SSTABLE));
+    }
+    if (!cfg.enable_user_defined_functions()) {
+        fcfg._disabled_features.insert(sstring(gms::features::UDF));
+    } else {
         if (!cfg.check_experimental(db::experimental_features_t::UDF)) {
             throw std::runtime_error(
                     "You must use both enable_user_defined_functions and experimental_features:udf "
                     "to enable user-defined functions");
         }
-        fcfg.enable_user_defined_functions = true;
     }
 
-    if (cfg.check_experimental(db::experimental_features_t::CDC)) {
-        fcfg.enable_cdc = true;
+    if (!cfg.check_experimental(db::experimental_features_t::ALTERNATOR_STREAMS)) {
+        fcfg._disabled_features.insert(sstring(gms::features::ALTERNATOR_STREAMS));
     }
 
     return fcfg;
@@ -136,11 +141,16 @@ void feature_service::enable(const sstring& name) {
     }
 }
 
+void feature_service::support(const std::string_view& name) {
+    _config._masked_features.erase(sstring(name));
+}
+
 std::set<std::string_view> feature_service::known_feature_set() {
     // Add features known by this local node. When a new feature is
     // introduced in scylla, update it here, e.g.,
     // return sstring("FEATURE1,FEATURE2")
     std::set<std::string_view> features = {
+        // Deprecated features - sent to other nodes via gossip, but assumed true in the code
         gms::features::RANGE_TOMBSTONES,
         gms::features::LARGE_PARTITIONS,
         gms::features::COUNTERS,
@@ -155,6 +165,8 @@ std::set<std::string_view> feature_service::known_feature_set() {
         gms::features::STREAM_WITH_RPC_STREAM,
         gms::features::MATERIALIZED_VIEWS,
         gms::features::INDEXES,
+
+        // Up-to-date features
         gms::features::ROW_LEVEL_REPAIR,
         gms::features::TRUNCATION_TABLE,
         gms::features::CORRECT_STATIC_COMPACT_IN_MC,
@@ -165,21 +177,29 @@ std::set<std::string_view> feature_service::known_feature_set() {
         gms::features::UNBOUNDED_RANGE_TOMBSTONES,
         gms::features::HINTED_HANDOFF_SEPARATE_CONNECTION,
         gms::features::PER_TABLE_PARTITIONERS,
+        gms::features::PER_TABLE_CACHING,
+        gms::features::LWT,
+        gms::features::MC_SSTABLE,
+        gms::features::MD_SSTABLE,
+        gms::features::UDF,
+        gms::features::CDC,
+        gms::features::DIGEST_FOR_NULL_VALUES,
+        gms::features::CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX,
+        gms::features::ALTERNATOR_STREAMS,
         gms::features::IN_MEMORY_TABLES,
+        gms::features::WORKLOAD_PRIORITIZATION,
     };
 
-    if (_config.enable_sstables_mc_format) {
-        features.insert(gms::features::MC_SSTABLE);
+    for (const sstring& s : _config._disabled_features) {
+        features.erase(s);
     }
-    if (_config.enable_user_defined_functions) {
-        features.insert(gms::features::UDF);
-    }
-    if (_config.enable_cdc) {
-        features.insert(gms::features::CDC);
-    }
-    features.insert(gms::features::LWT);
+    return features;
+}
 
-    for (const sstring& s : _config.disabled_features) {
+std::set<std::string_view> feature_service::supported_feature_set() {
+    auto features = known_feature_set();
+
+    for (const sstring& s : _config._masked_features) {
         features.erase(s);
     }
     return features;
@@ -225,39 +245,15 @@ db::schema_features feature_service::cluster_schema_features() const {
     f.set_if<db::schema_feature::COMPUTED_COLUMNS>(bool(_computed_columns));
     f.set_if<db::schema_feature::CDC_OPTIONS>(bool(_cdc_feature));
     f.set_if<db::schema_feature::PER_TABLE_PARTITIONERS>(bool(_per_table_partitioners_feature));
-    // We wish to be able to migrate from 2.3 and 3.0, as well as enterprise-2018.1.
-    // So we set the IN_MEMORY_TABLES feature if either the cluster feature IN_MEMORY_TABLES is present
-    // (indicating 2019.1 or later) or if the cluster XXHASH feature is not present (indicating enterprise-2018.1).
-    //
-    // Equivalently, we disable the feature if we don't have the cluster in-memory feature and do have the xxhash
-    // feature (indicating a recent open-source version).
-    bool some_features_were_propagated = bool(_range_tombstones_feature);
-    bool older_than_2019_1_or_2_3 = !_xxhash_feature;
-    bool upgrading_from_2018_1 = some_features_were_propagated && older_than_2019_1_or_2_3;
-    logger.info("range_tombstones: {} xxhash: {} in_memory: {} result: {}",
-            bool(_range_tombstones_feature), bool(_xxhash_feature), bool(_in_memory_tables),
-            bool(_in_memory_tables) || upgrading_from_2018_1);
-    f.set_if<db::schema_feature::IN_MEMORY_TABLES>(bool(_in_memory_tables) || upgrading_from_2018_1);
+    f.set_if<db::schema_feature::IN_MEMORY_TABLES>(bool(_in_memory_tables));
     return f;
 }
 
 void feature_service::enable(const std::set<std::string_view>& list) {
     for (gms::feature& f : {
-        std::ref(_range_tombstones_feature),
-        std::ref(_large_partitions_feature),
-        std::ref(_materialized_views_feature),
-        std::ref(_counters_feature),
-        std::ref(_indexes_feature),
-        std::ref(_digest_multipartition_read_feature),
-        std::ref(_correct_counter_order_feature),
-        std::ref(_schema_tables_v3),
-        std::ref(_correct_non_compound_range_tombstones),
-        std::ref(_write_failure_reply_feature),
-        std::ref(_xxhash_feature),
         std::ref(_udf_feature),
-        std::ref(_roles_feature),
-        std::ref(_stream_with_rpc_stream_feature),
         std::ref(_mc_sstable_feature),
+        std::ref(_md_sstable_feature),
         std::ref(_row_level_repair_feature),
         std::ref(_truncation_table),
         std::ref(_correct_static_compact_in_mc),
@@ -270,10 +266,15 @@ void feature_service::enable(const std::set<std::string_view>& list) {
         std::ref(_hinted_handoff_separate_connection),
         std::ref(_lwt_feature),
         std::ref(_per_table_partitioners_feature),
+        std::ref(_per_table_caching_feature),
+        std::ref(_digest_for_null_values_feature),
+        std::ref(_correct_idx_token_in_secondary_index_feature),
+        std::ref(_alternator_streams_feature),
         std::ref(_in_memory_tables),
+        std::ref(_workload_prioritization),
     })
     {
-        if (list.count(f.name())) {
+        if (list.contains(f.name())) {
             f.enable();
         }
     }

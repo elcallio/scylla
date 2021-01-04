@@ -36,6 +36,7 @@
 #include "range.hh"
 #include "log.hh"
 #include <boost/range/algorithm/partial_sort.hpp>
+#include "service/priority_manager.hh"
 
 class leveled_manifest {
     table& _table;
@@ -139,7 +140,7 @@ public:
             return 4L * max_sstable_size_in_bytes;
         }
         double bytes = pow(leveled_fan_out, level) * max_sstable_size_in_bytes;
-        if (bytes > std::numeric_limits<int64_t>::max()) {
+        if (bytes > double(std::numeric_limits<int64_t>::max())) {
             throw std::runtime_error(format("At most {:d} bytes may be in a compaction level; your maxSSTableSize must be absurdly high to compute {:f}", 
                 std::numeric_limits<int64_t>::max(), bytes));
         }
@@ -161,7 +162,8 @@ public:
             if (info.can_promote) {
                 info.candidates = get_overlapping_starved_sstables(next_level, std::move(info.candidates), compaction_counter);
             }
-            return sstables::compaction_descriptor(std::move(info.candidates), next_level, _max_sstable_size_in_bytes);
+            return sstables::compaction_descriptor(std::move(info.candidates), _table.get_sstable_set(),
+                                                   service::get_local_compaction_priority(), next_level, _max_sstable_size_in_bytes);
         } else {
             logger.debug("No compaction candidates for L{}", level);
             return sstables::compaction_descriptor();
@@ -239,7 +241,8 @@ public:
                     _table.min_compaction_threshold(), _schema->max_compaction_threshold(), _stcs_options);
                 if (!most_interesting.empty()) {
                     logger.debug("L0 is too far behind, performing size-tiering there first");
-                    return sstables::compaction_descriptor(std::move(most_interesting));
+                    return sstables::compaction_descriptor(std::move(most_interesting), _table.get_sstable_set(),
+                                                           service::get_local_compaction_priority());
                 }
             }
             auto descriptor = get_descriptor_for_level(i, last_compacted_keys, compaction_counter);
@@ -253,7 +256,8 @@ public:
             auto info = get_candidates_for(0, last_compacted_keys);
             if (!info.candidates.empty()) {
                 auto next_level = get_next_level(info.candidates, info.can_promote);
-                return sstables::compaction_descriptor(std::move(info.candidates), next_level, _max_sstable_size_in_bytes);
+                return sstables::compaction_descriptor(std::move(info.candidates), _table.get_sstable_set(),
+                                                       service::get_local_compaction_priority(), next_level, _max_sstable_size_in_bytes);
             }
         }
 

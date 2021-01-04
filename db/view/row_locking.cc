@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "row_locking.hh"
@@ -34,7 +23,7 @@ void row_locker::upgrade(schema_ptr new_schema) {
     if (new_schema == _schema) {
         return;
     }
-    mylog.debug("row_locker::upgrade from {} to {}", _schema.get(), new_schema.get());
+    mylog.debug("row_locker::upgrade from {} to {}", fmt::ptr(_schema.get()), fmt::ptr(new_schema.get()));
     _schema = new_schema;
 }
 
@@ -65,11 +54,7 @@ row_locker::lock_holder::lock_holder(row_locker* locker, const dht::decorated_ke
 future<row_locker::lock_holder>
 row_locker::lock_pk(const dht::decorated_key& pk, bool exclusive, db::timeout_clock::time_point timeout, stats& stats) {
     mylog.debug("taking {} lock on entire partition {}", (exclusive ? "exclusive" : "shared"), pk);
-    auto i = _two_level_locks.find(pk);
-    if (i == _two_level_locks.end()) {
-        // Lock doesn't exist, we need to create it first
-        i = _two_level_locks.emplace(pk, this).first;
-    }
+    auto i = _two_level_locks.try_emplace(pk, this).first;
     single_lock_stats &single_lock_stats = exclusive ? stats.exclusive_partition : stats.shared_partition;
     single_lock_stats.operations_currently_waiting_for_lock++;
     utils::latency_counter waiting_latency;
@@ -80,7 +65,7 @@ row_locker::lock_pk(const dht::decorated_key& pk, bool exclusive, db::timeout_cl
     // even in the case of rehashing.
     return f.then([this, pk = &i->first, exclusive, &single_lock_stats, waiting_latency = std::move(waiting_latency)] () mutable {
         waiting_latency.stop();
-        single_lock_stats.estimated_waiting_for_lock.add(waiting_latency.latency(), single_lock_stats.operations_currently_waiting_for_lock);
+        single_lock_stats.estimated_waiting_for_lock.add(waiting_latency.latency());
         single_lock_stats.lock_acquisitions++;
         single_lock_stats.operations_currently_waiting_for_lock--;
         return lock_holder(this, pk, exclusive);
@@ -90,11 +75,7 @@ row_locker::lock_pk(const dht::decorated_key& pk, bool exclusive, db::timeout_cl
 future<row_locker::lock_holder>
 row_locker::lock_ck(const dht::decorated_key& pk, const clustering_key_prefix& cpk, bool exclusive, db::timeout_clock::time_point timeout, stats& stats) {
     mylog.debug("taking shared lock on partition {}, and {} lock on row {} in it", pk, (exclusive ? "exclusive" : "shared"), cpk);
-    auto i = _two_level_locks.find(pk);
-    if (i == _two_level_locks.end()) {
-        // Not yet locked, we need to create the lock. This makes a copy of pk.
-        i = _two_level_locks.emplace(pk, this).first;
-    }
+    auto i = _two_level_locks.try_emplace(pk, this).first;
     future<lock_type::holder> lock_partition = i->second._partition_lock.hold_read_lock(timeout);
     auto j = i->second._row_locks.find(cpk);
     if (j == i->second._row_locks.end()) {
@@ -122,11 +103,11 @@ row_locker::lock_ck(const dht::decorated_key& pk, const clustering_key_prefix& c
     waiting_latency.start();
     future<lock_type::holder> lock_row = exclusive ? j->second.hold_write_lock(timeout) : j->second.hold_read_lock(timeout);
     return when_all_succeed(std::move(lock_partition), std::move(lock_row))
-    .then([this, pk = &i->first, cpk = &j->first, exclusive, &single_lock_stats, waiting_latency = std::move(waiting_latency)] (auto lock1, auto lock2) mutable {
+    .then_unpack([this, pk = &i->first, cpk = &j->first, exclusive, &single_lock_stats, waiting_latency = std::move(waiting_latency)] (auto lock1, auto lock2) mutable {
         lock1.release();
         lock2.release();
         waiting_latency.stop();
-        single_lock_stats.estimated_waiting_for_lock.add(waiting_latency.latency(), single_lock_stats.operations_currently_waiting_for_lock);
+        single_lock_stats.estimated_waiting_for_lock.add(waiting_latency.latency());
         single_lock_stats.lock_acquisitions++;
         single_lock_stats.operations_currently_waiting_for_lock--;
         return lock_holder(this, pk, cpk, exclusive);

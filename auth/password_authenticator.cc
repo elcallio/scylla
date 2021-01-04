@@ -51,15 +51,12 @@
 
 namespace auth {
 
-const sstring& password_authenticator_name() {
-    static const sstring name = meta::AUTH_PACKAGE_NAME + "PasswordAuthenticator";
-    return name;
-}
+constexpr std::string_view password_authenticator_name("org.apache.cassandra.auth.PasswordAuthenticator");
 
 // name of the hash column.
-static const sstring SALTED_HASH = "salted_hash";
-static const sstring DEFAULT_USER_NAME = meta::DEFAULT_SUPERUSER_NAME;
-static const sstring DEFAULT_USER_PASSWORD = meta::DEFAULT_SUPERUSER_NAME;
+static constexpr std::string_view SALTED_HASH = "salted_hash";
+static constexpr std::string_view DEFAULT_USER_NAME = meta::DEFAULT_SUPERUSER_NAME;
+static const sstring DEFAULT_USER_PASSWORD = sstring(meta::DEFAULT_SUPERUSER_NAME);
 
 static logging::logger plogger("password_authenticator");
 
@@ -87,7 +84,7 @@ static bool has_salted_hash(const cql3::untyped_result_set_row& row) {
 
 static const sstring& update_row_query() {
     static const sstring update_row_query = format("UPDATE {} SET {} = ? WHERE {} = ?",
-            meta::roles_table::qualified_name(),
+            meta::roles_table::qualified_name,
             SALTED_HASH,
             meta::roles_table::role_col_name);
     return update_row_query;
@@ -187,7 +184,7 @@ db::consistency_level password_authenticator::consistency_for_user(std::string_v
 }
 
 std::string_view password_authenticator::qualified_java_name() const {
-    return password_authenticator_name();
+    return password_authenticator_name;
 }
 
 bool password_authenticator::require_authentication() const {
@@ -204,10 +201,10 @@ authentication_option_set password_authenticator::alterable_options() const {
 
 future<authenticated_user> password_authenticator::authenticate(
                 const credentials_map& credentials) const {
-    if (!credentials.count(USERNAME_KEY)) {
+    if (!credentials.contains(USERNAME_KEY)) {
         throw exceptions::authentication_exception(format("Required key '{}' is missing", USERNAME_KEY));
     }
-    if (!credentials.count(PASSWORD_KEY)) {
+    if (!credentials.contains(PASSWORD_KEY)) {
         throw exceptions::authentication_exception(format("Required key '{}' is missing", PASSWORD_KEY));
     }
 
@@ -222,7 +219,7 @@ future<authenticated_user> password_authenticator::authenticate(
     return futurize_invoke([this, username, password] {
         static const sstring query = format("SELECT {} FROM {} WHERE {} = ?",
                 SALTED_HASH,
-                meta::roles_table::qualified_name(),
+                meta::roles_table::qualified_name,
                 meta::roles_table::role_col_name);
 
         return _qp.execute_internal(
@@ -272,7 +269,7 @@ future<> password_authenticator::alter(std::string_view role_name, const authent
     }
 
     static const sstring query = format("UPDATE {} SET {} = ? WHERE {} = ?",
-            meta::roles_table::qualified_name(),
+            meta::roles_table::qualified_name,
             SALTED_HASH,
             meta::roles_table::role_col_name);
 
@@ -286,7 +283,7 @@ future<> password_authenticator::alter(std::string_view role_name, const authent
 future<> password_authenticator::drop(std::string_view name) const {
     static const sstring query = format("DELETE {} FROM {} WHERE {} = ?",
             SALTED_HASH,
-            meta::roles_table::qualified_name(),
+            meta::roles_table::qualified_name,
             meta::roles_table::role_col_name);
 
     return _qp.execute_internal(

@@ -39,7 +39,6 @@
 
 #include "result_generator.hh"
 
-#include <seastar/util/gcc6-concepts.hh>
 
 namespace cql3 {
 
@@ -63,15 +62,15 @@ public:
     // used to include columns in the resultSet that we need to do post-query re-orderings
     // (SelectStatement.orderResults) but that shouldn't be sent to the user as they haven't been requested
     // (CASSANDRA-4911). So the serialization code will exclude any columns in name whose index is >= columnCount.
-        std::vector<::shared_ptr<column_specification>> _names;
+        std::vector<lw_shared_ptr<column_specification>> _names;
         uint32_t _column_count;
 
-        column_info(std::vector<::shared_ptr<column_specification>> names, uint32_t column_count)
+        column_info(std::vector<lw_shared_ptr<column_specification>> names, uint32_t column_count)
             : _names(std::move(names))
             , _column_count(column_count)
         { }
 
-        explicit column_info(std::vector<::shared_ptr<column_specification>> names)
+        explicit column_info(std::vector<lw_shared_ptr<column_specification>> names)
             : _names(std::move(names))
             , _column_count(_names.size())
         { }
@@ -84,15 +83,15 @@ private:
     lw_shared_ptr<const service::pager::paging_state> _paging_state;
 
 public:
-    metadata(std::vector<::shared_ptr<column_specification>> names_);
+    metadata(std::vector<lw_shared_ptr<column_specification>> names_);
 
-    metadata(flag_enum_set flags, std::vector<::shared_ptr<column_specification>> names_, uint32_t column_count,
+    metadata(flag_enum_set flags, std::vector<lw_shared_ptr<column_specification>> names_, uint32_t column_count,
             lw_shared_ptr<const service::pager::paging_state> paging_state);
 
     // The maximum number of values that the ResultSet can hold. This can be bigger than columnCount due to CASSANDRA-4911
     uint32_t value_count() const;
 
-    void add_non_serialized_column(::shared_ptr<column_specification> name);
+    void add_non_serialized_column(lw_shared_ptr<column_specification> name);
 
 private:
     bool all_in_same_cf() const;
@@ -109,7 +108,7 @@ public:
 
     lw_shared_ptr<const service::pager::paging_state> paging_state() const;
 
-    const std::vector<::shared_ptr<column_specification>>& get_names() const {
+    const std::vector<lw_shared_ptr<column_specification>>& get_names() const {
         return _column_info->_names;
     }
 };
@@ -118,37 +117,43 @@ public:
 
 class prepared_metadata {
 public:
-    enum class flag : uint8_t {
+    enum class flag : uint32_t {
         GLOBAL_TABLES_SPEC = 0,
+        // Denotes whether the prepared statement at hand is an LWT statement.
+        //
+        // Use the last available bit in the flags since we don't want to clash
+        // with C* in case they add some other flag in one the next versions of binary protocol.
+        LWT = 31
     };
 
     using flag_enum = super_enum<flag,
-        flag::GLOBAL_TABLES_SPEC>;
+        flag::GLOBAL_TABLES_SPEC,
+        flag::LWT>;
 
     using flag_enum_set = enum_set<flag_enum>;
+
+    static constexpr flag_enum_set::mask_type LWT_FLAG_MASK = flag_enum_set::mask_for<flag::LWT>();
+
 private:
     flag_enum_set _flags;
-    std::vector<::shared_ptr<column_specification>> _names;
+    std::vector<lw_shared_ptr<column_specification>> _names;
     std::vector<uint16_t> _partition_key_bind_indices;
 public:
-    prepared_metadata(const std::vector<::shared_ptr<column_specification>>& names,
-                      const std::vector<uint16_t>& partition_key_bind_indices);
+    prepared_metadata(const std::vector<lw_shared_ptr<column_specification>>& names,
+                      const std::vector<uint16_t>& partition_key_bind_indices,
+                      bool is_conditional);
 
     flag_enum_set flags() const;
-    const std::vector<::shared_ptr<column_specification>>& names() const;
+    const std::vector<lw_shared_ptr<column_specification>>& names() const;
     const std::vector<uint16_t>& partition_key_bind_indices() const;
 };
 
-GCC6_CONCEPT(
-
 template<typename Visitor>
-concept bool ResultVisitor = requires(Visitor& visitor) {
+concept ResultVisitor = requires(Visitor& visitor) {
     visitor.start_row();
     visitor.accept_value(std::optional<query::result_bytes_view>());
     visitor.end_row();
 };
-
-)
 
 class result_set {
     ::shared_ptr<metadata> _metadata;
@@ -156,7 +161,7 @@ class result_set {
 
     friend class result;
 public:
-    result_set(std::vector<::shared_ptr<column_specification>> metadata_);
+    result_set(std::vector<lw_shared_ptr<column_specification>> metadata_);
 
     result_set(::shared_ptr<metadata> metadata);
 
@@ -188,7 +193,7 @@ public:
     const std::deque<std::vector<bytes_opt>>& rows() const;
 
     template<typename Visitor>
-    GCC6_CONCEPT(requires ResultVisitor<Visitor>)
+    requires ResultVisitor<Visitor>
     void visit(Visitor&& visitor) const {
         auto column_count = get_metadata().column_count();
         for (auto& row : _rows) {
@@ -253,7 +258,7 @@ public:
     }
 
     template<typename Visitor>
-    GCC6_CONCEPT(requires ResultVisitor<Visitor>)
+    requires ResultVisitor<Visitor>
     void visit(Visitor&& visitor) const {
         if (_result_set) {
             _result_set->visit(std::forward<Visitor>(visitor));

@@ -2,24 +2,13 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for the Scan operation
 
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string, full_scan, full_scan_and_count, multiset
+from util import random_string, random_bytes, full_scan, full_scan_and_count, multiset
 from boto3.dynamodb.conditions import Attr
 
 # Test that scanning works fine with/without pagination
@@ -30,10 +19,10 @@ def test_scan_basic(filled_test_table):
         got_items = []
         while True:
             if limit:
-                response = test_table.scan(Limit=limit, ExclusiveStartKey=pos) if pos else test_table.scan(Limit=limit)
+                response = test_table.scan(Limit=limit, ConsistentRead=True, ExclusiveStartKey=pos) if pos else test_table.scan(Limit=limit, ConsistentRead=True)
                 assert len(response['Items']) <= limit
             else:
-                response = test_table.scan(ExclusiveStartKey=pos) if pos else test_table.scan()
+                response = test_table.scan(ExclusiveStartKey=pos, ConsistentRead=True) if pos else test_table.scan(ConsistentRead=True)
             pos = response.get('LastEvaluatedKey', None)
             got_items += response['Items']
             if not pos:
@@ -128,7 +117,6 @@ def test_scan_with_attribute_equality_filtering(dynamodb, filled_test_table):
     assert multiset(expected_items) == multiset(got_items)
 
 # Test that FilterExpression works as expected
-@pytest.mark.xfail(reason="FilterExpression not supported yet")
 def test_scan_filter_expression(filled_test_table):
     test_table, items = filled_test_table
 
@@ -244,7 +232,6 @@ def test_scan_select(filled_test_table):
 # a scan into multiple parts, and that these parts are in fact disjoint,
 # and their union is the entire contents of the table. We do not actually
 # try to run these queries in *parallel* in this test.
-@pytest.mark.xfail(reason="parallel scan not supported yet")
 def test_scan_parallel(filled_test_table):
     test_table, items = filled_test_table
     for nsegments in [1, 2, 17]:
@@ -255,3 +242,31 @@ def test_scan_parallel(filled_test_table):
         # The following comparison verifies that each of the expected item
         # in items was returned in one - and just one - of the segments.
         assert multiset(items) == multiset(got_items)
+
+# Test correct handling of incorrect parallel scan parameters.
+# Most of the corner cases (like TotalSegments=0) are validated
+# by boto3 itself, but some checks can still be performed.
+def test_scan_parallel_incorrect(filled_test_table):
+    test_table, items = filled_test_table
+    with pytest.raises(ClientError, match='ValidationException.*Segment'):
+        full_scan(test_table, TotalSegments=1000001, Segment=0)
+    for segment in [7, 9]:
+        with pytest.raises(ClientError, match='ValidationException.*Segment'):
+            full_scan(test_table, TotalSegments=5, Segment=segment)
+
+# We used to have a bug with formatting of LastEvaluatedKey in the response
+# of Query and Scan with bytes keys (issue #7768). In test_query_paging_byte()
+# (test_query.py) we tested the case of bytes *sort* keys. In the following
+# test we check bytes *partition* keys.
+def test_scan_paging_bytes(test_table_b):
+    # We will not Scan the entire table - we have no idea what it contains.
+    # But we don't need to scan the entire table - we just need the table
+    # to contain at least two items, and then Scan it with Limit=1 and stop
+    # after one page. Before #7768 was fixed, the test failed when the
+    # LastEvaluatedKey in the response could not be parsed.
+    items = [{'p': random_bytes()}, {'p': random_bytes()}]
+    with test_table_b.batch_writer() as batch:
+        for item in items:
+            batch.put_item(item)
+    response = test_table_b.scan(ConsistentRead=True, Limit=1)
+    assert 'LastEvaluatedKey' in response

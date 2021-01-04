@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "mutation_writer/multishard_writer.hh"
@@ -28,6 +17,8 @@
 #include <seastar/core/queue.hh>
 
 namespace mutation_writer {
+
+thread_local reader_concurrency_semaphore semaphore(reader_concurrency_semaphore::no_limits{}, "multishard_writer");
 
 class shard_writer {
 private:
@@ -104,12 +95,13 @@ multishard_writer::multishard_writer(
 }
 
 future<> multishard_writer::make_shard_writer(unsigned shard) {
-    auto [reader, handle] = make_queue_reader(_s);
+    auto [reader, handle] = make_queue_reader(_s, _producer.permit());
     _queue_reader_handles[shard] = std::move(handle);
     return smp::submit_to(shard, [gs = global_schema_ptr(_s),
             consumer = _consumer,
             reader = make_foreign(std::make_unique<flat_mutation_reader>(std::move(reader)))] () mutable {
-        auto this_shard_reader = make_foreign_reader(gs.get(), std::move(reader));
+        auto s = gs.get();
+        auto this_shard_reader = make_foreign_reader(s, semaphore.make_permit(s.get(), "multishard-writer"), std::move(reader));
         return make_foreign(std::make_unique<shard_writer>(gs.get(), std::move(this_shard_reader), consumer));
     }).then([this, shard] (foreign_ptr<std::unique_ptr<shard_writer>> writer) {
         _shard_writers[shard] = std::move(writer);
@@ -173,6 +165,13 @@ future<> multishard_writer::distribute_mutation_fragments() {
                 return handle_end_of_stream();
             }
         });
+    }).handle_exception([this] (std::exception_ptr ep) {
+        for (auto& q : _queue_reader_handles) {
+            if (q) {
+                q->abort(ep);
+            }
+        }
+        return make_exception_future<>(std::move(ep));
     });
 }
 

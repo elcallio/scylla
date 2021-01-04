@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 
@@ -62,16 +51,6 @@ SEASTAR_TEST_CASE(test_allow_filtering_check) {
 
         for (const sstring& q : queries) {
             e.execute_cql(q).get();
-            e.execute_cql(q + " ALLOW FILTERING").get();
-        }
-
-        queries = {
-            "SELECT * FROM t WHERE c = 2",
-            "SELECT * FROM t WHERE c <= 4"
-        };
-
-        for (const sstring& q : queries) {
-            BOOST_CHECK_THROW(e.execute_cql(q).get(), exceptions::invalid_request_exception);
             e.execute_cql(q + " ALLOW FILTERING").get();
         }
 
@@ -208,7 +187,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_multi_column) {
         e.execute_cql("INSERT INTO t (a,b,c,d,e) VALUES (1, 2, 1, 2, 25)").get();
         e.execute_cql("INSERT INTO t (a,b,c,d,e) VALUES (1, 2, 1, 3, 35)").get();
 
-        auto msg = e.execute_cql("SELECT * FROM t WHERE (c, d) = (1, 2) ALLOW FILTERING").get0();
+        auto msg = e.execute_cql("SELECT * FROM t WHERE (c, d) = (1, 2)").get0();
         assert_that(msg).is_rows().with_rows_ignore_order({
             {
                 int32_type->decompose(1),
@@ -226,7 +205,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_multi_column) {
             },
         });
 
-        msg = e.execute_cql("SELECT * FROM t WHERE (c, d) IN ((1, 2), (1,3), (1,4)) ALLOW FILTERING").get0();
+        msg = e.execute_cql("SELECT * FROM t WHERE (c, d) IN ((1, 2), (1,3), (1,4))").get0();
         assert_that(msg).is_rows().with_rows_ignore_order({
             {
                 int32_type->decompose(1),
@@ -251,7 +230,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_multi_column) {
             },
         });
 
-        msg = e.execute_cql("SELECT * FROM t WHERE (c, d) < (1, 3) ALLOW FILTERING").get0();
+        msg = e.execute_cql("SELECT * FROM t WHERE (c, d) < (1, 3)").get0();
         assert_that(msg).is_rows().with_rows_ignore_order({
             {
                 int32_type->decompose(1),
@@ -276,7 +255,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_multi_column) {
             },
         });
 
-        msg = e.execute_cql("SELECT * FROM t WHERE (c, d) < (1, 3) AND (c, d) > (1, 1) ALLOW FILTERING").get0();
+        msg = e.execute_cql("SELECT * FROM t WHERE (c, d) < (1, 3) AND (c, d) > (1, 1)").get0();
         assert_that(msg).is_rows().with_rows_ignore_order({
             {
                 int32_type->decompose(1),
@@ -344,10 +323,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_clustering_column) {
             int32_type->decompose(1)
         }});
 
-        BOOST_CHECK_THROW(e.execute_cql("SELECT * FROM t WHERE c = 2").get(), exceptions::invalid_request_exception);
-        BOOST_CHECK_THROW(e.execute_cql("SELECT * FROM t WHERE c > 2 AND c <= 4").get(), exceptions::invalid_request_exception);
-
-        msg = e.execute_cql("SELECT * FROM t WHERE c = 2 ALLOW FILTERING").get0();
+        msg = e.execute_cql("SELECT * FROM t WHERE c = 2").get0();
         assert_that(msg).is_rows().with_rows({
             {
                 int32_type->decompose(1),
@@ -361,7 +337,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_clustering_column) {
            }
         });
 
-        msg = e.execute_cql("SELECT * FROM t WHERE c > 2 AND c <= 4 ALLOW FILTERING").get0();
+        msg = e.execute_cql("SELECT * FROM t WHERE c > 2 AND c <= 4").get0();
         assert_that(msg).is_rows().with_rows({{
             int32_type->decompose(1),
             int32_type->decompose(3),
@@ -614,7 +590,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_desc) {
         e.execute_cql("INSERT INTO t (a, b, c, d, e) VALUES (1, 2, 5, 1, 9)").get();
         e.execute_cql("INSERT INTO t (a, b, c, d, e) VALUES (1, 2, 6, 7, 5)").get();
 
-        auto msg = e.execute_cql("SELECT a, b, c, d, e FROM t WHERE c > 3 ALLOW FILTERING").get0();
+        auto msg = e.execute_cql("SELECT a, b, c, d, e FROM t WHERE c > 3").get0();
         assert_that(msg).is_rows().with_rows({
             {
                 int32_type->decompose(1),
@@ -632,7 +608,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_desc) {
             }
         });
 
-        msg = e.execute_cql("SELECT a, b, c, d, e FROM t WHERE c < 4 ALLOW FILTERING").get0();
+        msg = e.execute_cql("SELECT a, b, c, d, e FROM t WHERE c < 4").get0();
         assert_that(msg).is_rows().with_rows({
             {
                 int32_type->decompose(1),
@@ -650,7 +626,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_desc) {
             }
         });
 
-        msg = e.execute_cql("SELECT a, b, c, d, e FROM t WHERE c = 4 ALLOW FILTERING").get0();
+        msg = e.execute_cql("SELECT a, b, c, d, e FROM t WHERE c = 4").get0();
         assert_that(msg).is_rows().with_size(0);
     });
 }
@@ -916,7 +892,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_limit) {
 
         // Assert that with LIMIT 3 and paging 1 we will not extract more than 3 values (issue #4100)
         rows_fetched = 0;
-        uint32_t remaining = 1;
+        uint64_t remaining = 1;
         while (remaining > 0) {
             qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, infinite_timeout_config, std::vector<cql3::raw_value>{},
                     cql3::query_options::specific_options{1, paging_state, {}, api::new_timestamp()});
@@ -1012,7 +988,7 @@ SEASTAR_TEST_CASE(test_allow_filtering_per_partition_limit) {
                 for (unsigned ppl = 1; ppl < 3; ++ppl) {
                     paging_state = nullptr;
                     rows_fetched = 0;
-                    uint32_t remaining = 1;
+                    uint64_t remaining = 1;
                     while (remaining > 0) {
                         qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, infinite_timeout_config, std::vector<cql3::raw_value>{},
                                 cql3::query_options::specific_options{pg, paging_state, {}, api::new_timestamp()});
@@ -1089,7 +1065,7 @@ SEASTAR_TEST_CASE(test_filtering_on_empty_partition_with_a_static_row) {
         cquery_nofail(e, "INSERT INTO t (p, s) VALUES (1, 1);");
         auto msg = cquery_nofail(e, "SELECT * FROM t WHERE s = 2 ALLOW FILTERING;");
         assert_that(msg).is_rows().is_empty();
-        msg = cquery_nofail(e, "SELECT * FROM t WHERE c = 1 ALLOW FILTERING");
+        msg = cquery_nofail(e, "SELECT * FROM t WHERE c = 1");
         assert_that(msg).is_rows().is_empty();
         cquery_nofail(e, "INSERT INTO t (p, c, s) VALUES (2, 2, 2);");
         msg = cquery_nofail(e, "SELECT * FROM t WHERE s = 1 ALLOW FILTERING");
@@ -1134,6 +1110,9 @@ SEASTAR_TEST_CASE(test_filtering) {
                 { int32_type->decompose(8), int32_type->decompose(3) },
                 { int32_type->decompose(9), int32_type->decompose(3) },
             });
+            require_rows(e, "SELECT k FROM cf WHERE k=12 AND (m,n)>=(4,0) ALLOW FILTERING;", {
+                    { int32_type->decompose(12), int32_type->decompose(4), int32_type->decompose(5)},
+                });
         }
 
         // test filtering on clustering keys

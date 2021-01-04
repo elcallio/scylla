@@ -80,13 +80,23 @@ range_streamer::get_range_fetch_map(const std::unordered_map<dht::token_range, s
         }
 
         if (!found_source) {
-            throw std::runtime_error(format("unable to find sufficient sources for streaming range {} in keyspace {}", range_, keyspace));
+            auto& ks = _db.local().find_keyspace(keyspace);
+            auto rf = ks.get_replication_strategy().get_replication_factor();
+            // When a replacing node replaces a dead node with keyspace of RF
+            // 1, it is expected that replacing node could not find a peer node
+            // that contains data to stream from.
+            if (_reason == streaming::stream_reason::replace && rf == 1) {
+                logger.warn("Unable to find sufficient sources to stream range {} for keyspace {} with RF = 1 for replace operation", range_, keyspace);
+            } else {
+                throw std::runtime_error(format("unable to find sufficient sources for streaming range {} in keyspace {}", range_, keyspace));
+            }
         }
     }
 
     return range_fetch_map_map;
 }
 
+// Must be called from a seastar thread
 std::unordered_map<dht::token_range, std::vector<inet_address>>
 range_streamer::get_all_ranges_with_sources_for(const sstring& keyspace_name, dht::token_range_vector desired_ranges) {
     logger.debug("{} ks={}", __func__, keyspace_name);
@@ -94,8 +104,9 @@ range_streamer::get_all_ranges_with_sources_for(const sstring& keyspace_name, dh
     auto& ks = _db.local().find_keyspace(keyspace_name);
     auto& strat = ks.get_replication_strategy();
 
-    auto tm = _metadata.clone_only_token_map();
-    auto range_addresses = strat.get_range_addresses(tm);
+    auto tm = get_token_metadata().clone_only_token_map().get0();
+    auto range_addresses = strat.get_range_addresses(tm, utils::can_yield::yes);
+    tm.clear_gently().get();
 
     logger.debug("keyspace={}, desired_ranges.size={}, range_addresses.size={}", keyspace_name, desired_ranges.size(), range_addresses.size());
 
@@ -126,6 +137,7 @@ range_streamer::get_all_ranges_with_sources_for(const sstring& keyspace_name, dh
     return range_sources;
 }
 
+// Must be called from a seastar thread
 std::unordered_map<dht::token_range, std::vector<inet_address>>
 range_streamer::get_all_ranges_with_strict_sources_for(const sstring& keyspace_name, dht::token_range_vector desired_ranges) {
     logger.debug("{} ks={}", __func__, keyspace_name);
@@ -135,12 +147,13 @@ range_streamer::get_all_ranges_with_strict_sources_for(const sstring& keyspace_n
     auto& strat = ks.get_replication_strategy();
 
     //Active ranges
-    auto metadata_clone = _metadata.clone_only_token_map();
-    auto range_addresses = strat.get_range_addresses(metadata_clone);
+    auto metadata_clone = get_token_metadata().clone_only_token_map().get0();
+    auto range_addresses = strat.get_range_addresses(metadata_clone, utils::can_yield::yes);
 
     //Pending ranges
-    metadata_clone.update_normal_tokens(_tokens, _address);
-    auto pending_range_addresses  = strat.get_range_addresses(metadata_clone);
+    metadata_clone.update_normal_tokens(_tokens, _address).get();
+    auto pending_range_addresses  = strat.get_range_addresses(metadata_clone, utils::can_yield::yes);
+    metadata_clone.clear_gently().get();
 
     //Collects the source that will have its range moved to the new node
     std::unordered_map<dht::token_range, std::vector<inet_address>> range_sources;
@@ -164,9 +177,8 @@ range_streamer::get_all_ranges_with_strict_sources_for(const sstring& keyspace_n
                 //Due to CASSANDRA-5953 we can have a higher RF then we have endpoints.
                 //So we need to be careful to only be strict when endpoints == RF
                 if (old_endpoints.size() == strat.get_replication_factor()) {
-                    auto it = std::remove_if(old_endpoints.begin(), old_endpoints.end(),
-                        [&new_endpoints] (inet_address ep) { return new_endpoints.count(ep); });
-                    old_endpoints.erase(it, old_endpoints.end());
+                    std::erase_if(old_endpoints,
+                        [&new_endpoints] (inet_address ep) { return new_endpoints.contains(ep); });
                     if (old_endpoints.size() != 1) {
                         throw std::runtime_error(format("Expected 1 endpoint but found {:d}", old_endpoints.size()));
                     }
@@ -202,7 +214,7 @@ bool range_streamer::use_strict_sources_for_ranges(const sstring& keyspace_name)
     return !_db.local().is_replacing()
            && use_strict_consistency()
            && !_tokens.empty()
-           && _metadata.get_all_endpoints().size() != strat.get_replication_factor();
+           && get_token_metadata().get_all_endpoints().size() != strat.get_replication_factor();
 }
 
 void range_streamer::add_tx_ranges(const sstring& keyspace_name, std::unordered_map<inet_address, dht::token_range_vector> ranges_per_endpoint) {
@@ -293,7 +305,7 @@ future<> range_streamer::do_stream_async() {
                 dht::token_range_vector ranges_to_stream;
                 auto do_streaming = [&] {
                     auto sp = stream_plan(format("{}-{}-index-{:d}", description, keyspace, sp_index++), _reason);
-                    auto abort_listener = _abort_source.subscribe([&] { sp.abort(); });
+                    auto abort_listener = _abort_source.subscribe([&] () noexcept { sp.abort(); });
                     _abort_source.check();
                     logger.info("{} with {} for keyspace={}, streaming [{}, {}) out of {} ranges",
                             description, source, keyspace,

@@ -12,15 +12,37 @@
 
 #include <unordered_map>
 #include <exception>
+#include <absl/container/btree_set.h>
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/future.hh>
 
 #include "database_fwd.hh"
-#include "flat_mutation_reader.hh"
+#include "frozen_mutation.hh"
 #include "utils/UUID.hh"
+#include "utils/hash.hh"
 #include "streaming/stream_plan.hh"
+#include "locator/token_metadata.hh"
+
+class flat_mutation_reader;
+
+class database;
+class repair_service;
+namespace db {
+    namespace view {
+        class view_update_generator;
+    }
+    class system_distributed_keyspace;
+}
+namespace netw { class messaging_service; }
+
+future<> repair_init_messaging_service_handler(repair_service& rs,
+        distributed<db::system_distributed_keyspace>& sys_dist_ks,
+        distributed<db::view::view_update_generator>& view_update_generator,
+        sharded<database>& db,
+        sharded<netw::messaging_service>& ms);
+future<> repair_uninit_messaging_service_handler();
 
 class repair_exception : public std::exception {
 private:
@@ -35,12 +57,29 @@ public:
     repair_stopped_exception() : repair_exception("Repair stopped") { }
 };
 
+struct repair_uniq_id {
+    // The integer ID used to identify a repair job. It is currently used by nodetool and http API.
+    int id;
+    // A UUID to identifiy a repair job. We will transit to use UUID over the integer ID.
+    utils::UUID uuid;
+};
+std::ostream& operator<<(std::ostream& os, const repair_uniq_id& x);
+
+struct node_ops_info {
+    utils::UUID ops_uuid;
+    bool abort = false;
+    std::list<gms::inet_address> ignore_nodes;
+    void check_abort();
+};
+
 // The tokens are the tokens assigned to the bootstrap node.
-future<> bootstrap_with_repair(seastar::sharded<database>& db, locator::token_metadata tm, std::unordered_set<dht::token> bootstrap_tokens);
-future<> decommission_with_repair(seastar::sharded<database>& db, locator::token_metadata tm);
-future<> removenode_with_repair(seastar::sharded<database>& db, locator::token_metadata tm, gms::inet_address leaving_node);
-future<> rebuild_with_repair(seastar::sharded<database>& db, locator::token_metadata tm, sstring source_dc);
-future<> replace_with_repair(seastar::sharded<database>& db, locator::token_metadata tm);
+future<> bootstrap_with_repair(seastar::sharded<database>& db, seastar::sharded<netw::messaging_service>& ms, locator::token_metadata_ptr tmptr, std::unordered_set<dht::token> bootstrap_tokens);
+future<> decommission_with_repair(seastar::sharded<database>& db, seastar::sharded<netw::messaging_service>& ms, locator::token_metadata_ptr tmptr);
+future<> removenode_with_repair(seastar::sharded<database>& db, seastar::sharded<netw::messaging_service>& ms, locator::token_metadata_ptr tmptr, gms::inet_address leaving_node, shared_ptr<node_ops_info> ops);
+future<> rebuild_with_repair(seastar::sharded<database>& db, seastar::sharded<netw::messaging_service>& ms, locator::token_metadata_ptr tmptr, sstring source_dc);
+future<> replace_with_repair(seastar::sharded<database>& db, seastar::sharded<netw::messaging_service>& ms, locator::token_metadata_ptr tmptr, std::unordered_set<dht::token> replacing_tokens);
+
+future<> abort_repair_node_ops(utils::UUID ops_uuid);
 
 // NOTE: repair_start() can be run on any node, but starts a node-global
 // operation.
@@ -49,8 +88,8 @@ future<> replace_with_repair(seastar::sharded<database>& db, locator::token_meta
 // repair_get_status(). The returned future<int> becomes available quickly,
 // as soon as repair_get_status() can be used - it doesn't wait for the
 // repair to complete.
-future<int> repair_start(seastar::sharded<database>& db, sstring keyspace,
-        std::unordered_map<sstring, sstring> options);
+future<int> repair_start(seastar::sharded<database>& db, seastar::sharded<netw::messaging_service>& ms,
+        sstring keyspace, std::unordered_map<sstring, sstring> options);
 
 // TODO: Have repair_progress contains a percentage progress estimator
 // instead of just "RUNNING".
@@ -59,6 +98,10 @@ enum class repair_status { RUNNING, SUCCESSFUL, FAILED };
 // repair_get_status() returns a future because it needs to run code on a
 // different CPU (cpu 0) and that might be a deferring operation.
 future<repair_status> repair_get_status(seastar::sharded<database>& db, int id);
+
+// If the repair job is finished (SUCCESSFUL or FAILED), it returns immediately.
+// It blocks if the repair job is still RUNNING until timeout.
+future<repair_status> repair_await_completion(seastar::sharded<database>& db, int id, std::chrono::steady_clock::time_point timeout);
 
 // returns a vector with the ids of the active repairs
 future<std::vector<int>> get_active_repairs(seastar::sharded<database>& db);
@@ -162,16 +205,20 @@ public:
 class repair_info {
 public:
     seastar::sharded<database>& db;
+    seastar::sharded<netw::messaging_service>& messaging;
     const dht::sharder& sharder;
     sstring keyspace;
     dht::token_range_vector ranges;
     std::vector<sstring> cfs;
-    int id;
+    std::vector<utils::UUID> table_ids;
+    repair_uniq_id id;
     shard_id shard;
     std::vector<sstring> data_centers;
     std::vector<sstring> hosts;
     streaming::stream_reason reason;
     std::unordered_map<dht::token_range, repair_neighbors> neighbors;
+    uint64_t nr_ranges_finished = 0;
+    uint64_t nr_ranges_total;
     size_t nr_failed_ranges = 0;
     bool aborted = false;
     // Map of peer -> <cf, ranges>
@@ -194,15 +241,19 @@ public:
     repair_stats _stats;
     bool _row_level_repair;
     uint64_t _sub_ranges_nr = 0;
+    std::unordered_set<sstring> dropped_tables;
+    std::optional<utils::UUID> _ops_uuid;
 public:
     repair_info(seastar::sharded<database>& db_,
+            seastar::sharded<netw::messaging_service>& ms_,
             const sstring& keyspace_,
             const dht::token_range_vector& ranges_,
-            const std::vector<sstring>& cfs_,
-            int id_,
+            std::vector<utils::UUID> table_ids_,
+            repair_uniq_id id_,
             const std::vector<sstring>& data_centers_,
             const std::vector<sstring>& hosts_,
-            streaming::stream_reason reason_);
+            streaming::stream_reason reason_,
+            std::optional<utils::UUID> ops_uuid);
     future<> do_streaming();
     void check_failed_ranges();
     future<> request_transfer_ranges(const sstring& cf,
@@ -218,6 +269,12 @@ public:
     bool row_level_repair() {
         return _row_level_repair;
     }
+    const std::vector<sstring>& table_names() {
+        return cfs;
+    }
+    const std::optional<utils::UUID>& ops_uuid() const {
+        return _ops_uuid;
+    };
 };
 
 // The repair_tracker tracks ongoing repair operations and their progress.
@@ -249,13 +306,14 @@ private:
     // by one shared.
     std::vector<named_semaphore> _range_parallelism_semaphores;
     static constexpr size_t _max_repair_memory_per_range = 32 * 1024 * 1024;
-    void start(int id);
-    void done(int id, bool succeeded);
+    seastar::condition_variable _done_cond;
+    void start(repair_uniq_id id);
+    void done(repair_uniq_id id, bool succeeded);
 public:
     explicit tracker(size_t nr_shards, size_t max_repair_memory);
     ~tracker();
     repair_status get(int id);
-    int next_repair_command();
+    repair_uniq_id next_repair_command();
     future<> shutdown();
     void check_in_shutdown();
     void add_repair_info(int id, lw_shared_ptr<repair_info> ri);
@@ -266,7 +324,10 @@ public:
     void abort_all_repairs();
     named_semaphore& range_parallelism_semaphore();
     static size_t max_repair_memory_per_range() { return _max_repair_memory_per_range; }
-    future<> run(int id, std::function<future<> ()> func);
+    future<> run(repair_uniq_id id, std::function<void ()> func);
+    future<repair_status> repair_await_completion(int id, std::chrono::steady_clock::time_point timeout);
+    float report_progress(streaming::stream_reason reason);
+    void abort_repair_node_ops(utils::UUID ops_uuid);
 };
 
 future<uint64_t> estimate_partitions(seastar::sharded<database>& db, const sstring& keyspace,
@@ -321,6 +382,17 @@ public:
     friend std::ostream& operator<<(std::ostream& os, const repair_hash& x) {
         return os << x.hash;
     }
+};
+
+using repair_hash_set = absl::btree_set<repair_hash>;
+
+enum class repair_row_level_start_status: uint8_t {
+    ok,
+    no_such_column_family,
+};
+
+struct repair_row_level_start_response {
+    repair_row_level_start_status status;
 };
 
 // Return value of the REPAIR_GET_SYNC_BOUNDARY RPC verb
@@ -395,6 +467,27 @@ enum class row_level_diff_detect_algorithm : uint8_t {
 };
 
 std::ostream& operator<<(std::ostream& out, row_level_diff_detect_algorithm algo);
+
+enum class node_ops_cmd : uint32_t {
+     removenode_prepare,
+     removenode_heartbeat,
+     removenode_sync_data,
+     removenode_abort,
+     removenode_done,
+};
+
+// The cmd and ops_uuid are mandatory for each request.
+// The ignore_nodes and leaving_node are optional.
+struct node_ops_cmd_request {
+    node_ops_cmd cmd;
+    utils::UUID ops_uuid;
+    std::list<gms::inet_address> ignore_nodes;
+    std::list<gms::inet_address> leaving_nodes;
+};
+
+struct node_ops_cmd_response {
+    bool ok;
+};
 
 namespace std {
 template<>

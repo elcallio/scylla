@@ -105,6 +105,23 @@ static future<json::json_return_type>  sum_timed_rate_as_long(distributed<proxy>
     });
 }
 
+utils_json::estimated_histogram time_to_json_histogram(const utils::time_estimated_histogram& val) {
+    utils_json::estimated_histogram res;
+    for (size_t i = 0; i < val.size(); i++) {
+        res.buckets.push(val.get(i));
+        res.bucket_offsets.push(val.get_bucket_lower_limit(i));
+    }
+    return res;
+}
+
+static future<json::json_return_type>  sum_estimated_histogram(http_context& ctx, utils::time_estimated_histogram service::storage_proxy_stats::stats::*f) {
+
+    return two_dimensional_map_reduce(ctx.sp, f, utils::time_estimated_histogram_merge,
+            utils::time_estimated_histogram()).then([](const utils::time_estimated_histogram& val) {
+        return make_ready_future<json::json_return_type>(time_to_json_histogram(val));
+    });
+}
+
 static future<json::json_return_type>  sum_estimated_histogram(http_context& ctx, utils::estimated_histogram service::storage_proxy_stats::stats::*f) {
 
     return two_dimensional_map_reduce(ctx.sp, f, utils::estimated_histogram_merge,
@@ -173,29 +190,39 @@ void set_storage_proxy(http_context& ctx, routes& r) {
     });
 
     sp::get_hinted_handoff_enabled.set(r, [&ctx](std::unique_ptr<request> req)  {
-        auto enabled = ctx.db.local().get_config().hinted_handoff_enabled();
-        return make_ready_future<json::json_return_type>(enabled);
+        const auto& filter = service::get_storage_proxy().local().get_hints_host_filter();
+        return make_ready_future<json::json_return_type>(!filter.is_disabled_for_all());
     });
 
     sp::set_hinted_handoff_enabled.set(r, [](std::unique_ptr<request> req)  {
-        //TBD
-        unimplemented();
         auto enable = req->get_query_param("enable");
-        return make_ready_future<json::json_return_type>(json_void());
+        auto filter = (enable == "true" || enable == "1")
+                ? db::hints::host_filter(db::hints::host_filter::enabled_for_all_tag {})
+                : db::hints::host_filter(db::hints::host_filter::disabled_for_all_tag {});
+        return service::get_storage_proxy().invoke_on_all([filter = std::move(filter)] (service::storage_proxy& sp) {
+            return sp.change_hints_host_filter(filter);
+        }).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
     });
 
     sp::get_hinted_handoff_enabled_by_dc.set(r, [](std::unique_ptr<request> req)  {
-        //TBD
-        unimplemented();
-        std::vector<sp::mapper_list> res;
+        std::vector<sstring> res;
+        const auto& filter = service::get_storage_proxy().local().get_hints_host_filter();
+        const auto& dcs = filter.get_dcs();
+        res.reserve(res.size());
+        std::copy(dcs.begin(), dcs.end(), std::back_inserter(res));
         return make_ready_future<json::json_return_type>(res);
     });
 
     sp::set_hinted_handoff_enabled_by_dc_list.set(r, [](std::unique_ptr<request> req)  {
-        //TBD
-        unimplemented();
-        auto enable = req->get_query_param("dcs");
-        return make_ready_future<json::json_return_type>(json_void());
+        auto dcs = req->get_query_param("dcs");
+        auto filter = db::hints::host_filter::parse_from_dc_list(std::move(dcs));
+        return service::get_storage_proxy().invoke_on_all([filter = std::move(filter)] (service::storage_proxy& sp) {
+            return sp.change_hints_host_filter(filter);
+        }).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
     });
 
     sp::get_max_hint_window.set(r, [](std::unique_ptr<request> req)  {

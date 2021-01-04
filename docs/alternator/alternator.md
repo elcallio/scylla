@@ -25,21 +25,38 @@ By default, Scylla listens on this port on all network interfaces.
 To listen only on a specific interface, pass also an "`alternator-address`"
 option.
 
-DynamoDB clients usually specify a single "endpoint" address, e.g.,
-`dynamodb.us-east-1.amazonaws.com`, and a DNS server hosted on that address
-distributes the connections to many different backend nodes. Alternator
-does not yet provide such a DNS server, so you should either supply your
-own (having it return one of the live Scylla nodes at random, with a TTL
-of a few seconds), or you should use a different mechanism to distribute
-different DynamoDB requests to different Scylla nodes, to balance the load.
+In addition to (or instead of) serving HTTP requests on `alternator-port`,
+Scylla can accept DynamoDB API requests over HTTPS (encrypted), on the port
+specified by `alternator-https-port`. As usual for HTTPS servers, the
+operator must specify certificate and key files. By default these should
+be placed in `/etc/scylla/scylla.crt` and `/etc/scylla/scylla.key`, but
+these default locations can overridden by specifying
+`--alternator-encryption-options keyfile="..."` and
+`--alternator-encryption-options certificate="..."`.
 
-Alternator tables are stored as Scylla tables in the "alternator" keyspace.
-This keyspace is initialized when the first Alternator table is created
-(with a CreateTable request). The replication factor (RF) for this keyspace
-and all Alternator tables is chosen at that point, depending on the size of
-the cluster: RF=3 is used on clusters with three or more live nodes, and
-RF=1 is used for smaller clusters. Such smaller clusters are, of course,
-only recommended for tests because of the risk of data loss.
+As we explain below in the "Write isolation policies", Alternator has
+four different choices for the implementation of writes, each with
+different advantages. You should consider which of the options makes
+more sense for your intended use case, and use the "`--alternator-write-isolation`"
+option to choose one. There is currently no default for this option: Trying
+to run Scylla with Alternator enabled without passing this option will
+result in an error asking you to set it.
+
+DynamoDB applications specify a single "endpoint" address, e.g.,
+`dynamodb.us-east-1.amazonaws.com`. Behind the scenes, a DNS server and/or
+load balancers distribute the connections to many different backend nodes.
+Alternator does not provide such a load-balancing setup, so you should
+either set one up, or set up the client library to do the load balancing
+itself. Instructions, code and examples for doing this can be found in:
+https://github.com/scylladb/alternator-load-balancing/
+
+Alternator tables are stored as Scylla tables, each in a separate keyspace.
+Each keyspace is initialized when the corresponding Alternator table is
+created (with a CreateTable request). The replication factor (RF) for this
+keyspace is chosen at that point, depending on the size of the cluster:
+RF=3 is used on clusters with three or more nodes, and RF=1 is used for
+smaller clusters. Such smaller clusters are, of course, only recommended
+for tests because of the risk of data loss.
 
 ## Current compatibility with DynamoDB
 
@@ -62,10 +79,11 @@ progresses and compatibility continues to improve.
     alternator\_enforce\_authorization: true
 * Load balancing: Not a part of Alternator. One should use an external load
   balancer or DNS server to balance the requests between the live Scylla
-  nodes. We plan to publish a reference example soon.
+  nodes, or a modification to the client library. For more information, see
+  https://github.com/scylladb/alternator-load-balancing/.
 ### Table Operations
 * CreateTable and DeleteTable: Supported. Note our implementation is synchronous.
-* DescribeTable: Partial implementation. Missing creation date and size esitmate.
+* DescribeTable: Partial implementation. Missing creation date and size estimate.
 * UpdateTable: Not supported.
 * ListTables: Supported.
 ### Item Operations
@@ -86,12 +104,10 @@ progresses and compatibility continues to improve.
 ### Scans
 Scan and Query are mostly supported, with the following limitations:
 * As above, projection expressions only support top-level attributes.
-* Filter expressions (to filter some of the items) are only partially
-  supported: The ScanFilter syntax is currently only supports the equality
-  operator, and the FilterExpression syntax is not yet supported at all.
+* The ScanFilter/QueryFilter parameter for filtering results is fully
+  supported, but the newer FilterExpression syntax is not yet supported.
 * The "Select" options which allows to count items instead of returning them
   is not yet supported.
-* Parallel scan is not yet supported.
 ### Secondary Indexes
 Global Secondary Indexes (GSI) and Local Secondary Indexes (LSI) are
 implemented, with the following limitations:
@@ -106,15 +122,18 @@ implemented, with the following limitations:
   feature with the same name.
 ### Replication
 * Supported, with RF=3 (unless running on a cluster of less than 3 nodes).
-  Writes are done in LOCAL_QURUM and reads in LOCAL_ONE (eventual consistency)
+  Writes are done in LOCAL_QUORUM and reads in LOCAL_ONE (eventual consistency)
   or LOCAL_QUORUM (strong consistency).
 ### Global Tables
-* Currently, *all* Alternator tables are created as "Global Tables", i.e., can
-  be accessed from all of Scylla's DCs.
-* We do not yet support the DynamoDB API calls to make some of the tables
-  global and others local to a particular DC: CreateGlobalTable,
-  UpdateGlobalTable, DescribeGlobalTable, ListGlobalTables,
-  UpdateGlobalTableSettings, DescribeGlobalTableSettings, and UpdateTable.
+* Currently, *all* Alternator tables are created as "global" tables and can
+  be accessed from all the DCs existing at the time of the table's creation.
+  If a DC is added after a table is created, the table won't be visible from
+  the new DC and changing that requires a CQL "ALTER TABLE" statement to
+  modify the table's replication strategy.
+* We do not yet support the DynamoDB API calls that control which table is
+  visible from what DC: CreateGlobalTable, UpdateGlobalTable,
+  DescribeGlobalTable, ListGlobalTables, UpdateGlobalTableSettings,
+  DescribeGlobalTableSettings, and UpdateTable.
 ### Backup and Restore
 * On-demand backup: the DynamoDB APIs are not yet supported: CreateBackup,
   DescribeBackup, DeleteBackup, ListBackups, RestoreTableFromBackup.
@@ -122,36 +141,23 @@ implemented, with the following limitations:
   or [Scylla Manager](https://docs.scylladb.com/operating-scylla/manager/2.0/backup/).
 * Continuous backup: Not yet supported: UpdateContinuousBackups,
   DescribeContinuousBackups, RestoreTableToPoinInTime.
-### Transations
+### Transactions
 * Not yet supported: TransactWriteItems, TransactGetItems.
   Note that this is a new DynamoDB feature - these are more powerful than
   the old conditional updates which were "lightweight transactions".
 ### Streams
-* Scylla has experimental support for [CDC](https://docs.scylladb.com/using-scylla/cdc/)
-  (change data capture), but the "DynamoDB Streams" API is not yet supported.
+* Implemented via [CDC](https://docs.scylladb.com/using-scylla/cdc/)
+  (change data capture). The Alternator server responds to all DynamoDB
+  Streams API calls.
+  Note that because of how Scylla CDC operates, there is a time window
+  between data being written to a table and it being visible via
+  GetRecords calls (default 10s).
+  
 ### Encryption at rest
 * Supported by Scylla Enterprise (not in open-source). Needs to be enabled.
-### ARNs and tags
-* ARN is generated for every alternator table
-* Tagging can be used with the help of the following requests:
-  ListTagsOfResource, TagResource, UntagResource.
-  Tags are stored in a schema table (system\_schema.tables.extensions['tags']),
-  which in particular means that concurrent adding of tags for a single table
-  on more than a single node may result in a race, until Scylla schema agreement
-  is reimplemented to avoid them.
-  Also, during table creation, a 'Tags' parameter can be used
-  and it will be honored by alternator. Note however, that creating a table
-  and tagging it later are not atomic operations, so in case of failure it's possible
-  for first to succeed (and leave side effects in the form of a table) and for the second
-  one to fail, adding no tags to the table.
-### Write isolation policies
- * By default, alternator will use LWT for all writes. It can, however, be configured
-   per table by tagging it with a 'system:write_isolation' key and one of the following values:
-    * 'a', 'always', 'always_use_lwt' - always use LWT
-    * 'o', 'only_rmw_uses_lwt' - use LWT only for requests that require read-before-write
-    * 'f', 'forbid', 'forbid_rmw' - forbid statements that need read-before-write. Using such statements
-      (e.g. UpdateItem with ConditionExpression) will result in an error
-    * 'u', 'unsafe', 'unsafe_rmw' - (unsafe) perform read-modify-write without any consistency guarantees
+### Tags
+* Tagging tables is fully supported, at CreateTable time (with the "Tags"
+  parameter) and later using TagResource, UntagResource and ListTagsOfResource.
 ### Accounting and capping
 * Not yet supported. Mainly for multi-tenant cloud use, we need to track
   resource use of individual requests (the API should also optionally
@@ -167,6 +173,77 @@ implemented, with the following limitations:
   https://docs.scylladb.com/operating-scylla/monitoring/
   Those are different from the current DynamoDB metrics, but Scylla's
   monitoring is rather advanced and provide more insights to the internals.
+
+## Alternator-specific API
+
+### Write isolation policies
+DynamoDB API update requests may involve a read before the write - e.g., a
+_conditional_ update or an update based on the old value of an attribute.
+The read and the write should be treated as a single transaction - protected
+(_isolated_) from other parallel writes to the same item.
+
+Alternator could do this isolation by using Scylla's LWT (lightweight
+transactions) for every write operation, but this significantly slows
+down writes, and not necessary for workloads which don't use read-modify-write
+(RMW) updates.
+
+So Alternator supports four _write isolation policies_, which can be chosen
+on a per-table basis and may make sense for certain workloads as explained
+below.
+
+A default write isolation policy **must** be chosen using the
+`--alternator-write-isolation` configuration option. Additionally, the write
+isolation policy for a specific table can be overridden by tagging the table
+(at CreateTable time, or any time later with TagResource) with the key
+`system:write_isolation`, and one of the following values:
+
+  * `a`, `always`, or `always_use_lwt` - This mode performs every write
+    operation - even those that do not need a read before the write - as a
+    lightweight transaction.
+
+    This is the slowest choice, but also the only choice guaranteed to work
+    correctly for every workload.
+
+  * `f`, `forbid`, or `forbid_rmw` - This mode _forbids_ write requests
+    which need a read before the write. An attempt to use such statements
+    (e.g.,  UpdateItem with a ConditionExpression) will result in an error.
+    In this mode, the remaining write requests which are allowed - pure writes
+    without a read - are performed using standard Scylla writes, not LWT,
+    so they are significantly faster than they would have been in the
+    `always_use_lwt`, but their isolation is still correct.
+
+    This mode is the fastest mode which is still guaranteed to be always
+    safe. However, it is not useful for workloads that do need read-modify-
+    write requests on this table - which this mode forbids.
+
+  * `o`, or `only_rmw_uses_lwt` - This mode uses LWT only for updates that
+    require read-modify-write, and does normal quorum writes for write-only
+    updates.
+
+    The benefit of this mode is that it allows fast write-only updates to some
+    items, while still allowing some slower read-modify-write operations to
+    other items. However, This mode is only safe if the workload does not mix
+    read-modify-write and write-only updates to the same item, concurrently.
+    It cannot verify that this condition is actually honored by the workload.
+
+  * `u`, `unsafe`, or `unsafe_rmw` - This mode performs read-modify-write
+    operations as separate reads and writes, without any isolation guarantees.
+    It is the fastest option, but not safe - it does not correctly isolate
+    read-modify-write updates. This mode is not recommended for any use case,
+    and will likely be removed in the future.
+
+### Accessing system tables from Scylla
+ * Scylla exposes lots of useful information via its internal system tables,
+   which can be found in system keyspaces: 'system', 'system\_auth', etc.
+   In order to access to these tables via alternator interface,
+   Scan and Query requests can use a special table name:
+   .scylla.alternator.KEYSPACE\_NAME.TABLE\_NAME
+   which will return results fetched from corresponding Scylla table.
+   This interface can be used only to fetch data from system tables.
+   Attempts to read regular tables via the virtual interface will result
+   in an error.
+   Example: in order to query the contents of Scylla's system.large_rows,
+   pass TableName='.scylla.alternator.system.large_rows' to a Query/Scan request.
 
 ## Alternator design and implementation
 
@@ -198,7 +275,7 @@ and "strong consistency". These two modes are implemented using Scylla's CL
 consistency level, then strongly-consistent reads are done with
 LOCAL_QUORUM, while eventually-consistent reads are with just LOCAL_ONE.
 
-Each table in Alternator is stored as a Scylla table in the "alternator"
+Each table in Alternator is stored as a Scylla table in a separate
 keyspace. The DynamoDB key columns (hash and sort key) have known types,
 and become partition and clustering key columns of the Scylla table.
 All other attributes may be different for each row, so are stored in one
@@ -210,15 +287,12 @@ The DynamoDB API, however, provides many types of requests that need a read
 before the write (a.k.a. RMW requests - read-modify-write). For example,
 a request may copy an existing attribute, increment an attribute,
 be conditional on some expression involving existing values of attribute,
-or request that the previous values of attributes be returned.
-Alternator offers various write isolation policies:
- * treat every write as transactional (using lightweight transactions - LWT)
- * use LWT only for RMW requests
- * forbid the usage of RMW - throw an error if it's attempted,
-   e.g. by using ConditionExpression
- * (unsafe) perform RMW without consistency guarantees
-By default, alternator will always enforce LWT, but it can be configured
-with table granularity via tags.
+or request that the previous values of attributes be returned. These
+read-modify-write transactions should be _isolated_ from each other, so
+by default Alternator implements every write operation using Scylla's
+LWT (lightweight transactions). This default can be overridden on a per-table
+basis, by tagging the table as explained above in the "write isolation
+policies" section.
 
 DynamoDB allows attributes to be **nested** - a top-level attribute may
 be a list or a map, and each of its elements may further be lists or
@@ -228,3 +302,11 @@ one DynamoDB feature which we cannot support safely: we cannot modify
 a non-top-level attribute (e.g., a.b[3].c) directly without RMW. We plan
 to fix this in a future version by rethinking the data model we use for
 attributes, or rethinking our implementation of RMW (as explained above).
+
+```eval_rst
+.. toctree::
+    :maxdepth: 2
+
+    getting-started
+    compatibility
+```

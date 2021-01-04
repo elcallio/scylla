@@ -27,6 +27,7 @@
  */
 
 #include "batch_statement.hh"
+#include "cql3/util.hh"
 #include "raw/batch_statement.hh"
 #include "db/config.hh"
 #include "db/consistency_level_validations.hh"
@@ -47,6 +48,10 @@ timeout_for_type(batch_statement::type t) {
             : &timeout_config::write_timeout;
 }
 
+db::timeout_clock::duration batch_statement::get_timeout(const query_options& options) const {
+    return _attrs->is_timeout_set() ? _attrs->get_timeout(options) : options.get_timeout_config().*get_timeout_config_selector();
+}
+
 batch_statement::batch_statement(int bound_terms, type type_,
                                  std::vector<single_statement> statements,
                                  std::unique_ptr<attributes> attrs,
@@ -57,6 +62,7 @@ batch_statement::batch_statement(int bound_terms, type type_,
     , _has_conditions(boost::algorithm::any_of(_statements, [] (auto&& s) { return s.statement->has_conditions(); }))
     , _stats(stats)
 {
+    validate();
     if (has_conditions()) {
         // A batch can be created not only by raw::batch_statement::prepare, but also by
         // cql_server::connection::process_batch, which doesn't call any methods of
@@ -73,12 +79,6 @@ batch_statement::batch_statement(type type_,
                                  cql_stats& stats)
     : batch_statement(-1, type_, std::move(statements), std::move(attrs), stats)
 {
-}
-
-bool batch_statement::uses_function(const sstring& ks_name, const sstring& function_name) const
-{
-    return _attrs->uses_function(ks_name, function_name)
-            || boost::algorithm::any_of(_statements, [&] (auto&& s) { return s.statement->uses_function(ks_name, function_name); });
 }
 
 bool batch_statement::depends_on_keyspace(const sstring& ks_name) const
@@ -149,7 +149,7 @@ void batch_statement::validate()
                 || (boost::distance(_statements
                         | boost::adaptors::transformed([] (auto&& s) { return s.statement->column_family(); })
                         | boost::adaptors::uniqued) != 1))) {
-        throw exceptions::invalid_request_exception("Batch with conditions cannot span multiple tables");
+        throw exceptions::invalid_request_exception("BATCH with conditions cannot span multiple tables");
     }
     std::optional<bool> raw_counter;
     for (auto& s : _statements) {
@@ -227,8 +227,8 @@ void batch_statement::verify_batch_size(service::storage_proxy& proxy, const std
             for (auto&& m : mutations) {
                 ks_cf_pairs.insert(m.schema()->ks_name() + "." + m.schema()->cf_name());
             }
-            return format("Batch of prepared statements for {} is of size {:d}, exceeding specified {} threshold of {:d} by {:d}.",
-                    join(", ", ks_cf_pairs), size, type, threshold, size - threshold);
+            return format("Batch modifying {:d} partitions in {} is of size {:d} bytes, exceeding specified {} threshold of {:d} by {:d}.",
+                    mutations.size(), join(", ", ks_cf_pairs), size, type, threshold, size - threshold);
         };
         if (size > fail_threshold) {
             _logger.error(error("FAIL", fail_threshold).c_str());
@@ -253,6 +253,7 @@ static thread_local inheriting_concrete_execution_stage<
 
 future<shared_ptr<cql_transport::messages::result_message>> batch_statement::execute(
         service::storage_proxy& storage, service::query_state& state, const query_options& options) const {
+    cql3::util::validate_timestamp(options, _attrs);
     return batch_stage(this, seastar::ref(storage), seastar::ref(state),
                        seastar::cref(options), false, options.get_timestamp(state));
 }
@@ -278,7 +279,7 @@ future<shared_ptr<cql_transport::messages::result_message>> batch_statement::do_
     ++_stats.batches;
     _stats.statements_in_batches += _statements.size();
 
-    auto timeout = db::timeout_clock::now() + options.get_timeout_config().*get_timeout_config_selector();
+    auto timeout = db::timeout_clock::now() + get_timeout(options);
     return get_mutations(storage, options, timeout, local, now, query_state).then([this, &storage, &options, timeout, tr_state = query_state.get_trace_state(),
                                                                                                                                permit = query_state.get_permit()] (std::vector<mutation> ms) mutable {
         return execute_without_conditions(storage, std::move(ms), options.get_consistency(), timeout, std::move(tr_state), std::move(permit));
@@ -373,10 +374,10 @@ future<shared_ptr<cql_transport::messages::result_message>> batch_statement::exe
                 make_shared<cql_transport::messages::result_message::bounce_to_shard>(shard));
     }
 
-    return proxy.cas(schema, request, request->read_command(), request->key(),
+    return proxy.cas(schema, request, request->read_command(proxy), request->key(),
             {read_timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()},
             cl_for_paxos, cl_for_learn, batch_timeout, cas_timeout).then([this, request] (bool is_applied) {
-        return modification_statement::build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied, request->rows());
+        return request->build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied);
     });
 }
 
@@ -389,9 +390,9 @@ void batch_statement::build_cas_result_set_metadata() {
     _columns_of_cas_result_set.resize(schema.all_columns_count());
 
     // Add the mandatory [applied] column to result set metadata
-    std::vector<shared_ptr<column_specification>> columns;
+    std::vector<lw_shared_ptr<column_specification>> columns;
 
-    auto applied = ::make_shared<cql3::column_specification>(schema.ks_name(), schema.cf_name(),
+    auto applied = make_lw_shared<cql3::column_specification>(schema.ks_name(), schema.cf_name(),
             ::make_shared<cql3::column_identifier>("[applied]", false), boolean_type);
     columns.push_back(applied);
 
@@ -441,13 +442,12 @@ batch_statement::prepare(database& db, cql_stats& stats) {
     prep_attrs->collect_marker_specification(bound_names);
 
     cql3::statements::batch_statement batch_statement_(bound_names.size(), _type, std::move(statements), std::move(prep_attrs), stats);
-    batch_statement_.validate();
 
     std::vector<uint16_t> partition_key_bind_indices;
     if (!have_multiple_cfs && batch_statement_.get_statements().size() > 0) {
         partition_key_bind_indices = bound_names.get_partition_key_bind_indexes(*batch_statement_.get_statements()[0].statement->s);
     }
-    return std::make_unique<prepared_statement>(audit_info(), make_shared(std::move(batch_statement_)),
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<cql3::statements::batch_statement>(std::move(batch_statement_)),
                                                      bound_names.get_specifications(),
                                                      std::move(partition_key_bind_indices));
 }

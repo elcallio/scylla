@@ -50,19 +50,17 @@ namespace bpo = boost::program_options;
 
 int main(int ac, char ** av) {
     distributed<database> db;
-    sharded<auth::service> auth_service;
     app_template app;
     app.add_options()
         ("seed", bpo::value<std::vector<std::string>>(), "IP address of seed node")
         ("listen-address", bpo::value<std::string>()->default_value("0.0.0.0"), "IP address to listen");
-    return app.run_deprecated(ac, av, [&auth_service, &db, &app] {
-        return async([&auth_service, &db, &app] {
+    return app.run_deprecated(ac, av, [&db, &app] {
+        return async([&db, &app] {
             auto config = app.configuration();
             logging::logger_registry().set_logger_level("gossip", logging::log_level::trace);
             const gms::inet_address listen = gms::inet_address(config["listen-address"].as<std::string>());
             utils::fb_utilities::set_broadcast_address(listen);
             utils::fb_utilities::set_broadcast_rpc_address(listen);
-            gms::versioned_value::factory vv;
             auto cfg = std::make_unique<db::config>();
             locator::i_endpoint_snitch::create_snitch("SimpleSnitch").get();
             sharded<gms::feature_service> feature_service;
@@ -71,7 +69,9 @@ int main(int ac, char ** av) {
             sharded<db::view::view_update_generator> view_update_generator;
             sharded<abort_source> abort_sources;
             sharded<service::migration_notifier> mnotif;
-            sharded<locator::token_metadata> token_metadata;
+            sharded<locator::shared_token_metadata> token_metadata;
+            sharded<netw::messaging_service> messaging;
+            sharded<auth::service> auth_service;
 
             abort_sources.start().get();
             auto stop_abort_source = defer([&] { abort_sources.stop().get(); });
@@ -80,13 +80,13 @@ int main(int ac, char ** av) {
             mnotif.start().get();
             auto stop_mnotifier = defer([&] { mnotif.stop().get(); });
             sharded<qos::service_level_controller> sl_controller;
-            sl_controller.start(qos::service_level_options{1000}).get();
+            sl_controller.start(std::ref(auth_service), qos::service_level_options{1000}).get();
             service::storage_service_config sscfg;
             sscfg.available_memory = memory::stats().total_memory();
-            gms::get_gossiper().start(std::ref(abort_sources), std::ref(feature_service), std::ref(token_metadata), std::ref(*cfg)).get();
-            service::init_storage_service(std::ref(abort_sources), db, gms::get_gossiper(), auth_service, sys_dist_ks, view_update_generator, feature_service, sscfg, mnotif, token_metadata, sl_controller).get();
-            netw::get_messaging_service().start(std::ref(sl_controller), listen).get();
-            auto& server = netw::get_local_messaging_service();
+            messaging.start(std::ref(sl_controller), listen).get();
+            gms::get_gossiper().start(std::ref(abort_sources), std::ref(feature_service), std::ref(token_metadata), std::ref(messaging), std::ref(*cfg)).get();
+            service::init_storage_service(std::ref(abort_sources), db, gms::get_gossiper(), sys_dist_ks, view_update_generator, feature_service, sscfg, mnotif, token_metadata, messaging, sl_controller).get();
+            auto& server = messaging.local();
             auto port = server.port();
             auto msg_listen = server.listen_address();
             fmt::print("Messaging server listening on ip {} port {:d} ...\n", msg_listen, port);
@@ -101,7 +101,7 @@ int main(int ac, char ** av) {
             gossiper.set_cluster_name("Test Cluster");
 
             std::map<gms::application_state, gms::versioned_value> app_states = {
-                { gms::application_state::LOAD, vv.load(0.5) },
+                { gms::application_state::LOAD, gms::versioned_value::load(0.5) },
             };
 
             using namespace std::chrono;
@@ -110,7 +110,7 @@ int main(int ac, char ** av) {
             gossiper.start_gossiping(generation_number, app_states).get();
             static double load = 0.5;
             for (;;) {
-                auto value = vv.load(load);
+                auto value = gms::versioned_value::load(load);
                 load += 0.0001;
                 gms::get_local_gossiper().add_local_application_state(gms::application_state::LOAD, value).get();
                 sleep(std::chrono::seconds(1)).get();

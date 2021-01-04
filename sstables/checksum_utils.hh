@@ -5,41 +5,27 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
 
 #include <zlib.h>
-#include <seastar/util/gcc6-concepts.hh>
 #include "libdeflate/libdeflate.h"
 #include "utils/gz/crc_combine.hh"
 
-GCC6_CONCEPT(
 template<typename Checksum>
-concept bool ChecksumUtils = requires(const char* input, size_t size, uint32_t checksum) {
-    { Checksum::init_checksum() } -> uint32_t;
-    { Checksum::checksum(input, size) } -> uint32_t;
-    { Checksum::checksum(checksum, input, size) } -> uint32_t;
-    { Checksum::checksum_combine(checksum, checksum, size) } -> uint32_t;
+concept ChecksumUtils = requires(const char* input, size_t size, uint32_t checksum) {
+    { Checksum::init_checksum() } -> std::same_as<uint32_t>;
+    { Checksum::checksum(input, size) } -> std::same_as<uint32_t>;
+    { Checksum::checksum(checksum, input, size) } -> std::same_as<uint32_t>;
+    { Checksum::checksum_combine(checksum, checksum, size) } -> std::same_as<uint32_t>;
 
     // Tells whether checksum_combine() should be preferred over checksum().
     // For same checksummers it's faster to re-feed the buffer to checksum() than to
     // combine the checksum of the buffer.
-    { Checksum::prefer_combine() } -> bool;
+    { Checksum::prefer_combine() } -> std::same_as<bool>;
 };
-)
 
 struct adler32_utils {
     inline static uint32_t init_checksum() {

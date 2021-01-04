@@ -47,9 +47,10 @@ drop_view_statement::drop_view_statement(::shared_ptr<cf_name> view_name, bool i
 future<> drop_view_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const
 {
     try {
-        auto&& s = proxy.get_db().local().find_schema(keyspace(), column_family());
+        const database& db = proxy.local_db();
+        auto&& s = db.find_schema(keyspace(), column_family());
         if (s->is_view()) {
-            return state.has_column_family_access(keyspace(), s->view_info()->base_name(), auth::permission::ALTER);
+            return state.has_column_family_access(db, keyspace(), s->view_info()->base_name(), auth::permission::ALTER);
         }
     } catch (const no_such_column_family& e) {
         // Will be validated afterwards.
@@ -62,10 +63,10 @@ void drop_view_statement::validate(service::storage_proxy&, const service::clien
     // validated in migration_manager::announce_view_drop()
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> drop_view_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
+future<shared_ptr<cql_transport::event::schema_change>> drop_view_statement::announce_migration(service::storage_proxy& proxy) const
 {
-    return make_ready_future<>().then([this, is_local_only] {
-        return service::get_local_migration_manager().announce_view_drop(keyspace(), column_family(), is_local_only);
+    return make_ready_future<>().then([this] {
+        return service::get_local_migration_manager().announce_view_drop(keyspace(), column_family());
     }).then_wrapped([this] (auto&& f) {
         try {
             f.get();

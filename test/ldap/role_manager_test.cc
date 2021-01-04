@@ -5,22 +5,13 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "auth/standard_role_manager.hh"
 #include "auth/ldap_role_manager.hh"
+#include "auth/password_authenticator.hh"
+#include "db/config.hh"
 
 #include <fmt/format.h>
 #include <seastar/testing/test_case.hh>
@@ -409,6 +400,7 @@ namespace {
 shared_ptr<db::config> make_ldap_config() {
     auto p = make_shared<db::config>();
     p->role_manager("com.scylladb.auth.LDAPRoleManager");
+    p->authenticator(sstring(auth::password_authenticator_name));
     p->ldap_url_template(default_query_template);
     p->ldap_attr_role("cn");
     p->ldap_bind_dn(manager_dn);

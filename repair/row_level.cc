@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "repair/repair.hh"
@@ -32,6 +21,7 @@
 #include "utils/UUID.hh"
 #include "utils/hash.hh"
 #include "service/priority_manager.hh"
+#include "service/storage_proxy.hh"
 #include "db/view/view_update_checks.hh"
 #include "database.hh"
 #include <seastar/util/bool_class.hh>
@@ -42,11 +32,13 @@
 #include <random>
 #include <optional>
 #include <boost/range/adaptors.hpp>
+#include <boost/intrusive/list.hpp>
 #include "../db/view/view_update_generator.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
 #include "gms/gossiper.hh"
 #include "repair/row_level.hh"
 #include "mutation_source_metadata.hh"
+#include "utils/stall_free.hh"
 
 extern logging::logger rlogger;
 
@@ -60,6 +52,43 @@ static bool inject_rpc_stream_error = false;
 
 distributed<db::system_distributed_keyspace>* _sys_dist_ks;
 distributed<db::view::view_update_generator>* _view_update_generator;
+sharded<netw::messaging_service>* _messaging;
+
+enum class repair_state : uint16_t {
+    unknown,
+    row_level_start_started,
+    row_level_start_finished,
+    get_estimated_partitions_started,
+    get_estimated_partitions_finished,
+    set_estimated_partitions_started,
+    set_estimated_partitions_finished,
+    get_sync_boundary_started,
+    get_sync_boundary_finished,
+    get_combined_row_hash_started,
+    get_combined_row_hash_finished,
+    get_row_diff_with_rpc_stream_started,
+    get_row_diff_with_rpc_stream_finished,
+    get_row_diff_and_update_peer_row_hash_sets_started,
+    get_row_diff_and_update_peer_row_hash_sets_finished,
+    get_full_row_hashes_with_rpc_stream_started,
+    get_full_row_hashes_with_rpc_stream_finished,
+    get_full_row_hashes_started,
+    get_full_row_hashes_finished,
+    get_row_diff_started,
+    get_row_diff_finished,
+    put_row_diff_with_rpc_stream_started,
+    put_row_diff_with_rpc_stream_finished,
+    put_row_diff_started,
+    put_row_diff_finished,
+    row_level_stop_started,
+    row_level_stop_finished,
+};
+
+struct repair_node_state {
+    gms::inet_address node;
+    repair_state state = repair_state::unknown;
+    explicit repair_node_state(gms::inet_address n) : node(n) { }
+};
 
 // Wraps sink and source objects for repair master or repair follower nodes.
 // For repair master, it stores sink and source pair for each of the followers.
@@ -67,7 +96,7 @@ distributed<db::view::view_update_generator>* _view_update_generator;
 template<class SinkType, class SourceType>
 class sink_source_for_repair {
     uint32_t _repair_meta_id;
-    using get_sink_source_fn_type = std::function<future<rpc::sink<SinkType>, rpc::source<SourceType>> (uint32_t repair_meta_id, netw::messaging_service::msg_addr addr)>;
+    using get_sink_source_fn_type = std::function<future<std::tuple<rpc::sink<SinkType>, rpc::source<SourceType>>> (uint32_t repair_meta_id, netw::messaging_service::msg_addr addr)>;
     using sink_type  = std::reference_wrapper<rpc::sink<SinkType>>;
     using source_type = std::reference_wrapper<rpc::source<SourceType>>;
     // The vectors below store sink and source object for peer nodes.
@@ -86,17 +115,18 @@ public:
     void mark_source_closed(unsigned node_idx) {
         _sources_closed[node_idx] = true;
     }
-    future<sink_type, source_type> get_sink_source(gms::inet_address remote_node, unsigned node_idx) {
+    future<std::tuple<sink_type, source_type>> get_sink_source(gms::inet_address remote_node, unsigned node_idx) {
+        using value_type = std::tuple<sink_type, source_type>;
         if (_sinks[node_idx] && _sources[node_idx]) {
-            return make_ready_future<sink_type, source_type>(_sinks[node_idx].value(), _sources[node_idx].value());
+            return make_ready_future<value_type>(value_type(_sinks[node_idx].value(), _sources[node_idx].value()));
         }
         if (_sinks[node_idx] || _sources[node_idx]) {
-            return make_exception_future<sink_type, source_type>(std::runtime_error(format("sink or source is missing for node {}", remote_node)));
+            return make_exception_future<value_type>(std::runtime_error(format("sink or source is missing for node {}", remote_node)));
         }
-        return _fn(_repair_meta_id, netw::messaging_service::msg_addr(remote_node)).then([this, node_idx] (rpc::sink<SinkType> sink, rpc::source<SourceType> source) mutable {
+        return _fn(_repair_meta_id, netw::messaging_service::msg_addr(remote_node)).then_unpack([this, node_idx] (rpc::sink<SinkType> sink, rpc::source<SourceType> source) mutable {
             _sinks[node_idx].emplace(std::move(sink));
             _sources[node_idx].emplace(std::move(source));
-            return make_ready_future<sink_type, source_type>(_sinks[node_idx].value(), _sources[node_idx].value());
+            return make_ready_future<value_type>(value_type(_sinks[node_idx].value(), _sources[node_idx].value()));
         });
     }
     future<> close() {
@@ -172,10 +202,10 @@ static const std::vector<row_level_diff_detect_algorithm>& suportted_diff_detect
     return _algorithms;
 };
 
-static row_level_diff_detect_algorithm get_common_diff_detect_algorithm(const std::vector<gms::inet_address>& nodes) {
+static row_level_diff_detect_algorithm get_common_diff_detect_algorithm(netw::messaging_service& ms, const std::vector<gms::inet_address>& nodes) {
     std::vector<std::vector<row_level_diff_detect_algorithm>> nodes_algorithms(nodes.size());
-    parallel_for_each(boost::irange(size_t(0), nodes.size()), [&nodes_algorithms, &nodes] (size_t idx) {
-        return netw::get_local_messaging_service().send_repair_get_diff_algorithms(netw::messaging_service::msg_addr(nodes[idx])).then(
+    parallel_for_each(boost::irange(size_t(0), nodes.size()), [&ms, &nodes_algorithms, &nodes] (size_t idx) {
+        return ms.send_repair_get_diff_algorithms(netw::messaging_service::msg_addr(nodes[idx])).then(
                 [&nodes_algorithms, &nodes, idx] (std::vector<row_level_diff_detect_algorithm> algorithms) {
             std::sort(algorithms.begin(), algorithms.end());
             nodes_algorithms[idx] = std::move(algorithms);
@@ -295,11 +325,14 @@ private:
     }
 };
 
+using is_dirty_on_master = bool_class<class is_dirty_on_master_tag>;
+
 class repair_row {
     std::optional<frozen_mutation_fragment> _fm;
     lw_shared_ptr<const decorated_key_with_hash> _dk_with_hash;
     std::optional<repair_sync_boundary> _boundary;
     std::optional<repair_hash> _hash;
+    is_dirty_on_master _dirty_on_master;
     lw_shared_ptr<mutation_fragment> _mf;
 public:
     repair_row() = default;
@@ -307,12 +340,17 @@ public:
             std::optional<position_in_partition> pos,
             lw_shared_ptr<const decorated_key_with_hash> dk_with_hash,
             std::optional<repair_hash> hash,
+            is_dirty_on_master dirty_on_master,
             lw_shared_ptr<mutation_fragment> mf = {})
             : _fm(std::move(fm))
             , _dk_with_hash(std::move(dk_with_hash))
             , _boundary(pos ? std::optional<repair_sync_boundary>(repair_sync_boundary{_dk_with_hash->dk, std::move(*pos)}) : std::nullopt)
             , _hash(std::move(hash))
+            , _dirty_on_master(dirty_on_master)
             , _mf(std::move(mf)) {
+    }
+    lw_shared_ptr<mutation_fragment>& get_mutation_fragment_ptr () {
+        return _mf;
     }
     mutation_fragment& get_mutation_fragment() {
         if (!_mf) {
@@ -353,6 +391,9 @@ public:
         }
         return *_hash;
     }
+    is_dirty_on_master dirty_on_master() const {
+        return _dirty_on_master;
+    }
 };
 
 class repair_reader {
@@ -361,6 +402,7 @@ using is_local_reader = bool_class<class is_local_reader_tag>;
 
 private:
     schema_ptr _schema;
+    reader_permit _permit;
     dht::partition_range _range;
     // Used to find the range that repair master will work on
     dht::selective_token_range_sharder _sharder;
@@ -372,48 +414,74 @@ private:
     std::optional<utils::phased_barrier::operation> _local_read_op;
     // Local reader or multishard reader to read the range
     flat_mutation_reader _reader;
+    std::optional<evictable_reader_handle> _reader_handle;
     // Current partition read from disk
     lw_shared_ptr<const decorated_key_with_hash> _current_dk;
+    uint64_t _reads_issued = 0;
+    uint64_t _reads_finished = 0;
 
 public:
     repair_reader(
             seastar::sharded<database>& db,
             column_family& cf,
             schema_ptr s,
+            reader_permit permit,
             dht::token_range range,
             const dht::sharder& remote_sharder,
             unsigned remote_shard,
             uint64_t seed,
             is_local_reader local_reader)
             : _schema(s)
+            , _permit(std::move(permit))
             , _range(dht::to_partition_range(range))
             , _sharder(remote_sharder, range, remote_shard)
             , _seed(seed)
             , _local_read_op(local_reader ? std::optional(cf.read_in_progress()) : std::nullopt)
-            , _reader(make_reader(db, cf, local_reader)) {
+            , _reader(nullptr) {
+        if (local_reader) {
+            auto ms = mutation_source([&cf] (
+                        schema_ptr s,
+                        reader_permit,
+                        const dht::partition_range& pr,
+                        const query::partition_slice& ps,
+                        const io_priority_class& pc,
+                        tracing::trace_state_ptr,
+                        streamed_mutation::forwarding,
+                        mutation_reader::forwarding fwd_mr) {
+                return cf.make_streaming_reader(std::move(s), pr, ps, fwd_mr);
+            });
+            std::tie(_reader, _reader_handle) = make_manually_paused_evictable_reader(
+                    std::move(ms),
+                    _schema,
+                    _permit,
+                    _range,
+                    _schema->full_slice(),
+                    service::get_local_streaming_priority(),
+                    {},
+                    mutation_reader::forwarding::no);
+        } else {
+            _reader = make_multishard_streaming_reader(db, _schema, [this] {
+                auto shard_range = _sharder.next();
+                if (shard_range) {
+                    return std::optional<dht::partition_range>(dht::to_partition_range(*shard_range));
+                }
+                return std::optional<dht::partition_range>();
+            });
+        }
     }
 
-private:
-    flat_mutation_reader
-    make_reader(seastar::sharded<database>& db,
-            column_family& cf,
-            is_local_reader local_reader) {
-        if (local_reader) {
-            return cf.make_streaming_reader(_schema, _range);
-        }
-        return make_multishard_streaming_reader(db, _schema, [this] {
-            auto shard_range = _sharder.next();
-            if (shard_range) {
-                return std::optional<dht::partition_range>(dht::to_partition_range(*shard_range));
-            }
-            return std::optional<dht::partition_range>();
+    future<mutation_fragment_opt>
+    read_mutation_fragment() {
+        ++_reads_issued;
+        return _reader(db::no_timeout).then([this] (mutation_fragment_opt mfopt) {
+            ++_reads_finished;
+            return mfopt;
         });
     }
 
-public:
-    future<mutation_fragment_opt>
-    read_mutation_fragment() {
-        return _reader(db::no_timeout);
+    void on_end_of_stream() {
+        _reader = make_empty_flat_reader(_schema, _permit);
+        _reader_handle.reset();
     }
 
     lw_shared_ptr<const decorated_key_with_hash>& get_current_dk() {
@@ -434,68 +502,66 @@ public:
         }
     }
 
+    void pause() {
+        if (_reader_handle) {
+            _reader_handle->pause();
+        }
+    }
 };
 
-class repair_writer {
+class repair_writer : public enable_lw_shared_from_this<repair_writer> {
     schema_ptr _schema;
+    reader_permit _permit;
     uint64_t _estimated_partitions;
     size_t _nr_peer_nodes;
-    // Needs more than one for repair master
-    std::vector<std::optional<future<uint64_t>>> _writer_done;
-    std::vector<std::optional<seastar::queue<mutation_fragment_opt>>> _mq;
+    std::optional<future<>> _writer_done;
+    std::optional<queue_reader_handle> _mq;
     // Current partition written to disk
-    std::vector<lw_shared_ptr<const decorated_key_with_hash>> _current_dk_written_to_sstable;
+    lw_shared_ptr<const decorated_key_with_hash> _current_dk_written_to_sstable;
     // Is current partition still open. A partition is opened when a
     // partition_start is written and is closed when a partition_end is
     // written.
-    std::vector<bool> _partition_opened;
+    bool _partition_opened;
     streaming::stream_reason _reason;
+    named_semaphore _sem{1, named_semaphore_exception_factory{"repair_writer"}};
 public:
     repair_writer(
             schema_ptr schema,
+            reader_permit permit,
             uint64_t estimated_partitions,
             size_t nr_peer_nodes,
             streaming::stream_reason reason)
             : _schema(std::move(schema))
+            , _permit(std::move(permit))
             , _estimated_partitions(estimated_partitions)
             , _nr_peer_nodes(nr_peer_nodes)
             , _reason(reason) {
-        init_writer();
     }
 
-    future<> write_start_and_mf(lw_shared_ptr<const decorated_key_with_hash> dk, mutation_fragment mf, unsigned node_idx)  {
-        _current_dk_written_to_sstable[node_idx] = dk;
+    future<> write_start_and_mf(lw_shared_ptr<const decorated_key_with_hash> dk, mutation_fragment mf)  {
+        _current_dk_written_to_sstable = dk;
         if (mf.is_partition_start()) {
-            return _mq[node_idx]->push_eventually(mutation_fragment_opt(std::move(mf))).then([this, node_idx] {
-                _partition_opened[node_idx] = true;
+            return _mq->push(std::move(mf)).then([this] {
+                _partition_opened = true;
             });
         } else {
-            auto start = mutation_fragment(partition_start(dk->dk, tombstone()));
-            return _mq[node_idx]->push_eventually(mutation_fragment_opt(std::move(start))).then([this, node_idx, mf = std::move(mf)] () mutable {
-                _partition_opened[node_idx] = true;
-                return _mq[node_idx]->push_eventually(mutation_fragment_opt(std::move(mf)));
+            auto start = mutation_fragment(*_schema, _permit, partition_start(dk->dk, tombstone()));
+            return _mq->push(std::move(start)).then([this, mf = std::move(mf)] () mutable {
+                _partition_opened = true;
+                return _mq->push(std::move(mf));
             });
         }
     };
 
-    void init_writer() {
-        _writer_done.resize(_nr_peer_nodes);
-        _mq.resize(_nr_peer_nodes);
-        _current_dk_written_to_sstable.resize(_nr_peer_nodes);
-        _partition_opened.resize(_nr_peer_nodes, false);
-    }
-
-    void create_writer(sharded<database>& db, unsigned node_idx) {
-        if (_writer_done[node_idx]) {
+    void create_writer(sharded<database>& db) {
+        if (_writer_done) {
             return;
         }
-        _mq[node_idx] = seastar::queue<mutation_fragment_opt>(16);
-        auto get_next_mutation_fragment = [this, node_idx] () mutable {
-            return _mq[node_idx]->pop_eventually();
-        };
         table& t = db.local().find_column_family(_schema->id());
-        _writer_done[node_idx] = mutation_writer::distribute_reader_and_consume_on_shards(_schema,
-                make_generating_reader(_schema, std::move(get_next_mutation_fragment)),
+        auto [queue_reader, queue_handle] = make_queue_reader(_schema, _permit);
+        _mq = std::move(queue_handle);
+        auto writer = shared_from_this();
+        _writer_done = mutation_writer::distribute_reader_and_consume_on_shards(_schema, std::move(queue_reader),
                 [&db, reason = this->_reason, estimated_partitions = this->_estimated_partitions] (flat_mutation_reader reader) {
             auto& t = db.local().find_column_family(reader.schema());
             return db::view::check_needs_view_update_path(_sys_dist_ks->local(), t, reason).then([t = t.shared_from_this(), estimated_partitions, reader = std::move(reader)] (bool use_view_update_path) mutable {
@@ -507,8 +573,8 @@ public:
                         [t = std::move(t), use_view_update_path, adjusted_estimated_partitions] (flat_mutation_reader reader) {
                     sstables::shared_sstable sst = use_view_update_path ? t->make_streaming_staging_sstable() : t->make_streaming_sstable_for_write();
                     schema_ptr s = reader.schema();
-                    auto& pc = service::get_local_streaming_write_priority();
-                    return sst->write_components(std::move(reader), std::max(1ul, adjusted_estimated_partitions), s,
+                    auto& pc = service::get_local_streaming_priority();
+                    return sst->write_components(std::move(reader), adjusted_estimated_partitions, s,
                                                  t->get_sstables_manager().configure_writer(),
                                                  encoding_stats{}, pc).then([sst] {
                         return sst->open_data();
@@ -524,63 +590,103 @@ public:
                 return consumer(std::move(reader));
             });
         },
-        t.stream_in_progress());
+        t.stream_in_progress()).then([writer] (uint64_t partitions) {
+            rlogger.debug("repair_writer: keyspace={}, table={}, managed to write partitions={} to sstable",
+                writer->_schema->ks_name(), writer->_schema->cf_name(), partitions);
+        }).handle_exception([writer] (std::exception_ptr ep) {
+            rlogger.warn("repair_writer: keyspace={}, table={}, multishard_writer failed: {}",
+                    writer->_schema->ks_name(), writer->_schema->cf_name(), ep);
+            writer->_mq->abort(ep);
+            return make_exception_future<>(std::move(ep));
+        });
     }
 
-    future<> write_partition_end(unsigned node_idx) {
-        if (_partition_opened[node_idx]) {
-            return _mq[node_idx]->push_eventually(mutation_fragment(partition_end())).then([this, node_idx] {
-                _partition_opened[node_idx] = false;
+    future<> write_partition_end() {
+        if (_partition_opened) {
+            return _mq->push(mutation_fragment(*_schema, _permit, partition_end())).then([this] {
+                _partition_opened = false;
             });
         }
         return make_ready_future<>();
     }
 
-    future<> do_write(unsigned node_idx, lw_shared_ptr<const decorated_key_with_hash> dk, mutation_fragment mf) {
-        if (_current_dk_written_to_sstable[node_idx]) {
-            if (_current_dk_written_to_sstable[node_idx]->dk.equal(*_schema, dk->dk)) {
-                return _mq[node_idx]->push_eventually(mutation_fragment_opt(std::move(mf)));
+    future<> do_write(lw_shared_ptr<const decorated_key_with_hash> dk, mutation_fragment mf) {
+        if (_current_dk_written_to_sstable) {
+            if (_current_dk_written_to_sstable->dk.equal(*_schema, dk->dk)) {
+                return _mq->push(std::move(mf));
             } else {
-                return write_partition_end(node_idx).then([this,
-                        node_idx, dk = std::move(dk), mf = std::move(mf)] () mutable {
-                    return write_start_and_mf(std::move(dk), std::move(mf), node_idx);
+                return write_partition_end().then([this,
+                        dk = std::move(dk), mf = std::move(mf)] () mutable {
+                    return write_start_and_mf(std::move(dk), std::move(mf));
                 });
             }
         } else {
-            return write_start_and_mf(std::move(dk), std::move(mf), node_idx);
+            return write_start_and_mf(std::move(dk), std::move(mf));
+        }
+    }
+
+    future<> write_end_of_stream() {
+        if (_mq) {
+          return with_semaphore(_sem, 1, [this] {
+            // Partition_end is never sent on wire, so we have to write one ourselves.
+            return write_partition_end().then([this] () mutable {
+                _mq->push_end_of_stream();
+            }).handle_exception([this] (std::exception_ptr ep) {
+                _mq->abort(ep);
+                rlogger.warn("repair_writer: keyspace={}, table={}, write_end_of_stream failed: {}",
+                        _schema->ks_name(), _schema->cf_name(), ep);
+                return make_exception_future<>(std::move(ep));
+            });
+          });
+        } else {
+            return make_ready_future<>();
+        }
+    }
+
+    future<> do_wait_for_writer_done() {
+        if (_writer_done) {
+            return std::move(*(_writer_done));
+        } else {
+            return make_ready_future<>();
         }
     }
 
     future<> wait_for_writer_done() {
-        return parallel_for_each(boost::irange(unsigned(0), unsigned(_nr_peer_nodes)), [this] (unsigned node_idx) {
-            if (_writer_done[node_idx] && _mq[node_idx]) {
-                // Partition_end is never sent on wire, so we have to write one ourselves.
-                return write_partition_end(node_idx).then([this, node_idx] () mutable {
-                    // Empty mutation_fragment_opt means no more data, so the writer can seal the sstables.
-                    return _mq[node_idx]->push_eventually(mutation_fragment_opt()).then([this, node_idx] () mutable {
-                        return (*_writer_done[node_idx]).then([] (uint64_t partitions) {
-                            rlogger.debug("Managed to write partitions={} to sstable", partitions);
-                            return make_ready_future<>();
-                        });
-                    });
-                });
-            }
-            return make_ready_future<>();
+        return when_all_succeed(write_end_of_stream(), do_wait_for_writer_done()).discard_result().handle_exception(
+                [this] (std::exception_ptr ep) {
+            rlogger.warn("repair_writer: keyspace={}, table={}, wait_for_writer_done failed: {}",
+                    _schema->ks_name(), _schema->cf_name(), ep);
+            return make_exception_future<>(std::move(ep));
         });
+    }
+
+    named_semaphore& sem() {
+        return _sem;
     }
 };
 
+class repair_meta;
+class repair_meta_tracker;
+class row_level_repair;
+
+static void add_to_repair_meta_for_masters(repair_meta& rm);
+static void add_to_repair_meta_for_followers(repair_meta& rm);
+
 class repair_meta {
+    friend repair_meta_tracker;
 public:
     using repair_master = bool_class<class repair_master_tag>;
     using update_working_row_buf = bool_class<class update_working_row_buf_tag>;
     using update_peer_row_hash_sets = bool_class<class update_peer_row_hash_sets_tag>;
     using needs_all_rows_t = bool_class<class needs_all_rows_tag>;
     using msg_addr = netw::messaging_service::msg_addr;
+    using tracker_link_type = boost::intrusive::list_member_hook<bi::link_mode<boost::intrusive::auto_unlink>>;
 private:
     seastar::sharded<database>& _db;
+    seastar::sharded<netw::messaging_service>& _messaging;
     column_family& _cf;
     schema_ptr _schema;
+    reader_permit _permit;
     dht::token_range _range;
     repair_sync_boundary::tri_compare _cmp;
     // The algorithm used to find the row difference
@@ -603,7 +709,7 @@ private:
     size_t _nr_peer_nodes= 1;
     repair_stats _stats;
     repair_reader _repair_reader;
-    repair_writer _repair_writer;
+    lw_shared_ptr<repair_writer> _repair_writer;
     // Contains rows read from disk
     std::list<repair_row> _row_buf;
     // Contains rows we are working on to sync between peers
@@ -615,13 +721,31 @@ private:
     // Tracks current sync boundary
     std::optional<repair_sync_boundary> _current_sync_boundary;
     // Contains the hashes of rows in the _working_row_buffor for all peer nodes
-    std::vector<std::unordered_set<repair_hash>> _peer_row_hash_sets;
+    std::vector<repair_hash_set> _peer_row_hash_sets;
     // Gate used to make sure pending operation of meta data is done
     seastar::gate _gate;
     sink_source_for_get_full_row_hashes _sink_source_for_get_full_row_hashes;
     sink_source_for_get_row_diff _sink_source_for_get_row_diff;
     sink_source_for_put_row_diff _sink_source_for_put_row_diff;
+    tracker_link_type _tracker_link;
+    row_level_repair* _row_level_repair_ptr;
+    std::vector<repair_node_state> _all_node_states;
+    is_dirty_on_master _dirty_on_master = is_dirty_on_master::no;
 public:
+    std::vector<repair_node_state>& all_nodes() {
+        return _all_node_states;
+    }
+    void set_repair_state(repair_state state, gms::inet_address node) {
+        for (auto& ns : all_nodes()) {
+            if (ns.node == node) {
+                ns.state = state;
+            }
+        }
+    }
+    void set_repair_state_for_local_node(repair_state state) {
+        // The first node is the local node
+        all_nodes().front().state = state;
+    }
     repair_stats& stats() {
         return _stats;
     }
@@ -647,6 +771,7 @@ public:
 public:
     repair_meta(
             seastar::sharded<database>& db,
+            seastar::sharded<netw::messaging_service>& ms,
             column_family& cf,
             schema_ptr s,
             dht::token_range range,
@@ -657,10 +782,14 @@ public:
             uint32_t repair_meta_id,
             streaming::stream_reason reason,
             shard_config master_node_shard_config,
-            size_t nr_peer_nodes = 1)
+            std::vector<gms::inet_address> all_live_peer_nodes,
+            size_t nr_peer_nodes = 1,
+            row_level_repair* row_level_repair_ptr = nullptr)
             : _db(db)
+            , _messaging(ms)
             , _cf(cf)
             , _schema(s)
+            , _permit(_cf.streaming_read_concurrency_semaphore().make_permit(_schema.get(), "repair-meta"))
             , _range(range)
             , _cmp(repair_sync_boundary::tri_compare(*_schema))
             , _algo(algo)
@@ -678,48 +807,57 @@ public:
                     _db,
                     _cf,
                     _schema,
+                    _permit,
                     _range,
                     _remote_sharder,
                     _master_node_shard_config.shard,
                     _seed,
                     repair_reader::is_local_reader(_repair_master || _same_sharding_config)
               )
-            , _repair_writer(_schema, _estimated_partitions, _nr_peer_nodes, _reason)
+            , _repair_writer(make_lw_shared<repair_writer>(_schema, _permit, _estimated_partitions, _nr_peer_nodes, _reason))
             , _sink_source_for_get_full_row_hashes(_repair_meta_id, _nr_peer_nodes,
-                    [] (uint32_t repair_meta_id, netw::messaging_service::msg_addr addr) {
-                        return netw::get_local_messaging_service().make_sink_and_source_for_repair_get_full_row_hashes_with_rpc_stream(repair_meta_id, addr);
+                    [&ms] (uint32_t repair_meta_id, netw::messaging_service::msg_addr addr) {
+                        return ms.local().make_sink_and_source_for_repair_get_full_row_hashes_with_rpc_stream(repair_meta_id, addr);
                 })
             , _sink_source_for_get_row_diff(_repair_meta_id, _nr_peer_nodes,
-                    [] (uint32_t repair_meta_id, netw::messaging_service::msg_addr addr) {
-                        return netw::get_local_messaging_service().make_sink_and_source_for_repair_get_row_diff_with_rpc_stream(repair_meta_id, addr);
+                    [&ms] (uint32_t repair_meta_id, netw::messaging_service::msg_addr addr) {
+                        return ms.local().make_sink_and_source_for_repair_get_row_diff_with_rpc_stream(repair_meta_id, addr);
                 })
             , _sink_source_for_put_row_diff(_repair_meta_id, _nr_peer_nodes,
-                    [] (uint32_t repair_meta_id, netw::messaging_service::msg_addr addr) {
-                        return netw::get_local_messaging_service().make_sink_and_source_for_repair_put_row_diff_with_rpc_stream(repair_meta_id, addr);
+                    [&ms] (uint32_t repair_meta_id, netw::messaging_service::msg_addr addr) {
+                        return ms.local().make_sink_and_source_for_repair_put_row_diff_with_rpc_stream(repair_meta_id, addr);
                 })
+            , _row_level_repair_ptr(row_level_repair_ptr)
             {
+            if (master) {
+                add_to_repair_meta_for_masters(*this);
+            } else {
+                add_to_repair_meta_for_followers(*this);
+            }
+            _all_node_states.push_back(repair_node_state(utils::fb_utilities::get_broadcast_address()));
+            for (auto& node : all_live_peer_nodes) {
+                _all_node_states.push_back(repair_node_state(node));
+            }
     }
 
 public:
     future<> stop() {
         auto gate_future = _gate.close();
-        auto writer_future = _repair_writer.wait_for_writer_done();
         auto f1 = _sink_source_for_get_full_row_hashes.close();
         auto f2 = _sink_source_for_get_row_diff.close();
         auto f3 = _sink_source_for_put_row_diff.close();
-        return when_all_succeed(std::move(gate_future), std::move(writer_future), std::move(f1), std::move(f2), std::move(f3));
+        return when_all_succeed(std::move(gate_future), std::move(f1), std::move(f2), std::move(f3)).discard_result().finally([this] {
+            return _repair_writer->wait_for_writer_done();
+        });
     }
 
-    static std::unordered_map<node_repair_meta_id, lw_shared_ptr<repair_meta>>& repair_meta_map() {
-        static thread_local std::unordered_map<node_repair_meta_id, lw_shared_ptr<repair_meta>> _repair_metas;
-        return _repair_metas;
-    }
+    static std::unordered_map<node_repair_meta_id, lw_shared_ptr<repair_meta>>& repair_meta_map();
 
     static lw_shared_ptr<repair_meta> get_repair_meta(gms::inet_address from, uint32_t repair_meta_id) {
         node_repair_meta_id id{from, repair_meta_id};
         auto it = repair_meta_map().find(id);
         if (it == repair_meta_map().end()) {
-            throw std::runtime_error(format("get_repair_meta: repair_meta_id {:d} for node {} does not exist", id.repair_meta_id, id.ip));
+            throw std::runtime_error(format("get_repair_meta: repair_meta_id {} for node {} does not exist", id.repair_meta_id, id.ip));
         } else {
             return it->second;
         }
@@ -736,7 +874,7 @@ public:
             shard_config master_node_shard_config,
             table_schema_version schema_version,
             streaming::stream_reason reason) {
-        return service::get_schema_for_write(schema_version, {from, src_cpu_id}).then([from,
+        return service::get_schema_for_write(schema_version, {from, src_cpu_id}, ::_messaging->local()).then([from,
                 repair_meta_id,
                 range,
                 algo,
@@ -745,10 +883,12 @@ public:
                 master_node_shard_config,
                 schema_version,
                 reason] (schema_ptr s) {
+            sharded<netw::messaging_service>& ms = *::_messaging;
             auto& db = service::get_local_storage_proxy().get_db();
             auto& cf = db.local().find_column_family(s->id());
             node_repair_meta_id id{from, repair_meta_id};
             auto rm = make_lw_shared<repair_meta>(db,
+                    ms,
                     cf,
                     s,
                     range,
@@ -758,11 +898,14 @@ public:
                     repair_meta::repair_master::no,
                     repair_meta_id,
                     reason,
-                    std::move(master_node_shard_config));
+                    std::move(master_node_shard_config),
+                    std::vector<gms::inet_address>{from});
+            rm->set_repair_state_for_local_node(repair_state::row_level_start_started);
             bool insertion = repair_meta_map().emplace(id, rm).second;
             if (!insertion) {
                 rlogger.warn("insert_repair_meta: repair_meta_id {} for node {} already exists, replace existing one", id.repair_meta_id, id.ip);
                 repair_meta_map()[id] = rm;
+                rm->set_repair_state_for_local_node(repair_state::row_level_start_finished);
             } else {
                 rlogger.debug("insert_repair_meta: Inserted repair_meta_id {} for node {}", id.repair_meta_id, id.ip);
             }
@@ -835,12 +978,12 @@ public:
     }
 
     // Must run inside a seastar thread
-    static std::unordered_set<repair_hash>
-    get_set_diff(const std::unordered_set<repair_hash>& x, const std::unordered_set<repair_hash>& y) {
-        std::unordered_set<repair_hash> set_diff;
+    static repair_hash_set
+    get_set_diff(const repair_hash_set& x, const repair_hash_set& y) {
+        repair_hash_set set_diff;
         // Note std::set_difference needs x and y are sorted.
         std::copy_if(x.begin(), x.end(), std::inserter(set_diff, set_diff.end()),
-                [&y] (auto& item) { thread::maybe_yield(); return y.find(item) == y.end(); });
+                [&y] (auto& item) { thread::maybe_yield(); return !y.contains(item); });
         return set_diff;
     }
 
@@ -855,14 +998,14 @@ public:
 
     }
 
-    std::unordered_set<repair_hash>& peer_row_hash_sets(unsigned node_idx) {
+    repair_hash_set& peer_row_hash_sets(unsigned node_idx) {
         return _peer_row_hash_sets[node_idx];
     }
 
     // Get a list of row hashes in _working_row_buf
-    future<std::unordered_set<repair_hash>>
+    future<repair_hash_set>
     working_row_hashes() {
-        return do_with(std::unordered_set<repair_hash>(), [this] (std::unordered_set<repair_hash>& hashes) {
+        return do_with(repair_hash_set(), [this] (repair_hash_set& hashes) {
             return do_for_each(_working_row_buf, [&hashes] (repair_row& r) {
                 hashes.emplace(r.hash());
             }).then([&hashes] {
@@ -987,11 +1130,7 @@ private:
         return repair_hash(h.finalize_uint64());
     }
 
-    stop_iteration handle_mutation_fragment(mutation_fragment_opt mfopt, size_t& cur_size, size_t& new_rows_size, std::list<repair_row>& cur_rows) {
-        if (!mfopt) {
-            return stop_iteration::yes;
-        }
-        mutation_fragment& mf = *mfopt;
+    stop_iteration handle_mutation_fragment(mutation_fragment& mf, size_t& cur_size, size_t& new_rows_size, std::list<repair_row>& cur_rows) {
         if (mf.is_partition_start()) {
             auto& start = mf.as_partition_start();
             _repair_reader.set_current_dk(start.key());
@@ -1004,7 +1143,7 @@ private:
             return stop_iteration::no;
         }
         auto hash = do_hash_for_mf(*_repair_reader.get_current_dk(), mf);
-        repair_row r(freeze(*_schema, mf), position_in_partition(mf.position()), _repair_reader.get_current_dk(), hash);
+        repair_row r(freeze(*_schema, mf), position_in_partition(mf.position()), _repair_reader.get_current_dk(), hash, is_dirty_on_master::no);
         rlogger.trace("Reading: r.boundary={}, r.hash={}", r.boundary(), r.hash());
         _metrics.row_from_disk_nr++;
         _metrics.row_from_disk_bytes += r.size();
@@ -1017,8 +1156,9 @@ private:
     // Read rows from sstable until the size of rows exceeds _max_row_buf_size  - current_size
     // This reads rows from where the reader left last time into _row_buf
     // _current_sync_boundary or _last_sync_boundary have no effect on the reader neither.
-    future<std::list<repair_row>, size_t>
+    future<std::tuple<std::list<repair_row>, size_t>>
     read_rows_from_disk(size_t cur_size) {
+        using value_type = std::tuple<std::list<repair_row>, size_t>;
         return do_with(cur_size, size_t(0), std::list<repair_row>(), [this] (size_t& cur_size, size_t& new_rows_size, std::list<repair_row>& cur_rows) {
             return repeat([this, &cur_size, &cur_rows, &new_rows_size] () mutable {
                 if (cur_size >= _max_row_buf_size) {
@@ -1026,11 +1166,30 @@ private:
                 }
                 _gate.check();
                 return _repair_reader.read_mutation_fragment().then([this, &cur_size, &new_rows_size, &cur_rows] (mutation_fragment_opt mfopt) mutable {
-                    return handle_mutation_fragment(std::move(mfopt), cur_size, new_rows_size, cur_rows);
+                    if (!mfopt) {
+                        _repair_reader.on_end_of_stream();
+                        return stop_iteration::yes;
+                    }
+                    return handle_mutation_fragment(*mfopt, cur_size, new_rows_size, cur_rows);
                 });
-            }).then([&cur_rows, &new_rows_size] () mutable {
-                return make_ready_future<std::list<repair_row>, size_t>(std::move(cur_rows), new_rows_size);
+            }).then_wrapped([this, &cur_rows, &new_rows_size] (future<> fut) mutable {
+                if (fut.failed()) {
+                    _repair_reader.on_end_of_stream();
+                    return make_exception_future<value_type>(fut.get_exception());
+                }
+                _repair_reader.pause();
+                return make_ready_future<value_type>(value_type(std::move(cur_rows), new_rows_size));
             });
+        });
+    }
+
+    future<> clear_row_buf() {
+        return utils::clear_gently(_row_buf);
+    }
+
+    future<> clear_working_row_buf() {
+        return utils::clear_gently(_working_row_buf).then([this] {
+            _working_row_buf_combined_hash.clear();
         });
     }
 
@@ -1039,20 +1198,18 @@ private:
     // Calculate the total size of the rows in _row_buf
     future<get_sync_boundary_response>
     get_sync_boundary(std::optional<repair_sync_boundary> skipped_sync_boundary) {
+        auto f = make_ready_future<>();
         if (skipped_sync_boundary) {
             _current_sync_boundary = skipped_sync_boundary;
-            _row_buf.clear();
-            _working_row_buf.clear();
-            _working_row_buf_combined_hash.clear();
-        } else {
-            _working_row_buf.clear();
-            _working_row_buf_combined_hash.clear();
+            f = clear_row_buf();
         }
         // Here is the place we update _last_sync_boundary
         rlogger.trace("SET _last_sync_boundary from {} to {}", _last_sync_boundary, _current_sync_boundary);
         _last_sync_boundary = _current_sync_boundary;
-        return row_buf_size().then([this, sb = std::move(skipped_sync_boundary)] (size_t cur_size) {
-            return read_rows_from_disk(cur_size).then([this, sb = std::move(sb)] (std::list<repair_row> new_rows, size_t new_rows_size) mutable {
+      return f.then([this, sb = std::move(skipped_sync_boundary)] () mutable {
+       return clear_working_row_buf().then([this, sb = sb] () mutable {
+        return row_buf_size().then([this, sb = std::move(sb)] (size_t cur_size) {
+            return read_rows_from_disk(cur_size).then_unpack([this, sb = std::move(sb)] (std::list<repair_row> new_rows, size_t new_rows_size) mutable {
                 size_t new_rows_nr = new_rows.size();
                 _row_buf.splice(_row_buf.end(), new_rows);
                 return row_buf_csum().then([this, new_rows_size, new_rows_nr, sb = std::move(sb)] (repair_hash row_buf_combined_hash) {
@@ -1068,6 +1225,8 @@ private:
                 });
             });
         });
+       });
+      });
     }
 
     future<> move_row_buf_to_working_row_buf() {
@@ -1143,11 +1302,11 @@ private:
     }
 
     future<std::list<repair_row>>
-    copy_rows_from_working_row_buf_within_set_diff(std::unordered_set<repair_hash> set_diff) {
+    copy_rows_from_working_row_buf_within_set_diff(repair_hash_set set_diff) {
         return do_with(std::list<repair_row>(), std::move(set_diff),
-                [this] (std::list<repair_row>& rows, std::unordered_set<repair_hash>& set_diff) {
+                [this] (std::list<repair_row>& rows, repair_hash_set& set_diff) {
             return do_for_each(_working_row_buf, [this, &set_diff, &rows] (const repair_row& r) {
-                if (set_diff.count(r.hash()) > 0) {
+                if (set_diff.contains(r.hash())) {
                     rows.push_back(r);
                 }
             }).then([&rows] {
@@ -1160,7 +1319,7 @@ private:
     // Give a set of row hashes, return the corresponding rows
     // If needs_all_rows is set, return all the rows in _working_row_buf, ignore the set_diff
     future<std::list<repair_row>>
-    get_row_diff(std::unordered_set<repair_hash> set_diff, needs_all_rows_t needs_all_rows = needs_all_rows_t::no) {
+    get_row_diff(repair_hash_set set_diff, needs_all_rows_t needs_all_rows = needs_all_rows_t::no) {
         if (needs_all_rows) {
             if (!_repair_master || _nr_peer_nodes == 1) {
                 return make_ready_future<std::list<repair_row>>(std::move(_working_row_buf));
@@ -1171,10 +1330,36 @@ private:
         }
     }
 
+    future<> do_apply_rows(std::list<repair_row>&& row_diff, update_working_row_buf update_buf) {
+        return do_with(std::move(row_diff), [this, update_buf] (std::list<repair_row>& row_diff) {
+            return with_semaphore(_repair_writer->sem(), 1, [this, update_buf, &row_diff] {
+                _repair_writer->create_writer(_db);
+                return repeat([this, update_buf, &row_diff] () mutable {
+                    if (row_diff.empty()) {
+                        return make_ready_future<stop_iteration>(stop_iteration::yes);
+                    }
+                    repair_row& r = row_diff.front();
+                    if (update_buf) {
+                        _working_row_buf_combined_hash.add(r.hash());
+                    }
+                    // The repair_row here is supposed to have
+                    // mutation_fragment attached because we have stored it in
+                    // to_repair_rows_list above where the repair_row is created.
+                    mutation_fragment mf = std::move(r.get_mutation_fragment());
+                    auto dk_with_hash = r.get_dk_with_hash();
+                    return _repair_writer->do_write(std::move(dk_with_hash), std::move(mf)).then([&row_diff] {
+                        row_diff.pop_front();
+                        return make_ready_future<stop_iteration>(stop_iteration::no);
+                    });
+                });
+            });
+        });
+    }
+
     // Give a list of rows, apply the rows to disk and update the _working_row_buf and _peer_row_hash_sets if requested
     // Must run inside a seastar thread
     void apply_rows_on_master_in_thread(repair_rows_on_wire rows, gms::inet_address from, update_working_row_buf update_buf,
-            update_peer_row_hash_sets update_hash_set, unsigned node_idx = 0) {
+            update_peer_row_hash_sets update_hash_set, unsigned node_idx) {
         if (rows.empty()) {
             return;
         }
@@ -1184,68 +1369,93 @@ private:
         stats().rx_row_nr += row_diff.size();
         stats().rx_row_nr_peer[from] += row_diff.size();
         if (update_buf) {
-            std::list<repair_row> tmp;
-            tmp.swap(_working_row_buf);
             // Both row_diff and _working_row_buf and are ordered, merging
             // two sored list to make sure the combination of row_diff
             // and _working_row_buf are ordered.
-            std::merge(tmp.begin(), tmp.end(), row_diff.begin(), row_diff.end(), std::back_inserter(_working_row_buf),
-                [this] (const repair_row& x, const repair_row& y) { thread::maybe_yield(); return _cmp(x.boundary(), y.boundary()) < 0; });
-        }
-        if (update_hash_set) {
-            _peer_row_hash_sets[node_idx] = boost::copy_range<std::unordered_set<repair_hash>>(row_diff |
-                    boost::adaptors::transformed([] (repair_row& r) { thread::maybe_yield(); return r.hash(); }));
-        }
-        _repair_writer.create_writer(_db, node_idx);
-        for (auto& r : row_diff) {
-            if (update_buf) {
+            utils::merge_to_gently(_working_row_buf, row_diff,
+                 [this] (const repair_row& x, const repair_row& y) { return _cmp(x.boundary(), y.boundary()) < 0; });
+            for (auto& r : row_diff) {
+                thread::maybe_yield();
                 _working_row_buf_combined_hash.add(r.hash());
             }
-            // The repair_row here is supposed to have
-            // mutation_fragment attached because we have stored it in
-            // to_repair_rows_list above where the repair_row is created.
-            mutation_fragment mf = std::move(r.get_mutation_fragment());
-            auto dk_with_hash = r.get_dk_with_hash();
-            _repair_writer.do_write(node_idx, std::move(dk_with_hash), std::move(mf)).get();
+        }
+        if (update_hash_set) {
+            _peer_row_hash_sets[node_idx] = boost::copy_range<repair_hash_set>(row_diff |
+                    boost::adaptors::transformed([] (repair_row& r) { thread::maybe_yield(); return r.hash(); }));
+        }
+        // Repair rows in row_diff will be flushed to disk by flush_rows_in_working_row_buf,
+        // so we skip calling do_apply_rows here.
+        _dirty_on_master = is_dirty_on_master::yes;
+    }
+public:
+    // Must run inside a seastar thread
+    void flush_rows_in_working_row_buf() {
+        if (_dirty_on_master) {
+            _dirty_on_master = is_dirty_on_master::no;
+        } else {
+            return;
+        }
+        auto cmp = position_in_partition::tri_compare(*_schema);
+        lw_shared_ptr<mutation_fragment> last_mf;
+        lw_shared_ptr<const decorated_key_with_hash> last_dk;
+        for (auto& r : _working_row_buf) {
+            thread::maybe_yield();
+            if (!r.dirty_on_master()) {
+                continue;
+            }
+            _repair_writer->create_writer(_db);
+            auto mf = r.get_mutation_fragment_ptr();
+            const auto& dk = r.get_dk_with_hash()->dk;
+            if (last_mf && last_dk &&
+                    cmp(last_mf->position(), mf->position()) == 0 &&
+                    dk.tri_compare(*_schema, last_dk->dk) == 0 &&
+                    last_mf->mergeable_with(*mf)) {
+                last_mf->apply(*_schema, std::move(*mf));
+            } else {
+                if (last_mf && last_dk) {
+                    _repair_writer->do_write(std::move(last_dk), std::move(*last_mf)).get();
+                }
+                last_mf = mf;
+                last_dk = r.get_dk_with_hash();
+            }
+        }
+        if (last_mf && last_dk) {
+            _repair_writer->do_write(std::move(last_dk), std::move(*last_mf)).get();
         }
     }
 
+private:
     future<>
     apply_rows_on_follower(repair_rows_on_wire rows) {
         if (rows.empty()) {
             return make_ready_future<>();
         }
-        return to_repair_rows_list(rows).then([this] (std::list<repair_row> row_diff) {
-            return do_with(std::move(row_diff), [this] (std::list<repair_row>& row_diff) {
-                unsigned node_idx = 0;
-                _repair_writer.create_writer(_db, node_idx);
-                return do_for_each(row_diff, [this, node_idx] (repair_row& r) {
-                    // The repair_row here is supposed to have
-                    // mutation_fragment attached because we have stored it in
-                    // to_repair_rows_list above where the repair_row is created.
-                    mutation_fragment mf = std::move(r.get_mutation_fragment());
-                    auto dk_with_hash = r.get_dk_with_hash();
-                    return _repair_writer.do_write(node_idx, std::move(dk_with_hash), std::move(mf));
-                });
-            });
+        return to_repair_rows_list(std::move(rows)).then([this] (std::list<repair_row> row_diff) {
+            return do_apply_rows(std::move(row_diff), update_working_row_buf::no);
         });
     }
 
     future<repair_rows_on_wire> to_repair_rows_on_wire(std::list<repair_row> row_list) {
-        return do_with(repair_rows_on_wire(), std::move(row_list), [this] (repair_rows_on_wire& rows, std::list<repair_row>& row_list) {
-            return get_repair_rows_size(row_list).then([this, &rows, &row_list] (size_t row_bytes) {
+        lw_shared_ptr<const decorated_key_with_hash> last_dk_with_hash;
+        return do_with(repair_rows_on_wire(), std::move(row_list), std::move(last_dk_with_hash),
+                [this] (repair_rows_on_wire& rows, std::list<repair_row>& row_list, lw_shared_ptr<const decorated_key_with_hash>& last_dk_with_hash) {
+            return get_repair_rows_size(row_list).then([this, &rows, &row_list, &last_dk_with_hash] (size_t row_bytes) {
                 _metrics.tx_row_nr += row_list.size();
                 _metrics.tx_row_bytes += row_bytes;
-                return do_for_each(row_list, [this, &rows] (repair_row& r) {
-                    auto pk = r.get_dk_with_hash()->dk.key();
+                return do_for_each(row_list, [this, &rows, &last_dk_with_hash] (repair_row& r) {
+                    const auto& dk_with_hash = r.get_dk_with_hash();
                     // No need to search from the beginning of the rows. Look at the end of repair_rows_on_wire is enough.
                     if (rows.empty()) {
+                        auto pk = dk_with_hash->dk.key();
+                        last_dk_with_hash = dk_with_hash;
                         rows.push_back(repair_row_on_wire(std::move(pk), {std::move(r.get_frozen_mutation())}));
                     } else {
                         auto& row = rows.back();
-                        if (pk.legacy_equal(*_schema, row.get_key())) {
+                        if (last_dk_with_hash && dk_with_hash->dk.tri_compare(*_schema, last_dk_with_hash->dk) == 0) {
                             row.push_mutation_fragment(std::move(r.get_frozen_mutation()));
                         } else {
+                            auto pk = dk_with_hash->dk.key();
+                            last_dk_with_hash = dk_with_hash;
                             rows.push_back(repair_row_on_wire(std::move(pk), {std::move(r.get_frozen_mutation())}));
                         }
                     }
@@ -1272,17 +1482,17 @@ private:
                         // optimization to avoid unfreeze again when
                         // mutation_fragment is needed by _repair_writer.do_write()
                         // to apply the repair_row to disk
-                        auto mf = make_lw_shared<mutation_fragment>(fmf.unfreeze(*_schema));
+                        auto mf = make_lw_shared<mutation_fragment>(fmf.unfreeze(*_schema, _permit));
                         auto hash = do_hash_for_mf(*dk_ptr, *mf);
                         position_in_partition pos(mf->position());
-                        row_list.push_back(repair_row(std::move(fmf), std::move(pos), dk_ptr, std::move(hash), std::move(mf)));
+                        row_list.push_back(repair_row(std::move(fmf), std::move(pos), dk_ptr, std::move(hash), is_dirty_on_master::yes, std::move(mf)));
                     });
                 } else {
                     last_mf = {};
                     return do_for_each(x.get_mutation_fragments(), [this, &dk_ptr, &row_list, &last_mf, &cmp] (frozen_mutation_fragment& fmf) mutable {
                         _metrics.rx_row_nr += 1;
                         _metrics.rx_row_bytes += fmf.representation().size();
-                        auto mf = make_lw_shared<mutation_fragment>(fmf.unfreeze(*_schema));
+                        auto mf = make_lw_shared<mutation_fragment>(fmf.unfreeze(*_schema, _permit));
                         // If the mutation_fragment has the same position as
                         // the last mutation_fragment, it means they are the
                         // same row with different contents. We can not feed
@@ -1293,7 +1503,7 @@ private:
                         } else {
                             last_mf = mf;
                             // On repair follower node, only decorated_key_with_hash and the mutation_fragment inside repair_row are used.
-                            row_list.push_back(repair_row({}, {}, dk_ptr, {}, std::move(mf)));
+                            row_list.push_back(repair_row({}, {}, dk_ptr, {}, is_dirty_on_master::no, std::move(mf)));
                         }
                     });
                 }
@@ -1306,13 +1516,13 @@ private:
 public:
     // RPC API
     // Return the hashes of the rows in _working_row_buf
-    future<std::unordered_set<repair_hash>>
+    future<repair_hash_set>
     get_full_row_hashes(gms::inet_address remote_node) {
         if (remote_node == _myip) {
             return get_full_row_hashes_handler();
         }
-        return netw::get_local_messaging_service().send_repair_get_full_row_hashes(msg_addr(remote_node),
-                _repair_meta_id).then([this, remote_node] (std::unordered_set<repair_hash> hashes) {
+        return _messaging.local().send_repair_get_full_row_hashes(msg_addr(remote_node),
+                _repair_meta_id).then([this, remote_node] (repair_hash_set hashes) {
             rlogger.debug("Got full hashes from peer={}, nr_hashes={}", remote_node, hashes.size());
             _metrics.rx_hashes_nr += hashes.size();
             stats().rx_hashes_nr += hashes.size();
@@ -1323,7 +1533,7 @@ public:
 
 private:
     future<> get_full_row_hashes_source_op(
-            lw_shared_ptr<std::unordered_set<repair_hash>> current_hashes,
+            lw_shared_ptr<repair_hash_set> current_hashes,
             gms::inet_address remote_node,
             unsigned node_idx,
             rpc::source<repair_hash_with_cmd>& source) {
@@ -1361,18 +1571,18 @@ private:
     }
 
 public:
-    future<std::unordered_set<repair_hash>>
+    future<repair_hash_set>
     get_full_row_hashes_with_rpc_stream(gms::inet_address remote_node, unsigned node_idx) {
         if (remote_node == _myip) {
             return get_full_row_hashes_handler();
         }
-        auto current_hashes = make_lw_shared<std::unordered_set<repair_hash>>();
-        return _sink_source_for_get_full_row_hashes.get_sink_source(remote_node, node_idx).then(
+        auto current_hashes = make_lw_shared<repair_hash_set>();
+        return _sink_source_for_get_full_row_hashes.get_sink_source(remote_node, node_idx).then_unpack(
                 [this, current_hashes, remote_node, node_idx]
                 (rpc::sink<repair_stream_cmd>& sink, rpc::source<repair_hash_with_cmd>& source) mutable {
             auto source_op = get_full_row_hashes_source_op(current_hashes, remote_node, node_idx, source);
             auto sink_op = get_full_row_hashes_sink_op(sink);
-            return when_all_succeed(std::move(source_op), std::move(sink_op));
+            return when_all_succeed(std::move(source_op), std::move(sink_op)).discard_result();
         }).then([this, current_hashes] () mutable {
             stats().rx_hashes_nr += current_hashes->size();
             _metrics.rx_hashes_nr += current_hashes->size();
@@ -1381,7 +1591,7 @@ public:
     }
 
     // RPC handler
-    future<std::unordered_set<repair_hash>>
+    future<repair_hash_set>
     get_full_row_hashes_handler() {
         return with_gate(_gate, [this] {
             return working_row_hashes();
@@ -1395,7 +1605,7 @@ public:
         if (remote_node == _myip) {
             return get_combined_row_hash_handler(common_sync_boundary);
         }
-        return netw::get_local_messaging_service().send_repair_get_combined_row_hash(msg_addr(remote_node),
+        return _messaging.local().send_repair_get_combined_row_hash(msg_addr(remote_node),
                 _repair_meta_id, common_sync_boundary).then([this] (get_combined_row_hash_response resp) {
             stats().rpc_call_nr++;
             stats().rx_hashes_nr++;
@@ -1428,24 +1638,34 @@ public:
         // Murmur3 is appropriate because that's the only supported partitioner at
         // the time this change is introduced.
         sstring remote_partitioner_name = "org.apache.cassandra.dht.Murmur3Partitioner";
-        return netw::get_local_messaging_service().send_repair_row_level_start(msg_addr(remote_node),
-                _repair_meta_id, std::move(ks_name), std::move(cf_name), std::move(range), _algo, _max_row_buf_size, _seed,
+        return _messaging.local().send_repair_row_level_start(msg_addr(remote_node),
+                _repair_meta_id, ks_name, cf_name, std::move(range), _algo, _max_row_buf_size, _seed,
                 _master_node_shard_config.shard, _master_node_shard_config.shard_count, _master_node_shard_config.ignore_msb,
-                remote_partitioner_name, std::move(schema_version), reason);
+                remote_partitioner_name, std::move(schema_version), reason).then([ks_name, cf_name] (rpc::optional<repair_row_level_start_response> resp) {
+            if (resp && resp->status == repair_row_level_start_status::no_such_column_family) {
+                return make_exception_future<>(no_such_column_family(ks_name, cf_name));
+            } else {
+                return make_ready_future<>();
+            }
+        });
     }
 
     // RPC handler
-    static future<>
+    static future<repair_row_level_start_response>
     repair_row_level_start_handler(gms::inet_address from, uint32_t src_cpu_id, uint32_t repair_meta_id, sstring ks_name, sstring cf_name,
             dht::token_range range, row_level_diff_detect_algorithm algo, uint64_t max_row_buf_size,
             uint64_t seed, shard_config master_node_shard_config, table_schema_version schema_version, streaming::stream_reason reason) {
         if (!_sys_dist_ks->local_is_initialized() || !_view_update_generator->local_is_initialized()) {
-            return make_exception_future<>(std::runtime_error(format("Node {} is not fully initialized for repair, try again later",
+            return make_exception_future<repair_row_level_start_response>(std::runtime_error(format("Node {} is not fully initialized for repair, try again later",
                     utils::fb_utilities::get_broadcast_address())));
         }
         rlogger.debug(">>> Started Row Level Repair (Follower): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_siz={}",
             utils::fb_utilities::get_broadcast_address(), from, repair_meta_id, ks_name, cf_name, schema_version, range, seed, max_row_buf_size);
-        return insert_repair_meta(from, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason);
+        return insert_repair_meta(from, src_cpu_id, repair_meta_id, std::move(range), algo, max_row_buf_size, seed, std::move(master_node_shard_config), std::move(schema_version), reason).then([] {
+            return repair_row_level_start_response{repair_row_level_start_status::ok};
+        }).handle_exception_type([] (no_such_column_family&) {
+            return repair_row_level_start_response{repair_row_level_start_status::no_such_column_family};
+        });
     }
 
     // RPC API
@@ -1454,7 +1674,7 @@ public:
             return stop();
         }
         stats().rpc_call_nr++;
-        return netw::get_local_messaging_service().send_repair_row_level_stop(msg_addr(remote_node),
+        return _messaging.local().send_repair_row_level_stop(msg_addr(remote_node),
                 _repair_meta_id, std::move(ks_name), std::move(cf_name), std::move(range));
     }
 
@@ -1464,7 +1684,10 @@ public:
         rlogger.debug("<<< Finished Row Level Repair (Follower): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, range={}",
             utils::fb_utilities::get_broadcast_address(), from, repair_meta_id, ks_name, cf_name, range);
         auto rm = get_repair_meta(from, repair_meta_id);
-        return remove_repair_meta(from, repair_meta_id, std::move(ks_name), std::move(cf_name), std::move(range));
+        rm->set_repair_state_for_local_node(repair_state::row_level_stop_started);
+        return remove_repair_meta(from, repair_meta_id, std::move(ks_name), std::move(cf_name), std::move(range)).then([rm] {
+            rm->set_repair_state_for_local_node(repair_state::row_level_stop_finished);
+        });
     }
 
     // RPC API
@@ -1473,14 +1696,18 @@ public:
             return get_estimated_partitions();
         }
         stats().rpc_call_nr++;
-        return netw::get_local_messaging_service().send_repair_get_estimated_partitions(msg_addr(remote_node), _repair_meta_id);
+        return _messaging.local().send_repair_get_estimated_partitions(msg_addr(remote_node), _repair_meta_id);
     }
 
 
     // RPC handler
     static future<uint64_t> repair_get_estimated_partitions_handler(gms::inet_address from, uint32_t repair_meta_id) {
         auto rm = get_repair_meta(from, repair_meta_id);
-        return rm->get_estimated_partitions();
+        rm->set_repair_state_for_local_node(repair_state::get_estimated_partitions_started);
+        return rm->get_estimated_partitions().then([rm] (uint64_t partitions) {
+            rm->set_repair_state_for_local_node(repair_state::get_estimated_partitions_finished);
+            return partitions;
+        });
     }
 
     // RPC API
@@ -1489,14 +1716,17 @@ public:
             return set_estimated_partitions(estimated_partitions);
         }
         stats().rpc_call_nr++;
-        return netw::get_local_messaging_service().send_repair_set_estimated_partitions(msg_addr(remote_node), _repair_meta_id, estimated_partitions);
+        return _messaging.local().send_repair_set_estimated_partitions(msg_addr(remote_node), _repair_meta_id, estimated_partitions);
     }
 
 
     // RPC handler
     static future<> repair_set_estimated_partitions_handler(gms::inet_address from, uint32_t repair_meta_id, uint64_t estimated_partitions) {
         auto rm = get_repair_meta(from, repair_meta_id);
-        return rm->set_estimated_partitions(estimated_partitions);
+        rm->set_repair_state_for_local_node(repair_state::set_estimated_partitions_started);
+        return rm->set_estimated_partitions(estimated_partitions).then([rm] {
+            rm->set_repair_state_for_local_node(repair_state::set_estimated_partitions_finished);
+        });
     }
 
     // RPC API
@@ -1507,7 +1737,7 @@ public:
             return get_sync_boundary_handler(skipped_sync_boundary);
         }
         stats().rpc_call_nr++;
-        return netw::get_local_messaging_service().send_repair_get_sync_boundary(msg_addr(remote_node), _repair_meta_id, skipped_sync_boundary);
+        return _messaging.local().send_repair_get_sync_boundary(msg_addr(remote_node), _repair_meta_id, skipped_sync_boundary);
     }
 
     // RPC handler
@@ -1521,7 +1751,7 @@ public:
     // RPC API
     // Return rows in the _working_row_buf with hash within the given sef_diff
     // Must run inside a seastar thread
-    void get_row_diff(std::unordered_set<repair_hash> set_diff, needs_all_rows_t needs_all_rows, gms::inet_address remote_node, unsigned node_idx) {
+    void get_row_diff(repair_hash_set set_diff, needs_all_rows_t needs_all_rows, gms::inet_address remote_node, unsigned node_idx) {
         if (needs_all_rows || !set_diff.empty()) {
             if (remote_node == _myip) {
                 return;
@@ -1533,7 +1763,7 @@ public:
                 _metrics.tx_hashes_nr += set_diff.size();
             }
             stats().rpc_call_nr++;
-            repair_rows_on_wire rows = netw::get_local_messaging_service().send_repair_get_row_diff(msg_addr(remote_node),
+            repair_rows_on_wire rows = _messaging.local().send_repair_get_row_diff(msg_addr(remote_node),
                     _repair_meta_id, std::move(set_diff), bool(needs_all_rows)).get0();
             if (!rows.empty()) {
                 apply_rows_on_master_in_thread(std::move(rows), remote_node, update_working_row_buf::yes, update_peer_row_hash_sets::no, node_idx);
@@ -1547,7 +1777,7 @@ public:
             return;
         }
         stats().rpc_call_nr++;
-        repair_rows_on_wire rows = netw::get_local_messaging_service().send_repair_get_row_diff(msg_addr(remote_node),
+        repair_rows_on_wire rows = _messaging.local().send_repair_get_row_diff(msg_addr(remote_node),
                 _repair_meta_id, {}, bool(needs_all_rows_t::yes)).get0();
         if (!rows.empty()) {
             apply_rows_on_master_in_thread(std::move(rows), remote_node, update_working_row_buf::yes, update_peer_row_hash_sets::yes, node_idx);
@@ -1590,11 +1820,11 @@ private:
     }
 
     future<> get_row_diff_sink_op(
-            std::unordered_set<repair_hash> set_diff,
+            repair_hash_set set_diff,
             needs_all_rows_t needs_all_rows,
             rpc::sink<repair_hash_with_cmd>& sink,
             gms::inet_address remote_node) {
-        return do_with(std::move(set_diff), [needs_all_rows, remote_node, &sink] (std::unordered_set<repair_hash>& set_diff) mutable {
+        return do_with(std::move(set_diff), [needs_all_rows, remote_node, &sink] (repair_hash_set& set_diff) mutable {
             if (inject_rpc_stream_error) {
                 return make_exception_future<>(std::runtime_error("get_row_diff: Inject sender error in sink loop"));
             }
@@ -1621,7 +1851,7 @@ private:
 public:
     // Must run inside a seastar thread
     void get_row_diff_with_rpc_stream(
-            std::unordered_set<repair_hash> set_diff,
+            repair_hash_set set_diff,
             needs_all_rows_t needs_all_rows,
             update_peer_row_hash_sets update_hash_set,
             gms::inet_address remote_node,
@@ -1637,7 +1867,7 @@ public:
                 _metrics.tx_hashes_nr += set_diff.size();
             }
             stats().rpc_call_nr++;
-            auto f = _sink_source_for_get_row_diff.get_sink_source(remote_node, node_idx).get();
+            auto f = _sink_source_for_get_row_diff.get_sink_source(remote_node, node_idx).get0();
             rpc::sink<repair_hash_with_cmd>& sink = std::get<0>(f);
             rpc::source<repair_row_on_wire_with_cmd>& source = std::get<1>(f);
             auto sink_op = get_row_diff_sink_op(std::move(set_diff), needs_all_rows, sink, remote_node);
@@ -1647,7 +1877,7 @@ public:
     }
 
     // RPC handler
-    future<repair_rows_on_wire> get_row_diff_handler(std::unordered_set<repair_hash> set_diff, needs_all_rows_t needs_all_rows) {
+    future<repair_rows_on_wire> get_row_diff_handler(repair_hash_set set_diff, needs_all_rows_t needs_all_rows) {
         return with_gate(_gate, [this, set_diff = std::move(set_diff), needs_all_rows] () mutable {
             return get_row_diff(std::move(set_diff), needs_all_rows).then([this] (std::list<repair_row> row_diff) {
                 return to_repair_rows_on_wire(std::move(row_diff));
@@ -1657,15 +1887,16 @@ public:
 
     // RPC API
     // Send rows in the _working_row_buf with hash within the given sef_diff
-    future<> put_row_diff(std::unordered_set<repair_hash> set_diff, needs_all_rows_t needs_all_rows, gms::inet_address remote_node) {
+    future<> put_row_diff(repair_hash_set set_diff, needs_all_rows_t needs_all_rows, gms::inet_address remote_node) {
         if (!set_diff.empty()) {
             if (remote_node == _myip) {
                 return make_ready_future<>();
             }
-            auto sz = set_diff.size();
+            size_t sz = set_diff.size();
             return get_row_diff(std::move(set_diff), needs_all_rows).then([this, remote_node, sz] (std::list<repair_row> row_diff) {
                 if (row_diff.size() != sz) {
-                    throw std::runtime_error("row_diff.size() != set_diff.size()");
+                    rlogger.warn("Hash conflict detected, keyspace={}, table={}, range={}, row_diff.size={}, set_diff.size={}. It is recommended to compact the table and rerun repair for the range.",
+                            _schema->ks_name(), _schema->cf_name(), _range, row_diff.size(), sz);
                 }
                 return do_with(std::move(row_diff), [this, remote_node] (std::list<repair_row>& row_diff) {
                     return get_repair_rows_size(row_diff).then([this, remote_node, &row_diff] (size_t row_bytes) mutable {
@@ -1674,7 +1905,7 @@ public:
                         stats().tx_row_bytes += row_bytes;
                         stats().rpc_call_nr++;
                         return to_repair_rows_on_wire(std::move(row_diff)).then([this, remote_node] (repair_rows_on_wire rows)  {
-                            return netw::get_local_messaging_service().send_repair_put_row_diff(msg_addr(remote_node), _repair_meta_id, std::move(rows));
+                            return _messaging.local().send_repair_put_row_diff(msg_addr(remote_node), _repair_meta_id, std::move(rows));
                         });
                     });
                 });
@@ -1732,17 +1963,18 @@ private:
 
 public:
     future<> put_row_diff_with_rpc_stream(
-            std::unordered_set<repair_hash> set_diff,
+            repair_hash_set set_diff,
             needs_all_rows_t needs_all_rows,
             gms::inet_address remote_node, unsigned node_idx) {
         if (!set_diff.empty()) {
             if (remote_node == _myip) {
                 return make_ready_future<>();
             }
-            auto sz = set_diff.size();
+            size_t sz = set_diff.size();
             return get_row_diff(std::move(set_diff), needs_all_rows).then([this, remote_node, node_idx, sz] (std::list<repair_row> row_diff) {
                 if (row_diff.size() != sz) {
-                    throw std::runtime_error("row_diff.size() != set_diff.size()");
+                    rlogger.warn("Hash conflict detected, keyspace={}, table={}, range={}, row_diff.size={}, set_diff.size={}. It is recommended to compact the table and rerun repair for the range.",
+                            _schema->ks_name(), _schema->cf_name(), _range, row_diff.size(), sz);
                 }
                 return do_with(std::move(row_diff), [this, remote_node, node_idx] (std::list<repair_row>& row_diff) {
                     return get_repair_rows_size(row_diff).then([this, remote_node, node_idx, &row_diff] (size_t row_bytes) mutable {
@@ -1751,12 +1983,12 @@ public:
                         stats().tx_row_bytes += row_bytes;
                         stats().rpc_call_nr++;
                         return to_repair_rows_on_wire(std::move(row_diff)).then([this, remote_node, node_idx] (repair_rows_on_wire rows)  {
-                            return  _sink_source_for_put_row_diff.get_sink_source(remote_node, node_idx).then(
+                            return  _sink_source_for_put_row_diff.get_sink_source(remote_node, node_idx).then_unpack(
                                     [this, rows = std::move(rows), remote_node, node_idx]
                                     (rpc::sink<repair_row_on_wire_with_cmd>& sink, rpc::source<repair_stream_cmd>& source) mutable {
                                 auto source_op = put_row_diff_source_op(remote_node, node_idx, source);
                                 auto sink_op = put_row_diff_sink_op(std::move(rows), sink, remote_node);
-                                return when_all_succeed(std::move(source_op), std::move(sink_op));
+                                return when_all_succeed(std::move(source_op), std::move(sink_op)).discard_result();
                             });
                         });
                     });
@@ -1774,6 +2006,12 @@ public:
     }
 };
 
+// The repair_metas created passively, i.e., local node is the repair follower.
+static thread_local std::unordered_map<node_repair_meta_id, lw_shared_ptr<repair_meta>> _repair_metas;
+std::unordered_map<node_repair_meta_id, lw_shared_ptr<repair_meta>>& repair_meta::repair_meta_map() {
+    return _repair_metas;
+}
+
 static future<stop_iteration> repair_get_row_diff_with_rpc_stream_process_op(
         gms::inet_address from,
         uint32_t src_cpu_id,
@@ -1781,7 +2019,7 @@ static future<stop_iteration> repair_get_row_diff_with_rpc_stream_process_op(
         rpc::sink<repair_row_on_wire_with_cmd> sink,
         rpc::source<repair_hash_with_cmd> source,
         bool &error,
-        std::unordered_set<repair_hash>& current_set_diff,
+        repair_hash_set& current_set_diff,
         std::optional<std::tuple<repair_hash_with_cmd>> hash_cmd_opt) {
     repair_hash_with_cmd hash_cmd = std::get<0>(hash_cmd_opt.value());
     rlogger.trace("Got repair_hash_with_cmd from peer={}, hash={}, cmd={}", from, hash_cmd.hash, int(hash_cmd.cmd));
@@ -1794,13 +2032,20 @@ static future<stop_iteration> repair_get_row_diff_with_rpc_stream_process_op(
         }
         bool needs_all_rows = hash_cmd.cmd == repair_stream_cmd::needs_all_rows;
         _metrics.rx_hashes_nr += current_set_diff.size();
-        auto fp = make_foreign(std::make_unique<std::unordered_set<repair_hash>>(std::move(current_set_diff)));
+        auto fp = make_foreign(std::make_unique<repair_hash_set>(std::move(current_set_diff)));
         return smp::submit_to(src_cpu_id % smp::count, [from, repair_meta_id, needs_all_rows, fp = std::move(fp)] {
             auto rm = repair_meta::get_repair_meta(from, repair_meta_id);
+            rm->set_repair_state_for_local_node(repair_state::get_row_diff_with_rpc_stream_started);
             if (fp.get_owner_shard() == this_shard_id()) {
-                return rm->get_row_diff_handler(std::move(*fp), repair_meta::needs_all_rows_t(needs_all_rows));
+                return rm->get_row_diff_handler(std::move(*fp), repair_meta::needs_all_rows_t(needs_all_rows)).then([rm] (repair_rows_on_wire rows) {
+                    rm->set_repair_state_for_local_node(repair_state::get_row_diff_with_rpc_stream_finished);
+                    return rows;
+                });
             } else {
-                return rm->get_row_diff_handler(*fp, repair_meta::needs_all_rows_t(needs_all_rows));
+                return rm->get_row_diff_handler(*fp, repair_meta::needs_all_rows_t(needs_all_rows)).then([rm] (repair_rows_on_wire rows) {
+                    rm->set_repair_state_for_local_node(repair_state::get_row_diff_with_rpc_stream_finished);
+                    return rows;
+                });
             }
         }).then([sink] (repair_rows_on_wire rows_on_wire) mutable {
             if (rows_on_wire.empty()) {
@@ -1842,10 +2087,15 @@ static future<stop_iteration> repair_put_row_diff_with_rpc_stream_process_op(
         auto fp = make_foreign(std::make_unique<repair_rows_on_wire>(std::move(current_rows)));
         return smp::submit_to(src_cpu_id % smp::count, [from, repair_meta_id, fp = std::move(fp)] () mutable {
             auto rm = repair_meta::get_repair_meta(from, repair_meta_id);
+            rm->set_repair_state_for_local_node(repair_state::put_row_diff_with_rpc_stream_started);
             if (fp.get_owner_shard() == this_shard_id()) {
-                return rm->put_row_diff_handler(std::move(*fp), from);
+                return rm->put_row_diff_handler(std::move(*fp), from).then([rm] {
+                    rm->set_repair_state_for_local_node(repair_state::put_row_diff_with_rpc_stream_finished);
+                });
             } else {
-                return rm->put_row_diff_handler(*fp, from);
+                return rm->put_row_diff_handler(*fp, from).then([rm] {
+                    rm->set_repair_state_for_local_node(repair_state::put_row_diff_with_rpc_stream_finished);
+                });
             }
         }).then([sink] () mutable {
             return sink(repair_stream_cmd::put_rows_done);
@@ -1872,12 +2122,14 @@ static future<stop_iteration> repair_get_full_row_hashes_with_rpc_stream_process
     if (status == repair_stream_cmd::get_full_row_hashes) {
         return smp::submit_to(src_cpu_id % smp::count, [from, repair_meta_id] {
             auto rm = repair_meta::get_repair_meta(from, repair_meta_id);
-            return rm->get_full_row_hashes_handler().then([] (std::unordered_set<repair_hash> hashes) {
+            rm->set_repair_state_for_local_node(repair_state::get_full_row_hashes_started);
+            return rm->get_full_row_hashes_handler().then([rm] (repair_hash_set hashes) {
+                rm->set_repair_state_for_local_node(repair_state::get_full_row_hashes_started);
                 _metrics.tx_hashes_nr += hashes.size();
                 return hashes;
             });
-        }).then([sink] (std::unordered_set<repair_hash> hashes) mutable {
-            return do_with(std::move(hashes), [sink] (std::unordered_set<repair_hash>& hashes) mutable {
+        }).then([sink] (repair_hash_set hashes) mutable {
+            return do_with(std::move(hashes), [sink] (repair_hash_set& hashes) mutable {
                 return do_for_each(hashes, [sink] (const repair_hash& hash) mutable {
                     return sink(repair_hash_with_cmd{repair_stream_cmd::hash_data, hash});
                 }).then([sink] () mutable {
@@ -1900,7 +2152,7 @@ static future<> repair_get_row_diff_with_rpc_stream_handler(
         uint32_t repair_meta_id,
         rpc::sink<repair_row_on_wire_with_cmd> sink,
         rpc::source<repair_hash_with_cmd> source) {
-    return do_with(false, std::unordered_set<repair_hash>(), [from, src_cpu_id, repair_meta_id, sink, source] (bool& error, std::unordered_set<repair_hash>& current_set_diff) mutable {
+    return do_with(false, repair_hash_set(), [from, src_cpu_id, repair_meta_id, sink, source] (bool& error, repair_hash_set& current_set_diff) mutable {
         return repeat([from, src_cpu_id, repair_meta_id, sink, source, &error, &current_set_diff] () mutable {
             return source().then([from, src_cpu_id, repair_meta_id, sink, source, &error, &current_set_diff] (std::optional<std::tuple<repair_hash_with_cmd>> hash_cmd_opt) mutable {
                 if (hash_cmd_opt) {
@@ -1916,22 +2168,17 @@ static future<> repair_get_row_diff_with_rpc_stream_handler(
                             current_set_diff,
                             std::move(hash_cmd_opt)).handle_exception([sink, &error] (std::exception_ptr ep) mutable {
                         error = true;
-                        return sink(repair_row_on_wire_with_cmd{repair_stream_cmd::error, repair_row_on_wire()}).then([sink] ()  mutable {
-                            return sink.close();
-                        }).then([sink] {
+                        return sink(repair_row_on_wire_with_cmd{repair_stream_cmd::error, repair_row_on_wire()}).then([] {
                             return make_ready_future<stop_iteration>(stop_iteration::no);
                         });
                     });
                 } else {
-                    if (error) {
-                        return make_ready_future<stop_iteration>(stop_iteration::yes);
-                    }
-                    return sink.close().then([sink] {
-                        return make_ready_future<stop_iteration>(stop_iteration::yes);
-                    });
+                    return make_ready_future<stop_iteration>(stop_iteration::yes);
                 }
             });
         });
+    }).finally([sink] () mutable {
+        return sink.close().finally([sink] { });
     });
 }
 
@@ -1957,22 +2204,17 @@ static future<> repair_put_row_diff_with_rpc_stream_handler(
                             current_rows,
                             std::move(row_opt)).handle_exception([sink, &error] (std::exception_ptr ep) mutable {
                         error = true;
-                        return sink(repair_stream_cmd::error).then([sink] ()  mutable {
-                            return sink.close();
-                        }).then([sink] {
+                        return sink(repair_stream_cmd::error).then([] {
                             return make_ready_future<stop_iteration>(stop_iteration::no);
                         });
                     });
                 } else {
-                    if (error) {
-                        return make_ready_future<stop_iteration>(stop_iteration::yes);
-                    }
-                    return sink.close().then([sink] {
-                        return make_ready_future<stop_iteration>(stop_iteration::yes);
-                    });
+                    return make_ready_future<stop_iteration>(stop_iteration::yes);
                 }
             });
         });
+    }).finally([sink] () mutable {
+        return sink.close().finally([sink] { });
     });
 }
 
@@ -1997,29 +2239,26 @@ static future<> repair_get_full_row_hashes_with_rpc_stream_handler(
                             error,
                             std::move(status_opt)).handle_exception([sink, &error] (std::exception_ptr ep) mutable {
                         error = true;
-                        return sink(repair_hash_with_cmd{repair_stream_cmd::error, repair_hash()}).then([sink] ()  mutable {
-                            return sink.close();
-                        }).then([sink] {
+                        return sink(repair_hash_with_cmd{repair_stream_cmd::error, repair_hash()}).then([] () {
                             return make_ready_future<stop_iteration>(stop_iteration::no);
                         });
                     });
                 } else {
-                    if (error) {
-                        return make_ready_future<stop_iteration>(stop_iteration::yes);
-                    }
-                    return sink.close().then([sink] {
-                        return make_ready_future<stop_iteration>(stop_iteration::yes);
-                    });
+                    return make_ready_future<stop_iteration>(stop_iteration::yes);
                 }
             });
         });
+    }).finally([sink] () mutable {
+        return sink.close().finally([sink] { });
     });
 }
 
-future<> repair_init_messaging_service_handler(repair_service& rs, distributed<db::system_distributed_keyspace>& sys_dist_ks, distributed<db::view::view_update_generator>& view_update_generator) {
+future<> row_level_repair_init_messaging_service_handler(repair_service& rs, distributed<db::system_distributed_keyspace>& sys_dist_ks,
+        distributed<db::view::view_update_generator>& view_update_generator, sharded<netw::messaging_service>& ms) {
     _sys_dist_ks = &sys_dist_ks;
     _view_update_generator = &view_update_generator;
-    return netw::get_messaging_service().invoke_on_all([] (auto& ms) {
+    _messaging = &ms;
+    return ms.invoke_on_all([] (auto& ms) {
         ms.register_repair_get_row_diff_with_rpc_stream([&ms] (const rpc::client_info& cinfo, uint64_t repair_meta_id, rpc::source<repair_hash_with_cmd> source) {
             auto src_cpu_id = cinfo.retrieve_auxiliary<uint32_t>("src_cpu_id");
             auto from = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
@@ -2027,7 +2266,7 @@ future<> repair_init_messaging_service_handler(repair_service& rs, distributed<d
             // Start a new fiber.
             (void)repair_get_row_diff_with_rpc_stream_handler(from, src_cpu_id, repair_meta_id, sink, source).handle_exception(
                     [from, repair_meta_id, sink, source] (std::exception_ptr ep) {
-                rlogger.info("Failed to process get_row_diff_with_rpc_stream_handler from={}, repair_meta_id={}: {}", from, repair_meta_id, ep);
+                rlogger.warn("Failed to process get_row_diff_with_rpc_stream_handler from={}, repair_meta_id={}: {}", from, repair_meta_id, ep);
             });
             return make_ready_future<rpc::sink<repair_row_on_wire_with_cmd>>(sink);
         });
@@ -2038,7 +2277,7 @@ future<> repair_init_messaging_service_handler(repair_service& rs, distributed<d
             // Start a new fiber.
             (void)repair_put_row_diff_with_rpc_stream_handler(from, src_cpu_id, repair_meta_id, sink, source).handle_exception(
                     [from, repair_meta_id, sink, source] (std::exception_ptr ep) {
-                rlogger.info("Failed to process put_row_diff_with_rpc_stream_handler from={}, repair_meta_id={}: {}", from, repair_meta_id, ep);
+                rlogger.warn("Failed to process put_row_diff_with_rpc_stream_handler from={}, repair_meta_id={}: {}", from, repair_meta_id, ep);
             });
             return make_ready_future<rpc::sink<repair_stream_cmd>>(sink);
         });
@@ -2049,7 +2288,7 @@ future<> repair_init_messaging_service_handler(repair_service& rs, distributed<d
             // Start a new fiber.
             (void)repair_get_full_row_hashes_with_rpc_stream_handler(from, src_cpu_id, repair_meta_id, sink, source).handle_exception(
                     [from, repair_meta_id, sink, source] (std::exception_ptr ep) {
-                rlogger.info("Failed to process get_full_row_hashes_with_rpc_stream_handler from={}, repair_meta_id={}: {}", from, repair_meta_id, ep);
+                rlogger.warn("Failed to process get_full_row_hashes_with_rpc_stream_handler from={}, repair_meta_id={}: {}", from, repair_meta_id, ep);
             });
             return make_ready_future<rpc::sink<repair_hash_with_cmd>>(sink);
         });
@@ -2058,7 +2297,9 @@ future<> repair_init_messaging_service_handler(repair_service& rs, distributed<d
             auto from = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
             return smp::submit_to(src_cpu_id % smp::count, [from, repair_meta_id] {
                 auto rm = repair_meta::get_repair_meta(from, repair_meta_id);
-                return rm->get_full_row_hashes_handler().then([] (std::unordered_set<repair_hash> hashes) {
+                rm->set_repair_state_for_local_node(repair_state::get_full_row_hashes_started);
+                return rm->get_full_row_hashes_handler().then([rm] (repair_hash_set hashes) {
+                    rm->set_repair_state_for_local_node(repair_state::get_full_row_hashes_finished);
                     _metrics.tx_hashes_nr += hashes.size();
                     return hashes;
                 });
@@ -2072,7 +2313,11 @@ future<> repair_init_messaging_service_handler(repair_service& rs, distributed<d
                     common_sync_boundary = std::move(common_sync_boundary)] () mutable {
                 auto rm = repair_meta::get_repair_meta(from, repair_meta_id);
                 _metrics.tx_hashes_nr++;
-                return rm->get_combined_row_hash_handler(std::move(common_sync_boundary));
+                rm->set_repair_state_for_local_node(repair_state::get_combined_row_hash_started);
+                return rm->get_combined_row_hash_handler(std::move(common_sync_boundary)).then([rm] (get_combined_row_hash_response resp) {
+                    rm->set_repair_state_for_local_node(repair_state::get_combined_row_hash_finished);
+                    return resp;
+                });
             });
         });
         ms.register_repair_get_sync_boundary([] (const rpc::client_info& cinfo, uint32_t repair_meta_id,
@@ -2082,21 +2327,32 @@ future<> repair_init_messaging_service_handler(repair_service& rs, distributed<d
             return smp::submit_to(src_cpu_id % smp::count, [from, repair_meta_id,
                     skipped_sync_boundary = std::move(skipped_sync_boundary)] () mutable {
                 auto rm = repair_meta::get_repair_meta(from, repair_meta_id);
-                return rm->get_sync_boundary_handler(std::move(skipped_sync_boundary));
+                rm->set_repair_state_for_local_node(repair_state::get_sync_boundary_started);
+                return rm->get_sync_boundary_handler(std::move(skipped_sync_boundary)).then([rm] (get_sync_boundary_response resp) {
+                    rm->set_repair_state_for_local_node(repair_state::get_sync_boundary_finished);
+                    return resp;
+                });
             });
         });
         ms.register_repair_get_row_diff([] (const rpc::client_info& cinfo, uint32_t repair_meta_id,
-                std::unordered_set<repair_hash> set_diff, bool needs_all_rows) {
+                repair_hash_set set_diff, bool needs_all_rows) {
             auto src_cpu_id = cinfo.retrieve_auxiliary<uint32_t>("src_cpu_id");
             auto from = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
             _metrics.rx_hashes_nr += set_diff.size();
-            auto fp = make_foreign(std::make_unique<std::unordered_set<repair_hash>>(std::move(set_diff)));
+            auto fp = make_foreign(std::make_unique<repair_hash_set>(std::move(set_diff)));
             return smp::submit_to(src_cpu_id % smp::count, [from, repair_meta_id, fp = std::move(fp), needs_all_rows] () mutable {
                 auto rm = repair_meta::get_repair_meta(from, repair_meta_id);
+                rm->set_repair_state_for_local_node(repair_state::get_row_diff_started);
                 if (fp.get_owner_shard() == this_shard_id()) {
-                    return rm->get_row_diff_handler(std::move(*fp), repair_meta::needs_all_rows_t(needs_all_rows));
+                    return rm->get_row_diff_handler(std::move(*fp), repair_meta::needs_all_rows_t(needs_all_rows)).then([rm] (repair_rows_on_wire rows) {
+                        rm->set_repair_state_for_local_node(repair_state::get_row_diff_finished);
+                        return rows;
+                    });
                 } else {
-                    return rm->get_row_diff_handler(*fp, repair_meta::needs_all_rows_t(needs_all_rows));
+                    return rm->get_row_diff_handler(*fp, repair_meta::needs_all_rows_t(needs_all_rows)).then([rm] (repair_rows_on_wire rows) {
+                        rm->set_repair_state_for_local_node(repair_state::get_row_diff_finished);
+                        return rows;
+                    });
                 }
             });
         });
@@ -2107,10 +2363,15 @@ future<> repair_init_messaging_service_handler(repair_service& rs, distributed<d
             auto fp = make_foreign(std::make_unique<repair_rows_on_wire>(std::move(row_diff)));
             return smp::submit_to(src_cpu_id % smp::count, [from, repair_meta_id, fp = std::move(fp)] () mutable {
                 auto rm = repair_meta::get_repair_meta(from, repair_meta_id);
+                rm->set_repair_state_for_local_node(repair_state::put_row_diff_started);
                 if (fp.get_owner_shard() == this_shard_id()) {
-                    return rm->put_row_diff_handler(std::move(*fp), from);
+                    return rm->put_row_diff_handler(std::move(*fp), from).then([rm] {
+                        rm->set_repair_state_for_local_node(repair_state::put_row_diff_finished);
+                    });
                 } else {
-                    return rm->put_row_diff_handler(*fp, from);
+                    return rm->put_row_diff_handler(*fp, from).then([rm] {
+                        rm->set_repair_state_for_local_node(repair_state::put_row_diff_finished);
+                    });
                 }
             });
         });
@@ -2158,15 +2419,54 @@ future<> repair_init_messaging_service_handler(repair_service& rs, distributed<d
     });
 }
 
+future<> row_level_repair_uninit_messaging_service_handler() {
+    return _messaging->invoke_on_all([] (auto& ms) {
+        return when_all_succeed(
+            ms.unregister_repair_get_row_diff_with_rpc_stream(),
+            ms.unregister_repair_put_row_diff_with_rpc_stream(),
+            ms.unregister_repair_get_full_row_hashes_with_rpc_stream(),
+            ms.unregister_repair_get_full_row_hashes(),
+            ms.unregister_repair_get_combined_row_hash(),
+            ms.unregister_repair_get_sync_boundary(),
+            ms.unregister_repair_get_row_diff(),
+            ms.unregister_repair_put_row_diff(),
+            ms.unregister_repair_row_level_start(),
+            ms.unregister_repair_row_level_stop(),
+            ms.unregister_repair_get_estimated_partitions(),
+            ms.unregister_repair_set_estimated_partitions(),
+            ms.unregister_repair_get_diff_algorithms()).discard_result();
+    });
+}
+
+class repair_meta_tracker {
+    boost::intrusive::list<repair_meta,
+        boost::intrusive::member_hook<repair_meta, repair_meta::tracker_link_type, &repair_meta::_tracker_link>,
+        boost::intrusive::constant_time_size<false>> _repair_metas;
+public:
+    void add(repair_meta& rm) {
+        _repair_metas.push_back(rm);
+    }
+};
+
+namespace debug {
+    static thread_local repair_meta_tracker repair_meta_for_masters;
+    static thread_local repair_meta_tracker repair_meta_for_followers;
+}
+
+static void add_to_repair_meta_for_masters(repair_meta& rm) {
+    debug::repair_meta_for_masters.add(rm);
+}
+static void add_to_repair_meta_for_followers(repair_meta& rm) {
+    debug::repair_meta_for_followers.add(rm);
+}
+
 class row_level_repair {
     repair_info& _ri;
     sstring _cf_name;
+    utils::UUID _table_id;
     dht::token_range _range;
     std::vector<gms::inet_address> _all_live_peer_nodes;
     column_family& _cf;
-
-    // All particular peer nodes not including the node itself.
-    std::vector<gms::inet_address> _all_nodes;
 
     // Repair master and followers will propose a sync boundary. Each of them
     // read N bytes of rows from disk, the row with largest
@@ -2210,14 +2510,15 @@ class row_level_repair {
 public:
     row_level_repair(repair_info& ri,
             sstring cf_name,
+            utils::UUID table_id,
             dht::token_range range,
             std::vector<gms::inet_address> all_live_peer_nodes)
         : _ri(ri)
         , _cf_name(std::move(cf_name))
+        , _table_id(std::move(table_id))
         , _range(std::move(range))
         , _all_live_peer_nodes(std::move(all_live_peer_nodes))
-        , _cf(_ri.db.local().find_column_family(_ri.keyspace, _cf_name))
-        , _all_nodes(_all_live_peer_nodes)
+        , _cf(_ri.db.local().find_column_family(_table_id))
         , _seed(get_random_seed()) {
     }
 
@@ -2243,11 +2544,14 @@ private:
         rlogger.debug("ROUND {}, _last_sync_boundary={}, _current_sync_boundary={}, _skipped_sync_boundary={}",
                 master.stats().round_nr, master.last_sync_boundary(), master.current_sync_boundary(), _skipped_sync_boundary);
         master.stats().round_nr++;
-        parallel_for_each(_all_nodes, [&, this] (const gms::inet_address& node) {
+        parallel_for_each(master.all_nodes(), [&, this] (repair_node_state& ns) {
+            const auto& node = ns.node;
             // By calling `get_sync_boundary`, the `_last_sync_boundary`
             // is moved to the `_current_sync_boundary` or
             // `_skipped_sync_boundary` if it is not std::nullopt.
+            ns.state = repair_state::get_sync_boundary_started;
             return master.get_sync_boundary(node, _skipped_sync_boundary).then([&, this] (get_sync_boundary_response res) {
+                ns.state = repair_state::get_sync_boundary_finished;
                 master.stats().row_from_disk_bytes[node] += res.new_rows_size;
                 master.stats().row_from_disk_nr[node] += res.new_rows_nr;
                 if (res.boundary && res.row_buf_size > 0) {
@@ -2302,8 +2606,8 @@ private:
         // Rows within the (_last_sync_boundary, _current_sync_boundary] are
         // moved from the `_row_buf` to `_working_row_buf`.
         std::vector<repair_hash> combined_hashes;
-        combined_hashes.resize(_all_nodes.size());
-        parallel_for_each(boost::irange(size_t(0), _all_nodes.size()), [&, this] (size_t idx) {
+        combined_hashes.resize(master.all_nodes().size());
+        parallel_for_each(boost::irange(size_t(0), master.all_nodes().size()), [&, this] (size_t idx) {
             // Request combined hashes from all nodes between (_last_sync_boundary, _current_sync_boundary]
             // Each node will
             // - Set `_current_sync_boundary` to `_common_sync_boundary`
@@ -2315,8 +2619,10 @@ private:
             // peers are identical, we think rows in the `_working_row_buff`
             // are identical, there is no need to transfer each and every
             // row hashes to the repair master.
-            return master.get_combined_row_hash(_common_sync_boundary, _all_nodes[idx]).then([&, this, idx] (get_combined_row_hash_response resp) {
-                rlogger.debug("Calling master.get_combined_row_hash for node {}, got combined_hash={}", _all_nodes[idx], resp);
+            master.all_nodes()[idx].state = repair_state::get_combined_row_hash_started;
+            return master.get_combined_row_hash(_common_sync_boundary, master.all_nodes()[idx].node).then([&, this, idx] (get_combined_row_hash_response resp) {
+                master.all_nodes()[idx].state = repair_state::get_combined_row_hash_finished;
+                rlogger.debug("Calling master.get_combined_row_hash for node {}, got combined_hash={}", master.all_nodes()[idx].node, resp);
                 combined_hashes[idx]= std::move(resp);
             });
         }).get();
@@ -2337,6 +2643,7 @@ private:
         // because syncing with _all_live_peer_nodes in serial avoids
         // getting the same rows from more than one peers.
         for (unsigned node_idx = 0; node_idx < _all_live_peer_nodes.size(); node_idx++) {
+            auto& ns = master.all_nodes()[node_idx + 1];
             auto& node = _all_live_peer_nodes[node_idx];
             // Here is an optimization to avoid transferring full rows hashes,
             // if remote and local node, has the same combined_hashes.
@@ -2361,10 +2668,14 @@ private:
                 master.peer_row_hash_sets(node_idx).clear();
                 if (master.use_rpc_stream()) {
                     rlogger.debug("FastPath: get_row_diff with needs_all_rows_t::yes rpc stream");
+                    ns.state = repair_state::get_row_diff_with_rpc_stream_started;
                     master.get_row_diff_with_rpc_stream({}, repair_meta::needs_all_rows_t::yes, repair_meta::update_peer_row_hash_sets::yes, node, node_idx);
+                    ns.state = repair_state::get_row_diff_with_rpc_stream_finished;
                 } else {
                     rlogger.debug("FastPath: get_row_diff with needs_all_rows_t::yes rpc verb");
+                    ns.state = repair_state::get_row_diff_and_update_peer_row_hash_sets_started;
                     master.get_row_diff_and_update_peer_row_hash_sets(node, node_idx);
+                    ns.state = repair_state::get_row_diff_and_update_peer_row_hash_sets_finished;
                 }
                 continue;
             }
@@ -2373,9 +2684,13 @@ private:
                 node, master.peer_row_hash_sets(node_idx).size());
             // Ask the peer to send the full list hashes in the working row buf.
             if (master.use_rpc_stream()) {
+                ns.state = repair_state::get_full_row_hashes_with_rpc_stream_started;
                 master.peer_row_hash_sets(node_idx) = master.get_full_row_hashes_with_rpc_stream(node, node_idx).get0();
+                ns.state = repair_state::get_full_row_hashes_with_rpc_stream_finished;
             } else {
+                ns.state = repair_state::get_full_row_hashes_started;
                 master.peer_row_hash_sets(node_idx) = master.get_full_row_hashes(node).get0();
+                ns.state = repair_state::get_full_row_hashes_finished;
             }
             rlogger.debug("After master.get_full_row_hashes for node {}, hash_sets={}",
                 node, master.peer_row_hash_sets(node_idx).size());
@@ -2387,7 +2702,7 @@ private:
             // sequentially because the rows from repair follower 1 to
             // repair master might reduce the amount of missing data
             // between repair master and repair follower 2.
-            std::unordered_set<repair_hash> set_diff = repair_meta::get_set_diff(master.peer_row_hash_sets(node_idx), master.working_row_hashes().get0());
+            repair_hash_set set_diff = repair_meta::get_set_diff(master.peer_row_hash_sets(node_idx), master.working_row_hashes().get0());
             // Request missing sets from peer node
             rlogger.debug("Before get_row_diff to node {}, local={}, peer={}, set_diff={}",
                     node, master.working_row_hashes().get0().size(), master.peer_row_hash_sets(node_idx).size(), set_diff.size());
@@ -2395,12 +2710,17 @@ private:
             // sending the row hashes on wire by setting needs_all_rows flag.
             auto needs_all_rows = repair_meta::needs_all_rows_t(set_diff.size() == master.peer_row_hash_sets(node_idx).size());
             if (master.use_rpc_stream()) {
+                ns.state = repair_state::get_row_diff_with_rpc_stream_started;
                 master.get_row_diff_with_rpc_stream(std::move(set_diff), needs_all_rows, repair_meta::update_peer_row_hash_sets::no, node, node_idx);
+                ns.state = repair_state::get_row_diff_with_rpc_stream_finished;
             } else {
+                ns.state = repair_state::get_row_diff_started;
                 master.get_row_diff(std::move(set_diff), needs_all_rows, node, node_idx);
+                ns.state = repair_state::get_row_diff_finished;
             }
             rlogger.debug("After get_row_diff node {}, hash_sets={}", master.myip(), master.working_row_hashes().get0().size());
         }
+        master.flush_rows_in_working_row_buf();
         return op_status::next_step;
     }
 
@@ -2410,20 +2730,27 @@ private:
         // So we can figure out which rows peer node are missing and send the missing rows to them
         check_in_shutdown();
         _ri.check_in_abort();
-        std::unordered_set<repair_hash> local_row_hash_sets = master.working_row_hashes().get0();
+        repair_hash_set local_row_hash_sets = master.working_row_hashes().get0();
         auto sz = _all_live_peer_nodes.size();
-        std::vector<std::unordered_set<repair_hash>> set_diffs(sz);
+        std::vector<repair_hash_set> set_diffs(sz);
         for (size_t idx : boost::irange(size_t(0), sz)) {
             set_diffs[idx] = repair_meta::get_set_diff(local_row_hash_sets, master.peer_row_hash_sets(idx));
         }
         parallel_for_each(boost::irange(size_t(0), sz), [&, this] (size_t idx) {
+            auto& ns = master.all_nodes()[idx + 1];
             auto needs_all_rows = repair_meta::needs_all_rows_t(master.peer_row_hash_sets(idx).empty());
             auto& set_diff = set_diffs[idx];
             rlogger.debug("Calling master.put_row_diff to node {}, set_diff={}, needs_all_rows={}", _all_live_peer_nodes[idx], set_diff.size(), needs_all_rows);
             if (master.use_rpc_stream()) {
-                return master.put_row_diff_with_rpc_stream(std::move(set_diff), needs_all_rows, _all_live_peer_nodes[idx], idx);
+                ns.state = repair_state::put_row_diff_with_rpc_stream_started;
+                return master.put_row_diff_with_rpc_stream(std::move(set_diff), needs_all_rows, _all_live_peer_nodes[idx], idx).then([&ns] {
+                    ns.state = repair_state::put_row_diff_with_rpc_stream_finished;
+                });
             } else {
-                return master.put_row_diff(std::move(set_diff), needs_all_rows, _all_live_peer_nodes[idx]);
+                ns.state = repair_state::put_row_diff_finished;
+                return master.put_row_diff(std::move(set_diff), needs_all_rows, _all_live_peer_nodes[idx]).then([&ns] {
+                    ns.state = repair_state::put_row_diff_finished;
+                });
             }
         }).get();
         master.stats().round_nr_slow_path++;
@@ -2435,7 +2762,7 @@ public:
             check_in_shutdown();
             _ri.check_in_abort();
             auto repair_meta_id = repair_meta::get_next_repair_meta_id().get0();
-            auto algorithm = get_common_diff_detect_algorithm(_all_live_peer_nodes);
+            auto algorithm = get_common_diff_detect_algorithm(_ri.messaging.local(), _all_live_peer_nodes);
             auto max_row_buf_size = get_max_row_buf_size(algorithm);
             auto master_node_shard_config = shard_config {
                     this_shard_id(),
@@ -2444,8 +2771,10 @@ public:
             };
             auto s = _cf.schema();
             auto schema_version = s->version();
+            bool table_dropped = false;
 
             repair_meta master(_ri.db,
+                    _ri.messaging,
                     _cf,
                     s,
                     _range,
@@ -2456,31 +2785,39 @@ public:
                     repair_meta_id,
                     _ri.reason,
                     std::move(master_node_shard_config),
-                    _all_live_peer_nodes.size());
-
-            // All nodes including the node itself.
-            _all_nodes.insert(_all_nodes.begin(), master.myip());
+                    _all_live_peer_nodes,
+                    _all_live_peer_nodes.size(),
+                    this);
 
             rlogger.debug(">>> Started Row Level Repair (Master): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, schema_version={}, range={}, seed={}, max_row_buf_size={}",
                     master.myip(), _all_live_peer_nodes, master.repair_meta_id(), _ri.keyspace, _cf_name, schema_version, _range, _seed, max_row_buf_size);
 
 
             std::vector<gms::inet_address> nodes_to_stop;
-            nodes_to_stop.reserve(_all_nodes.size());
+            nodes_to_stop.reserve(master.all_nodes().size());
             try {
-                parallel_for_each(_all_nodes, [&, this] (const gms::inet_address& node) {
+                parallel_for_each(master.all_nodes(), [&, this] (repair_node_state& ns) {
+                    const auto& node = ns.node;
+                    ns.state = repair_state::row_level_start_started;
                     return master.repair_row_level_start(node, _ri.keyspace, _cf_name, _range, schema_version, _ri.reason).then([&] () {
+                        ns.state = repair_state::row_level_start_finished;
                         nodes_to_stop.push_back(node);
-                        return master.repair_get_estimated_partitions(node).then([this, node] (uint64_t partitions) {
+                        ns.state = repair_state::get_estimated_partitions_started;
+                        return master.repair_get_estimated_partitions(node).then([this, node, &ns] (uint64_t partitions) {
+                            ns.state = repair_state::get_estimated_partitions_finished;
                             rlogger.trace("Get repair_get_estimated_partitions for node={}, estimated_partitions={}", node, partitions);
                             _estimated_partitions += partitions;
                         });
                     });
                 }).get();
 
-                parallel_for_each(_all_nodes, [&, this] (const gms::inet_address& node) {
+                parallel_for_each(master.all_nodes(), [&, this] (repair_node_state& ns) {
+                    const auto& node = ns.node;
                     rlogger.trace("Get repair_set_estimated_partitions for node={}, estimated_partitions={}", node, _estimated_partitions);
-                    return master.repair_set_estimated_partitions(node, _estimated_partitions);
+                    ns.state = repair_state::set_estimated_partitions_started;
+                    return master.repair_set_estimated_partitions(node, _estimated_partitions).then([&ns] {
+                        ns.state = repair_state::set_estimated_partitions_finished;
+                    });
                 }).get();
 
                 while (true) {
@@ -2496,20 +2833,32 @@ public:
                     }
                     send_missing_rows_to_follower_nodes(master);
                 }
+            } catch (no_such_column_family& e) {
+                table_dropped = true;
+                rlogger.warn("repair id {} on shard {}, keyspace={}, cf={}, range={}, got error in row level repair: {}",
+                        _ri.id, this_shard_id(), _ri.keyspace, _cf_name, _range, e);
+                _failed = true;
             } catch (std::exception& e) {
-                rlogger.info("Got error in row level repair: {}", e);
+                rlogger.warn("repair id {} on shard {}, keyspace={}, cf={}, range={}, got error in row level repair: {}",
+                        _ri.id, this_shard_id(), _ri.keyspace, _cf_name, _range, e);
                 // In case the repair process fail, we need to call repair_row_level_stop to clean up repair followers
                 _failed = true;
-                _ri.nr_failed_ranges++;
             }
 
             parallel_for_each(nodes_to_stop, [&] (const gms::inet_address& node) {
-                return master.repair_row_level_stop(node, _ri.keyspace, _cf_name, _range);
+                master.set_repair_state(repair_state::row_level_stop_finished, node);
+                return master.repair_row_level_stop(node, _ri.keyspace, _cf_name, _range).then([node, &master] {
+                    master.set_repair_state(repair_state::row_level_stop_finished, node);
+                });
             }).get();
 
             _ri.update_statistics(master.stats());
             if (_failed) {
-                throw std::runtime_error(format("Failed to repair for keyspace={}, cf={}, range={}", _ri.keyspace, _cf_name, _range));
+                if (table_dropped) {
+                    throw no_such_column_family(_ri.keyspace,  _cf_name);
+                } else {
+                    throw std::runtime_error(format("Failed to repair for keyspace={}, cf={}, range={}", _ri.keyspace, _cf_name, _range));
+                }
             }
             rlogger.debug("<<< Finished Row Level Repair (Master): local={}, peers={}, repair_meta_id={}, keyspace={}, cf={}, range={}, tx_hashes_nr={}, rx_hashes_nr={}, tx_row_nr={}, rx_row_nr={}, row_from_disk_bytes={}, row_from_disk_nr={}",
                     master.myip(), _all_live_peer_nodes, master.repair_meta_id(), _ri.keyspace, _cf_name, _range, master.stats().tx_hashes_nr, master.stats().rx_hashes_nr, master.stats().tx_row_nr, master.stats().rx_row_nr, master.stats().row_from_disk_bytes, master.stats().row_from_disk_nr);
@@ -2518,10 +2867,13 @@ public:
 };
 
 future<> repair_cf_range_row_level(repair_info& ri,
-        sstring cf_name, dht::token_range range,
+        sstring cf_name, utils::UUID table_id, dht::token_range range,
         const std::vector<gms::inet_address>& all_peer_nodes) {
-    return do_with(row_level_repair(ri, std::move(cf_name), std::move(range), all_peer_nodes), [] (row_level_repair& repair) {
-        return repair.run();
+    return seastar::futurize_invoke([&ri, cf_name = std::move(cf_name), table_id = std::move(table_id), range = std::move(range), &all_peer_nodes] () mutable {
+        auto repair = row_level_repair(ri, std::move(cf_name), std::move(table_id), std::move(range), all_peer_nodes);
+        return do_with(std::move(repair), [] (row_level_repair& repair) {
+            return repair.run();
+        });
     });
 }
 

@@ -14,11 +14,18 @@
 #include "storage_helper.hh"
 #include "db/config.hh"
 
+namespace cql3 {
+
+class query_processor;
+
+}
+
 namespace audit {
 
 class audit_cf_storage_helper : public storage_helper {
     static const sstring KEYSPACE_NAME;
     static const sstring TABLE_NAME;
+    cql3::query_processor& _qp;
     table_helper _table;
     service::query_state _dummy_query_state;
     static cql3::query_options make_data(const audit_info* audit_info,
@@ -32,7 +39,7 @@ class audit_cf_storage_helper : public storage_helper {
                                                const sstring& username,
                                                bool error);
 public:
-    audit_cf_storage_helper();
+    explicit audit_cf_storage_helper(cql3::query_processor& qp);
     virtual ~audit_cf_storage_helper() {}
     virtual future<> start(const db::config& cfg) override;
     virtual future<> stop() override;

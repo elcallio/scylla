@@ -25,18 +25,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <algorithm>
@@ -85,11 +74,7 @@ static future<result_message_ptr> void_result_message() {
     return make_ready_future<result_message_ptr>(nullptr);
 }
 
-void validate_cluster_support(service::storage_proxy& proxy) {
-    if (!proxy.features().cluster_supports_roles()) {
-        throw exceptions::invalid_request_exception(
-                "You cannot modify access-control information until the cluster has fully upgraded.");
-    }
+void validate_cluster_support(service::storage_proxy&) {
 }
 
 //
@@ -120,7 +105,7 @@ future<> create_role_statement::check_access(service::storage_proxy& proxy, cons
     state.ensure_not_anonymous();
 
     return async([this, &state] {
-        state.ensure_has_permission(auth::permission::CREATE, auth::root_role_resource()).get0();
+        state.ensure_has_permission({auth::permission::CREATE, auth::root_role_resource()}).get0();
 
         if (*_options.is_superuser) {
             if (!auth::has_superuser(*state.get_auth_service(), *state.user()).get0()) {
@@ -252,12 +237,12 @@ future<> alter_role_statement::check_access(service::storage_proxy& proxy, const
         }
 
         if (*user.name != _role) {
-            state.ensure_has_permission(auth::permission::ALTER, auth::make_role_resource(_role)).get0();
+            state.ensure_has_permission({auth::permission::ALTER, auth::make_role_resource(_role)}).get0();
         } else {
             const auto alterable_options = state.get_auth_service()->underlying_authenticator().alterable_options();
 
             const auto check = [&alterable_options](auth::authentication_option ao) {
-                if (alterable_options.count(ao) == 0) {
+                if (!alterable_options.contains(ao)) {
                     throw exceptions::unauthorized_exception(format("You aren't allowed to alter the {} option.", ao));
                 }
             };
@@ -327,7 +312,7 @@ future<> drop_role_statement::check_access(service::storage_proxy& proxy, const 
     state.ensure_not_anonymous();
 
     return async([this, &state] {
-        state.ensure_has_permission(auth::permission::DROP, auth::make_role_resource(_role)).get0();
+        state.ensure_has_permission({auth::permission::DROP, auth::make_role_resource(_role)}).get0();
 
         auto& as = *state.get_auth_service();
 
@@ -376,7 +361,7 @@ future<> list_roles_statement::check_access(service::storage_proxy& proxy, const
     state.ensure_not_anonymous();
 
     return async([this, &state] {
-        if (state.check_has_permission(auth::permission::DESCRIBE, auth::root_role_resource()).get0()) {
+        if (state.check_has_permission({auth::permission::DESCRIBE, auth::root_role_resource()}).get0()) {
             return;
         }
 
@@ -404,7 +389,7 @@ list_roles_statement::execute(service::storage_proxy&, service::query_state& sta
     static const sstring virtual_table_name("roles");
 
     static const auto make_column_spec = [](const sstring& name, const ::shared_ptr<const abstract_type>& ty) {
-        return ::make_shared<column_specification>(
+        return make_lw_shared<column_specification>(
                 auth::meta::AUTH_KS,
                 virtual_table_name,
                 ::make_shared<column_identifier>(name, true),
@@ -414,7 +399,7 @@ list_roles_statement::execute(service::storage_proxy&, service::query_state& sta
     static const thread_local auto custom_options_type = map_type_impl::get_instance(utf8_type, utf8_type, true);
 
     static const thread_local auto metadata = ::make_shared<cql3::metadata>(
-            std::vector<::shared_ptr<column_specification>>{
+            std::vector<lw_shared_ptr<column_specification>>{
                     make_column_spec("role", utf8_type),
                     make_column_spec("super", boolean_type),
                     make_column_spec("login", boolean_type),
@@ -442,7 +427,7 @@ list_roles_statement::execute(service::storage_proxy&, service::query_state& sta
                 return when_all_succeed(
                         rm.can_login(role),
                         rm.is_superuser(role),
-                        a.query_custom_options(role)).then([&results, &role](
+                        a.query_custom_options(role)).then_unpack([&results, &role](
                                bool login,
                                bool super,
                                auth::custom_options os) {
@@ -475,9 +460,9 @@ list_roles_statement::execute(service::storage_proxy&, service::query_state& sta
         if (!_grantee) {
             // A user with DESCRIBE on the root role resource lists all roles in the system. A user without it lists
             // only the roles granted to them.
-            return cs.check_has_permission(
+            return cs.check_has_permission({
                     auth::permission::DESCRIBE,
-                    auth::root_role_resource()).then([&cs, &rm, &a, query_mode](bool has_describe) {
+                    auth::root_role_resource()}).then([&cs, &rm, &a, query_mode](bool has_describe) {
                 if (has_describe) {
                     return rm.query_all().then([&rm, &a](auto&& roles) {
                         return make_results(rm, a, std::move(roles));
@@ -511,7 +496,7 @@ future<> grant_role_statement::check_access(service::storage_proxy& proxy, const
     state.ensure_not_anonymous();
 
     return do_with(auth::make_role_resource(_role), [this, &state](const auto& r) {
-        return state.ensure_has_permission(auth::permission::AUTHORIZE, r);
+        return state.ensure_has_permission({auth::permission::AUTHORIZE, r});
     });
 }
 
@@ -539,7 +524,7 @@ future<> revoke_role_statement::check_access(service::storage_proxy& proxy, cons
     state.ensure_not_anonymous();
 
     return do_with(auth::make_role_resource(_role), [this, &state](const auto& r) {
-        return state.ensure_has_permission(auth::permission::AUTHORIZE, r);
+        return state.ensure_has_permission({auth::permission::AUTHORIZE, r});
     });
 }
 

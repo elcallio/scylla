@@ -9,7 +9,6 @@ source_path=$script_path/../..
 # By default, we take the latest build/*/scylla as the executable:
 SCYLLA=${SCYLLA-$(ls -t "$source_path/build/"*"/scylla" | head -1)}
 SCYLLA=$(readlink -f "$SCYLLA")
-CPUSET=${CPUSET-0}
 
 # Below, we need to use python3 and the Cassandra drive to set up the
 # authentication credentials expected by some of the tests that check
@@ -29,8 +28,8 @@ fi
 SCYLLA_IP=127.1.$(($$ >> 8 & 255)).$(($$ & 255))
 echo "Running Scylla on $SCYLLA_IP"
 
-tmp_dir=/tmp/alternator-test-$$
-mkdir $tmp_dir
+tmp_dir="$(readlink -e ${TMPDIR-/tmp})"/alternator-test-$$
+mkdir "$tmp_dir"
 
 # We run the cleanup() function on exit for any reason - successful finish
 # of the script, an error (since we have "set -e"), or a signal.
@@ -70,22 +69,41 @@ do
         alternator_url="https://$SCYLLA_IP:8043"
     fi
 done
-"$SCYLLA" --options-file "$source_path/conf/scylla.yaml" \
+
+# To make things easier for users of "killall", "top", and similar, we want
+# the Scylla executable which we run during the test to have a different name
+# from manul runs of Scylla. Unfortunately, using "exec -a" to change just
+# argv[0] isn't good enough - because killall inspects the actual executable
+# filename in /proc/<pid>/stat. So we need to name the executable differently.
+# Luckily, using a symbolic link is good enough.
+SCYLLA_LINK="$tmp_dir"/test_scylla
+ln -s "$SCYLLA" "$SCYLLA_LINK"
+
+"$SCYLLA_LINK" --options-file "$source_path/conf/scylla.yaml" \
         --alternator-address $SCYLLA_IP \
         $alternator_port_option \
         --alternator-enforce-authorization=1 \
+        --alternator-write-isolation=always_use_lwt \
+        --alternator-streams-time-window-s=0 \
+        --alternator-timeout-in-ms 30000 \
         --developer-mode=1 \
+        --experimental-features=alternator-streams \
         --ring-delay-ms 0 --collectd 0 \
-        --cpuset "$CPUSET" -m 1G \
+        --smp 2 -m 1G \
+        --overprovisioned --unsafe-bypass-fsync 1 \
         --api-address $SCYLLA_IP \
         --rpc-address $SCYLLA_IP \
         --listen-address $SCYLLA_IP \
         --prometheus-address $SCYLLA_IP \
         --seed-provider-parameters seeds=$SCYLLA_IP \
         --workdir "$tmp_dir" \
-        --server-encryption-options keyfile="$tmp_dir/scylla.key" \
-        --server-encryption-options certificate="$tmp_dir/scylla.crt" \
+        --alternator-encryption-options keyfile="$tmp_dir/scylla.key" \
+        --alternator-encryption-options certificate="$tmp_dir/scylla.crt" \
         --auto-snapshot 0 \
+        --skip-wait-for-gossip-to-settle 0 \
+        --logger-log-level compaction=warn \
+        --logger-log-level migration_manager=warn \
+        --num-tokens 16 \
         >"$tmp_dir/log" 2>&1 &
 SCYLLA_PROCESS=$!
 
@@ -95,19 +113,30 @@ SCYLLA_PROCESS=$!
 setup_authentication() {
     python3 -c 'from cassandra.cluster import Cluster; Cluster(["'$SCYLLA_IP'"]).connect().execute("INSERT INTO system_auth.roles (role, salted_hash) VALUES ('\''alternator'\'', '\''secret_pass'\'')")'
 }
+# Test that Alternator is serving. Alternator starts after CQL, so we use
+# check_alternator() to verify that both are up.
+check_alternator() {
+    python3 -c 'import requests; requests.get("'$alternator_url'/")'
+}
 echo "Scylla is: $SCYLLA."
 echo -n "Booting Scylla..."
 ok=
 SECONDS=0
-while ((SECONDS < 100))
+while ((SECONDS < 200))
 do
-    sleep 2
+    sleep 1
     echo -n .
     if ! kill -0 $SCYLLA_PROCESS 2>/dev/null
     then
         summary="Error: Scylla failed to boot after $SECONDS seconds."
         break
     fi
+    case "`check_alternator 2>&1`" in
+    *"Connection refused"*)
+        # This may indicate that Scylla is still booting, or that it failed
+        # to boot and exited. Try again (and check again if Scylla exited).
+        continue;;
+    esac
     err=`setup_authentication 2>&1` && ok=yes && break
     case "$err" in
     *NoHostAvailable:*)
@@ -140,7 +169,7 @@ fi
 
 cd "$script_path"
 set +e
-pytest --url $alternator_url "$@"
+pytest --url $alternator_url -o junit_family=xunit2 "$@"
 code=$?
 case $code in
 0) summary="Alternator tests pass";;

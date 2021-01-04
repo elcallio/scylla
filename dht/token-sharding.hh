@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -42,6 +31,7 @@ protected:
     std::vector<uint64_t> _shard_start;
 public:
     sharder(unsigned shard_count = smp::count, unsigned sharding_ignore_msb_bits = 0);
+    virtual ~sharder() = default;
     /**
      * Calculates the shard that handles a particular token.
      */
@@ -86,5 +76,21 @@ inline std::ostream& operator<<(std::ostream& os, const sharder& sharder) {
        << ", ignore_msb_bits="<< sharder.sharding_ignore_msb() << "]";
     return os;
 }
+
+/*
+ * Finds the first token in token range (`start`, `end`] that belongs to shard shard_idx.
+ *
+ * If there is no token that belongs to shard shard_idx in this range,
+ * `end` is returned.
+ *
+ * The first token means the one that appears first on the ring when going
+ * from `start` to `end`.
+ * 'first token' is not always the smallest.
+ * For example, if in vnode (100, 10] only tokens 110 and 1 belong to
+ * shard shard_idx then token 110 is the first because it appears first
+ * when going from 100 to 10 on the ring.
+ */
+dht::token find_first_token_for_shard(
+        const dht::sharder& sharder, dht::token start, dht::token end, size_t shard_idx);
 
 } //namespace dht

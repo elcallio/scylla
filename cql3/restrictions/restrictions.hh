@@ -47,9 +47,6 @@ namespace restrictions {
  * Sets of restrictions
  */
 class restrictions {
-protected:
-    using op_enum = super_enum<restriction::op, restriction::op::EQ, restriction::op::SLICE, restriction::op::IN, restriction::op::CONTAINS, restriction::op::LIKE>;
-    enum_set<op_enum> _ops;
 public:
     virtual ~restrictions() {}
 
@@ -64,21 +61,13 @@ public:
     }
 
     /**
-     * Returns <code>true</code> if one of the restrictions use the specified function.
-     *
-     * @param ks_name the keyspace name
-     * @param function_name the function name
-     * @return <code>true</code> if one of the restrictions use the specified function, <code>false</code> otherwise.
-     */
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const = 0;
-
-    /**
      * Check if the restriction is on indexed columns.
      *
      * @param index_manager the index manager
      * @return <code>true</code> if the restriction is on indexed columns, <code>false</code>
      */
-    virtual bool has_supporting_index(const secondary_index::secondary_index_manager& index_manager, allow_local_index allow_local) const = 0;
+    virtual bool has_supporting_index(const secondary_index::secondary_index_manager& index_manager,
+                                      expr::allow_local_index allow_local) const = 0;
 
 #if 0
     /**

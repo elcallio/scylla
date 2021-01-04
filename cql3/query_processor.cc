@@ -50,8 +50,6 @@ logging::logger log("query_processor");
 logging::logger prep_cache_log("prepared_statements_cache");
 logging::logger authorized_prepared_statements_cache_log("authorized_prepared_statements_cache");
 
-distributed<query_processor> _the_query_processor;
-
 const sstring query_processor::CQL_VERSION = "3.3.1";
 
 const std::chrono::minutes prepared_statements_cache::entry_expiry = std::chrono::minutes(60);
@@ -554,27 +552,6 @@ query_processor::prepare(sstring query_string, const service::client_state& clie
         return prepare_one<result_message::prepared::cql>(
                 std::move(query_string),
                 client_state,
-                compute_id,
-                prepared_cache_key_type::cql_id);
-    }
-}
-
-::shared_ptr<cql_transport::messages::result_message::prepared>
-query_processor::get_stored_prepared_statement(
-        const std::string_view& query_string,
-        const sstring& keyspace,
-        bool for_thrift) {
-    using namespace cql_transport::messages;
-    if (for_thrift) {
-        return get_stored_prepared_statement_one<result_message::prepared::thrift>(
-                query_string,
-                keyspace,
-                compute_thrift_id,
-                prepared_cache_key_type::thrift_id);
-    } else {
-        return get_stored_prepared_statement_one<result_message::prepared::cql>(
-                query_string,
-                keyspace,
                 compute_id,
                 prepared_cache_key_type::cql_id);
     }

@@ -35,10 +35,12 @@
 #include "schema_builder.hh"
 #include "compaction_strategy.hh"
 #include "utils/UUID.hh"
-#include "cdc/cdc_options.hh"
 
 namespace db {
 class extensions;
+}
+namespace cdc {
+class options;
 }
 
 namespace cql3 {
@@ -51,6 +53,7 @@ public:
     static const sstring KW_READREPAIRCHANCE;
     static const sstring KW_DCLOCALREADREPAIRCHANCE;
     static const sstring KW_GCGRACESECONDS;
+    static const sstring KW_PAXOSGRACESECONDS;
     static const sstring KW_MINCOMPACTIONTHRESHOLD;
     static const sstring KW_MAXCOMPACTIONTHRESHOLD;
     static const sstring KW_CACHING;
@@ -86,6 +89,7 @@ public:
     std::map<sstring, sstring> get_compaction_options() const;
     std::optional<std::map<sstring, sstring>> get_compression_options() const;
     const cdc::options* get_cdc_options(const schema::extensions_map&) const;
+    std::optional<caching_options> get_caching_options() const;
 #if 0
     public CachingOptions getCachingOptions() throws SyntaxException, ConfigurationException
     {
@@ -105,6 +109,7 @@ public:
 #endif
     int32_t get_default_time_to_live() const;
     int32_t get_gc_grace_seconds() const;
+    int32_t get_paxos_grace_seconds() const;
     std::optional<utils::UUID> get_id() const;
 
     void apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions);

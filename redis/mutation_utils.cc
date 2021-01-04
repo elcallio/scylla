@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "redis/mutation_utils.hh"
@@ -50,6 +39,23 @@ atomic_cell make_cell(const schema_ptr schema,
     }   
     return atomic_cell::make_live(type, api::new_timestamp(), value, atomic_cell::collection_member::no);
 }  
+
+
+future<> write_hashes(service::storage_proxy& proxy, redis::redis_options& options, bytes&& key, bytes&& field, bytes&& data, long ttl, service_permit permit) {
+    db::timeout_clock::time_point timeout = db::timeout_clock::now() + options.get_write_timeout();
+
+    auto schema = get_schema(proxy, options.get_keyspace_name(), redis::HASHes);
+    const column_definition& column = *schema->get_column_definition(redis::DATA_COLUMN_NAME);
+    auto pkey = partition_key::from_single_value(*schema, key);
+    auto ckey = clustering_key::from_single_value(*schema, field);
+    auto m = mutation(schema, std::move(pkey));
+    auto cell = make_cell(schema, *(column.type.get()), data, ttl);
+    m.set_clustered_cell(ckey, column, std::move(cell));
+
+    auto write_consistency_level = options.get_write_consistency_level();
+    return proxy.mutate(std::vector<mutation> {std::move(m)}, write_consistency_level, timeout, nullptr, permit);
+}
+
 
 mutation make_mutation(service::storage_proxy& proxy, const redis_options& options, bytes&& key, bytes&& data, long ttl) {
     auto schema = get_schema(proxy, options.get_keyspace_name(), redis::STRINGs);
@@ -88,6 +94,23 @@ future<> delete_objects(service::storage_proxy& proxy, redis::redis_options& opt
         });
     };  
     return parallel_for_each(tables.begin(), tables.end(), remove);
+}
+
+future<> delete_fields(service::storage_proxy& proxy, redis::redis_options& options, bytes&& key, std::vector<bytes>&& fields, service_permit permit) {
+    db::timeout_clock::time_point timeout = db::timeout_clock::now() + options.get_write_timeout();
+    auto write_consistency_level = options.get_write_consistency_level();
+    auto schema = get_schema(proxy, options.get_keyspace_name(), redis::HASHes);
+    auto pkey = partition_key::from_single_value(*schema, key);
+    auto ts = api::new_timestamp();
+    auto clk = gc_clock::now();
+    std::vector<mutation> mutations;
+    for (auto& field : fields) {
+        auto ckey = clustering_key::from_single_value(*schema, field);
+        auto m = mutation(schema, pkey);
+        m.partition().apply_delete(*schema, ckey, tombstone { ts, clk });
+        mutations.push_back(m);
+    }
+    return proxy.mutate(mutations, write_consistency_level, timeout, nullptr, permit);
 }
 
 }

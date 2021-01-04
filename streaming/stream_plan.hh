@@ -136,7 +136,8 @@ public:
      */
     future<stream_state> execute();
 
-    void abort();
+    void abort() noexcept;
+    void do_abort();
 };
 
 } // namespace streaming

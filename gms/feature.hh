@@ -117,6 +117,7 @@ extern const std::string_view ROLES;
 extern const std::string_view LA_SSTABLE;
 extern const std::string_view STREAM_WITH_RPC_STREAM;
 extern const std::string_view MC_SSTABLE;
+extern const std::string_view MD_SSTABLE;
 extern const std::string_view ROW_LEVEL_REPAIR;
 extern const std::string_view TRUNCATION_TABLE;
 extern const std::string_view CORRECT_STATIC_COMPACT_IN_MC;
@@ -129,7 +130,15 @@ extern const std::string_view NONFROZEN_UDTS;
 extern const std::string_view HINTED_HANDOFF_SEPARATE_CONNECTION;
 extern const std::string_view LWT;
 extern const std::string_view PER_TABLE_PARTITIONERS;
+extern const std::string_view PER_TABLE_CACHING;
+extern const std::string_view DIGEST_FOR_NULL_VALUES;
+extern const std::string_view CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX;
+extern const std::string_view ALTERNATOR_STREAMS;
+
+
+// enterprise
 extern const std::string_view IN_MEMORY_TABLES;
+extern const std::string_view WORKLOAD_PRIORITIZATION;
 
 }
 

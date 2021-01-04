@@ -54,11 +54,10 @@ class functions {
     using declared_t = cql3::functions::declared_t;
     static thread_local declared_t _declared;
 private:
-    static std::unordered_multimap<function_name, shared_ptr<function>> init();
+    static std::unordered_multimap<function_name, shared_ptr<function>> init() noexcept;
 public:
-    static shared_ptr<column_specification> make_arg_spec(const sstring& receiver_ks, const sstring& receiver_cf,
+    static lw_shared_ptr<column_specification> make_arg_spec(const sstring& receiver_ks, const sstring& receiver_cf,
             const function& fun, size_t i);
-    static int get_overload_count(const function_name& name);
 public:
     static shared_ptr<function> get(database& db,
                                     const sstring& keyspace,
@@ -66,7 +65,7 @@ public:
                                     const std::vector<shared_ptr<assignment_testable>>& provided_args,
                                     const sstring& receiver_ks,
                                     const sstring& receiver_cf,
-                                    ::shared_ptr<column_specification> receiver = nullptr);
+                                    const column_specification* receiver = nullptr);
     template <typename AssignmentTestablePtrRange>
     static shared_ptr<function> get(database& db,
                                     const sstring& keyspace,
@@ -74,14 +73,14 @@ public:
                                     AssignmentTestablePtrRange&& provided_args,
                                     const sstring& receiver_ks,
                                     const sstring& receiver_cf,
-                                    ::shared_ptr<column_specification> receiver = nullptr) {
+                                    const column_specification* receiver = nullptr) {
         const std::vector<shared_ptr<assignment_testable>> args(std::begin(provided_args), std::end(provided_args));
         return get(db, keyspace, name, args, receiver_ks, receiver_cf, receiver);
     }
     static boost::iterator_range<declared_t::iterator> find(const function_name& name);
     static declared_t::iterator find_iter(const function_name& name, const std::vector<data_type>& arg_types);
     static shared_ptr<function> find(const function_name& name, const std::vector<data_type>& arg_types);
-    static void clear_functions();
+    static void clear_functions() noexcept;
     static void add_function(shared_ptr<function>);
     static void replace_function(shared_ptr<function>);
     static void remove_function(const function_name& name, const std::vector<data_type>& arg_types);

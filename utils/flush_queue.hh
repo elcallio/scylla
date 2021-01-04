@@ -50,15 +50,33 @@ private:
     seastar::gate _gate;
     bool _chain_exceptions;
 
-    template<typename Func, typename... Args>
-    static auto call_helper(Func&& func, future<Args...> f) {
-        using futurator = futurize<std::result_of_t<Func(Args&&...)>>;
+    template<typename Func>
+    static auto call_helper(Func&& func, future<> f) {
+        return f.then([func = std::move(func)] {
+            return func();
+        });
+    }
+
+    template<typename Func, typename Arg>
+    static auto call_helper(Func&& func, future<Arg> f) {
+        using futurator = futurize<std::result_of_t<Func(Arg&&)>>;
         try {
-            return futurator::apply(std::forward<Func>(func), f.get());
+            return futurator::invoke(std::forward<Func>(func), f.get0());
         } catch (...) {
             return futurator::make_exception_future(std::current_exception());
         }
     }
+
+    template<typename Func, typename... Args>
+    static auto call_helper(Func&& func, future<std::tuple<Args...>> f) {
+        using futurator = futurize<std::result_of_t<Func(std::tuple<Args&&...>)>>;
+        try {
+            return futurator::invoke(std::forward<Func>(func), f.get());
+        } catch (...) {
+            return futurator::make_exception_future(std::current_exception());
+        }
+    }
+
     template<typename... Types>
     static future<Types...> handle_failed_future(future<Types...> f, promise_type& pr) {
         assert(f.failed());
@@ -93,7 +111,7 @@ public:
         // already is in the map. If either condition is true we can
         // uphold the guarantee to enforce ordered "post" execution
         // and signalling of all larger elements.
-        if (!_map.empty() && !_map.count(rp) && rp < _map.rbegin()->first) {
+        if (!_map.empty() && !_map.contains(rp) && rp < _map.rbegin()->first) {
             throw std::invalid_argument(format("Attempting to insert key out of order: {}", rp));
         }
 
@@ -165,7 +183,7 @@ public:
         return _map.size();
     }
     bool has_operation(T rp) const {
-        return _map.count(rp) != 0;
+        return _map.contains(rp);
     }
     T highest_key() const {
         return _map.rbegin()->first;

@@ -24,18 +24,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 #pragma once
 #include "service/storage_proxy.hh"
@@ -90,17 +79,29 @@ public:
         return _rows;
     }
 
-    lw_shared_ptr<query::read_command> read_command() const;
+    lw_shared_ptr<query::read_command> read_command(service::storage_proxy& proxy) const;
 
     void add_row_update(const modification_statement& stmt_arg, std::vector<query::clustering_range> ranges_arg,
         modification_statement::json_cache_opt json_cache_arg, const query_options& options_arg);
 
-    virtual std::optional<mutation> apply(query::result& qr,
+    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
             const query::partition_slice& slice, api::timestamp_type ts) override;
+
+    /// Build a result set with prefetched rows, but return only
+    /// the columns required by CAS.
+    ///
+    /// Each cas_row_update provides a row in the result set.
+    /// Rows are ordered the same way as the individual statements appear
+    /// in case of batch statement.
+    seastar::shared_ptr<cql_transport::messages::result_message>
+    build_cas_result_set(seastar::shared_ptr<cql3::metadata> metadata,
+            const column_set& mask, bool is_applied) const;
 
 private:
     bool applies_to() const;
     std::optional<mutation> apply_updates(api::timestamp_type t) const;
+    /// Find a row in prefetch_data which matches primary key identifying a given `cas_row_update`
+    const update_parameters::prefetch_data::row* find_old_row(const cas_row_update& op) const;
 };
 
 } // end of namespace "cql3::statements"

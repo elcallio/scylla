@@ -70,7 +70,7 @@ private:
             columns.push_back(schema::column{ to_bytes(format("column{:04d}", i)), utf8_type });
         }
 
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id("ks", "perf-test"), "ks", "perf-test",
+        schema_builder builder(make_shared_schema(generate_legacy_id("ks", "perf-test"), "ks", "perf-test",
             // partition key
             {{"name", utf8_type}},
             // clustering key
@@ -83,7 +83,7 @@ private:
             utf8_type,
             // comment
             "Perf tests"
-        )));
+        ));
         return builder.build(schema_builder::compact_storage::no);
     }
 
@@ -142,7 +142,7 @@ public:
 
     future<double> compaction(int idx) {
         return test_setup::create_empty_test_dir(dir()).then([this, idx] {
-            return seastar::async([this, idx] {
+            return sstables::test_env::do_with_async_returning<double>([this, idx] (sstables::test_env& env) {
                 auto sst_gen = [this, gen = make_lw_shared<unsigned>(idx)] () mutable {
                     return _env.make_sstable(s, dir(), (*gen)++, sstable::version_types::ka, sstable::format_types::big, _cfg.buffer_size);
                 };
@@ -159,11 +159,11 @@ public:
                 cache_tracker tracker;
                 cell_locker_stats cl_stats;
                 auto cm = make_lw_shared<compaction_manager>();
-                auto cf = make_lw_shared<column_family>(s, column_family_test_config(), column_family::no_commitlog(), *cm, cl_stats, tracker);
+                auto cf = make_lw_shared<column_family>(s, column_family_test_config(env.manager()), column_family::no_commitlog(), *cm, cl_stats, tracker);
 
                 auto start = perf_sstable_test_env::now();
 
-                auto descriptor = sstables::compaction_descriptor(std::move(ssts));
+                auto descriptor = sstables::compaction_descriptor(std::move(ssts), cf->get_sstable_set(), default_priority_class());
                 descriptor.creator = [sst_gen = std::move(sst_gen)] (unsigned dummy) mutable {
                     return sst_gen();
                 };
@@ -193,7 +193,7 @@ public:
     }
 
     future<double> read_sequential_partitions(int idx) {
-        return do_with(_sst[0]->read_rows_flat(s, no_reader_permit()), [this] (flat_mutation_reader& r) {
+        return do_with(_sst[0]->read_rows_flat(s, tests::make_permit()), [this] (flat_mutation_reader& r) {
             auto start = perf_sstable_test_env::now();
             auto total = make_lw_shared<size_t>(0);
             auto done = make_lw_shared<bool>(false);

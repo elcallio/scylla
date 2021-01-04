@@ -96,8 +96,8 @@ public:
      */
     virtual void reset() = 0;
 
-    virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) const override {
-        auto t1 = receiver->type->underlying_type();
+    virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const override {
+        auto t1 = receiver.type->underlying_type();
         auto t2 = get_type()->underlying_type();
         // We want columns of `counter_type' to be served by underlying type's overloads
         // (here: `counter_cell_view::total_value_type()') with an `EXACT_MATCH'.
@@ -120,10 +120,6 @@ class selector::factory {
 public:
     virtual ~factory() {}
 
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const {
-        return false;
-    }
-
     /**
      * Returns the column specification corresponding to the output value of the selector instances created by
      * this factory.
@@ -131,7 +127,7 @@ public:
      * @param schema the column family schema
      * @return a column specification
      */
-    ::shared_ptr<column_specification> get_column_specification(const schema& schema) const;
+    lw_shared_ptr<column_specification> get_column_specification(const schema& schema) const;
 
     /**
      * Creates a new <code>selector</code> instance.

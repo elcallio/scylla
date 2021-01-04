@@ -93,13 +93,15 @@ public:
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
         execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const = 0;
 
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const = 0;
-
     virtual bool depends_on_keyspace(const sstring& ks_name) const = 0;
 
     virtual bool depends_on_column_family(const sstring& cf_name) const = 0;
 
     virtual shared_ptr<const metadata> get_result_metadata() const = 0;
+
+    virtual bool is_conditional() const {
+        return false;
+    }
 
     audit::audit_info* get_audit_info() { return _audit_info.get(); }
     void set_audit_info(audit::audit_info_ptr&& info) { _audit_info = std::move(info); }

@@ -37,32 +37,14 @@ protected:
     float _tombstone_threshold = DEFAULT_TOMBSTONE_THRESHOLD;
     db_clock::duration _tombstone_compaction_interval = DEFAULT_TOMBSTONE_COMPACTION_INTERVAL();
 public:
-    static std::optional<sstring> get_value(const std::map<sstring, sstring>& options, const sstring& name) {
-        auto it = options.find(name);
-        if (it == options.end()) {
-            return std::nullopt;
-        }
-        return it->second;
-    }
+    static std::optional<sstring> get_value(const std::map<sstring, sstring>& options, const sstring& name);
 protected:
     compaction_strategy_impl() = default;
-    explicit compaction_strategy_impl(const std::map<sstring, sstring>& options) {
-        using namespace cql3::statements;
-
-        auto tmp_value = get_value(options, TOMBSTONE_THRESHOLD_OPTION);
-        _tombstone_threshold = property_definitions::to_double(TOMBSTONE_THRESHOLD_OPTION, tmp_value, DEFAULT_TOMBSTONE_THRESHOLD);
-
-        tmp_value = get_value(options, TOMBSTONE_COMPACTION_INTERVAL_OPTION);
-        auto interval = property_definitions::to_long(TOMBSTONE_COMPACTION_INTERVAL_OPTION, tmp_value, DEFAULT_TOMBSTONE_COMPACTION_INTERVAL().count());
-        _tombstone_compaction_interval = db_clock::duration(std::chrono::seconds(interval));
-
-        // FIXME: validate options.
-    }
+    explicit compaction_strategy_impl(const std::map<sstring, sstring>& options);
 public:
     virtual ~compaction_strategy_impl() {}
     virtual compaction_descriptor get_sstables_for_compaction(column_family& cfs, std::vector<sstables::shared_sstable> candidates) = 0;
     virtual compaction_descriptor get_major_compaction_job(column_family& cf, std::vector<sstables::shared_sstable> candidates);
-    virtual std::vector<resharding_descriptor> get_resharding_jobs(column_family& cf, std::vector<sstables::shared_sstable> candidates);
     virtual void notify_completion(const std::vector<shared_sstable>& removed, const std::vector<shared_sstable>& added) { }
     virtual compaction_strategy_type type() const = 0;
     virtual bool parallel_compaction() const {
@@ -88,5 +70,11 @@ public:
     virtual uint64_t adjust_partition_estimate(const mutation_source_metadata& ms_meta, uint64_t partition_estimate);
 
     virtual reader_consumer make_interposer_consumer(const mutation_source_metadata& ms_meta, reader_consumer end_consumer);
+
+    virtual bool use_interposer_consumer() const {
+        return false;
+    }
+
+    virtual compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, const ::io_priority_class& iop, reshape_mode mode);
 };
 }

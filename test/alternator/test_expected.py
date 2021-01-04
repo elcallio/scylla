@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for the "Expected" parameter used to make certain operations (PutItem,
 # UpdateItem and DeleteItem) conditional on the existing attribute values.
@@ -522,6 +511,15 @@ def test_update_expected_1_null(test_table_s):
             Expected={'a': {'ComparisonOperator': 'NULL', 'AttributeValueList': [2]}}
         )
 
+# When ComparisonOperator = "NULL", AttributeValueList should be empty if it
+# exists, but as this test verifies, it may also be missing completely.
+def test_update_expected_1_null_missing_list(test_table_s):
+    p = random_string()
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'a': {'Value': 2, 'Action': 'PUT'}},
+        Expected={'a': {'ComparisonOperator': 'NULL'}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['a'] == 2
+
 # Tests for Expected with ComparisonOperator = "CONTAINS":
 def test_update_expected_1_contains(test_table_s):
     # true cases. CONTAINS can be used for two unrelated things: check substrings
@@ -598,6 +596,10 @@ def test_update_expected_1_contains(test_table_s):
             AttributeUpdates={'z': {'Value': 17, 'Action': 'PUT'}},
             Expected={'a': {'ComparisonOperator': 'CONTAINS', 'AttributeValueList': []}}
         )
+    # Strangely, while ConditionExpression's contains() allows the argument
+    # to be of any type and checks if the attribute is perhaps a list
+    # containing that item, Expected's "CONTAINS" is more limited, and
+    # refuses a list as the argument (to be searched in a list of lists)
     with pytest.raises(ClientError, match='ValidationException'):
         test_table_s.update_item(Key={'p': p},
             AttributeUpdates={'z': {'Value': 17, 'Action': 'PUT'}},
@@ -684,6 +686,10 @@ def test_update_expected_1_not_contains(test_table_s):
             AttributeUpdates={'z': {'Value': 17, 'Action': 'PUT'}},
             Expected={'a': {'ComparisonOperator': 'NOT_CONTAINS', 'AttributeValueList': []}}
         )
+    # Strangely, while ConditionExpression's contains() allows the argument
+    # to be of any type and checks if the attribute is perhaps a list
+    # containing that item, Expected's "CONTAINS" is more limited, and
+    # refuses a list as the argument (to be searched in a list of lists)
     with pytest.raises(ClientError, match='ValidationException'):
         test_table_s.update_item(Key={'p': p},
             AttributeUpdates={'z': {'Value': 17, 'Action': 'PUT'}},
@@ -1052,6 +1058,19 @@ def test_update_expected_empty(test_table_s):
             AttributeUpdates={'z': {'Value': 4, 'Action': 'PUT'}},
             Expected={}, ConditionalOperator='AND')
 
+# Specifying ConditionalOperator is forbidden if the "Expected" Attribute
+# is missing:
+def test_conditional_operator_expected_missing(test_table_s):
+    p = random_string()
+    with pytest.raises(ClientError, match='ValidationException.*ConditionalOperator'):
+        test_table_s.update_item(Key={'p': p},
+            AttributeUpdates={'z': {'Value': 4, 'Action': 'PUT'}},
+            ConditionalOperator='OR')
+    with pytest.raises(ClientError, match='ValidationException.*ConditionalOperator'):
+        test_table_s.update_item(Key={'p': p},
+            AttributeUpdates={'z': {'Value': 4, 'Action': 'PUT'}},
+            ConditionalOperator='AND')
+
 # All of the above tests tested "Expected" with the UpdateItem operation.
 # We now want to test that it works also with the PutItem and DeleteItems
 # operations. We don't need to check again all the different sub-cases tested
@@ -1077,3 +1096,42 @@ def test_put_item_expected(test_table_s):
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 2}
     with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
         test_table_s.put_item(Item={'p': p, 'a': 3}, Expected={'a': {'Value': 1}})
+
+# Reproducer for issue #6573: binary strings should be ordered as unsigned
+# bytes, i.e., byte 128 comes after 127, not before as with signed bytes.
+# Test the five ordering operators: LT, LE, GT, GE, BETWEEN
+def test_update_expected_unsigned_bytes(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'b': bytearray([127])})
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'z': {'Value': 1, 'Action': 'PUT'}},
+        Expected={'b': {'ComparisonOperator': 'LT',
+                        'AttributeValueList': [bytearray([128])]}}
+    )
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 1
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'z': {'Value': 2, 'Action': 'PUT'}},
+        Expected={'b': {'ComparisonOperator': 'LE',
+                        'AttributeValueList': [bytearray([128])]}}
+    )
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 2
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'z': {'Value': 3, 'Action': 'PUT'}},
+        Expected={'b': {'ComparisonOperator': 'BETWEEN',
+                        'AttributeValueList': [bytearray([126]), bytearray([128])]}}
+    )
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 3
+
+    test_table_s.put_item(Item={'p': p, 'b': bytearray([128])})
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'z': {'Value': 4, 'Action': 'PUT'}},
+        Expected={'b': {'ComparisonOperator': 'GT',
+                        'AttributeValueList': [bytearray([127])]}}
+    )
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 4
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'z': {'Value': 5, 'Action': 'PUT'}},
+        Expected={'b': {'ComparisonOperator': 'GE',
+                        'AttributeValueList': [bytearray([127])]}}
+    )
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 5

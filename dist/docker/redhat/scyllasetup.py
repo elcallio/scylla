@@ -5,7 +5,7 @@ import os
 
 
 class ScyllaSetup:
-    def __init__(self, arguments):
+    def __init__(self, arguments, extra_arguments):
         self._developerMode = arguments.developerMode
         self._seeds = arguments.seeds
         self._cpuset = arguments.cpuset
@@ -16,8 +16,11 @@ class ScyllaSetup:
         self._broadcastRpcAddress = arguments.broadcastRpcAddress
         self._apiAddress = arguments.apiAddress
         self._alternatorPort = arguments.alternatorPort
+        self._alternatorHttpsPort = arguments.alternatorHttpsPort
+        self._alternatorWriteIsolation = arguments.alternatorWriteIsolation
         self._smp = arguments.smp
         self._memory = arguments.memory
+        self._reserveMemory = arguments.reserveMemory
         self._overprovisioned = arguments.overprovisioned
         self._housekeeping = not arguments.disable_housekeeping
         self._experimental = arguments.experimental
@@ -26,6 +29,8 @@ class ScyllaSetup:
         self._clusterName = arguments.clusterName
         self._endpointSnitch = arguments.endpointSnitch
         self._replaceAddressFirstBoot = arguments.replaceAddressFirstBoot
+        self._io_setup = arguments.io_setup
+        self._extra_args = extra_arguments
 
     def _run(self, *args, **kwargs):
         logging.info('running: {}'.format(args))
@@ -58,7 +63,8 @@ class ScyllaSetup:
         if not os.path.exists(data_dir):
             os.makedirs(data_dir)
 
-        self._run(['/opt/scylladb/scripts/scylla_io_setup'])
+        if self._io_setup == "1":
+            self._run(['/opt/scylladb/scripts/scylla_io_setup'])
 
     def cqlshrc(self):
         home = os.environ['HOME']
@@ -78,6 +84,9 @@ class ScyllaSetup:
         args = []
         if self._memory is not None:
             args += ["--memory %s" % self._memory]
+
+        if self._reserveMemory is not None:
+            args += ["--reserve-memory %s" % self._reserveMemory]
 
         if self._smp is not None:
             args += ["--smp %s" % self._smp]
@@ -116,6 +125,13 @@ class ScyllaSetup:
             args += ["--alternator-address %s" % self._alternatorAddress]
             args += ["--alternator-port %s" % self._alternatorPort]
 
+        if self._alternatorHttpsPort is not None:
+            args += ["--alternator-address %s" % self._alternatorAddress]
+            args += ["--alternator-https-port %s" % self._alternatorHttpsPort]
+
+        if self._alternatorWriteIsolation is not None:
+            args += ["--alternator-write-isolation %s" % self._alternatorWriteIsolation]
+
         if self._authenticator is not None:
             args += ["--authenticator %s" % self._authenticator]
 
@@ -137,4 +153,4 @@ class ScyllaSetup:
         args += ["--blocked-reactor-notify-ms 999999999"]
 
         with open("/etc/scylla.d/docker.conf", "w") as cqlshrc:
-            cqlshrc.write("SCYLLA_DOCKER_ARGS=\"%s\"\n" % " ".join(args))
+            cqlshrc.write("SCYLLA_DOCKER_ARGS=\"%s\"\n" % (" ".join(args) + " " + " ".join(self._extra_args)))

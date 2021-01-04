@@ -19,6 +19,7 @@
 #include "log.hh"
 #include "schema_builder.hh"
 #include "memtable.hh"
+#include "test/lib/reader_permit.hh"
 
 static
 partition_key new_key(schema_ptr s) {
@@ -32,6 +33,8 @@ clustering_key new_ckey(schema_ptr s) {
     return clustering_key::from_single_value(*s, to_bytes(format("ckey{:d}", next++)));
 }
 
+void *leak;
+
 int main(int argc, char** argv) {
     namespace bpo = boost::program_options;
     app_template app;
@@ -39,7 +42,7 @@ int main(int argc, char** argv) {
         ("debug", "enable debug logging");
 
     return app.run(argc, argv, [&app] {
-        if (app.configuration().count("debug")) {
+        if (app.configuration().contains("debug")) {
             logging::logger_registry().set_all_loggers_level(logging::log_level::debug);
         }
 
@@ -165,7 +168,7 @@ int main(int argc, char** argv) {
 
             fragment_free_space();
 
-            cache.update([] {}, *mt).get();
+            cache.update(row_cache::external_updater([] {}), *mt).get();
 
             stuffing.clear();
             cache_stuffing.clear();
@@ -173,7 +176,7 @@ int main(int argc, char** argv) {
             // Verify that all mutations from memtable went through
             for (auto&& key : keys) {
                 auto range = dht::partition_range::make_singular(key);
-                auto reader = cache.make_reader(s, range);
+                auto reader = cache.make_reader(s, tests::make_permit(), range);
                 auto mo = read_mutation_from_flat_mutation_reader(reader, db::no_timeout).get0();
                 assert(mo);
                 assert(mo->partition().live_row_count(*s) ==
@@ -190,7 +193,7 @@ int main(int argc, char** argv) {
 
             for (auto&& key : keys) {
                 auto range = dht::partition_range::make_singular(key);
-                auto reader = cache.make_reader(s, range);
+                auto reader = cache.make_reader(s, tests::make_permit(), range);
                 auto mfopt = reader(db::no_timeout).get0();
                 assert(mfopt);
                 assert(mfopt->is_partition_start());
@@ -228,10 +231,12 @@ int main(int argc, char** argv) {
                 }
 
                 try {
-                    auto reader = cache.make_reader(s, range);
+                    auto reader = cache.make_reader(s, tests::make_permit(), range);
                     assert(!reader(db::no_timeout).get0());
                     auto evicted_from_cache = logalloc::segment_size + large_cell_size;
-                    new char[evicted_from_cache + logalloc::segment_size];
+                    // GCC's -fallocation-dce can remove dead calls to new and malloc, so
+                    // assign the result to a global variable to disable it.
+                    leak = new char[evicted_from_cache + logalloc::segment_size];
                     assert(false); // The test is not invoking the case which it's supposed to test
                 } catch (const std::bad_alloc&) {
                     // expected

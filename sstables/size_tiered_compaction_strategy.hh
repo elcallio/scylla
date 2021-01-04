@@ -33,28 +33,9 @@ class size_tiered_compaction_strategy_options {
     double bucket_high = DEFAULT_BUCKET_HIGH;
     double cold_reads_to_omit =  DEFAULT_COLD_READS_TO_OMIT;
 public:
-    size_tiered_compaction_strategy_options(const std::map<sstring, sstring>& options) {
-        using namespace cql3::statements;
+    size_tiered_compaction_strategy_options(const std::map<sstring, sstring>& options);
 
-        auto tmp_value = compaction_strategy_impl::get_value(options, MIN_SSTABLE_SIZE_KEY);
-        min_sstable_size = property_definitions::to_long(MIN_SSTABLE_SIZE_KEY, tmp_value, DEFAULT_MIN_SSTABLE_SIZE);
-
-        tmp_value = compaction_strategy_impl::get_value(options, BUCKET_LOW_KEY);
-        bucket_low = property_definitions::to_double(BUCKET_LOW_KEY, tmp_value, DEFAULT_BUCKET_LOW);
-
-        tmp_value = compaction_strategy_impl::get_value(options, BUCKET_HIGH_KEY);
-        bucket_high = property_definitions::to_double(BUCKET_HIGH_KEY, tmp_value, DEFAULT_BUCKET_HIGH);
-
-        tmp_value = compaction_strategy_impl::get_value(options, COLD_READS_TO_OMIT_KEY);
-        cold_reads_to_omit = property_definitions::to_double(COLD_READS_TO_OMIT_KEY, tmp_value, DEFAULT_COLD_READS_TO_OMIT);
-    }
-
-    size_tiered_compaction_strategy_options() {
-        min_sstable_size = DEFAULT_MIN_SSTABLE_SIZE;
-        bucket_low = DEFAULT_BUCKET_LOW;
-        bucket_high = DEFAULT_BUCKET_HIGH;
-        cold_reads_to_omit = DEFAULT_COLD_READS_TO_OMIT;
-    }
+    size_tiered_compaction_strategy_options();
 
     // FIXME: convert java code below.
 #if 0
@@ -105,9 +86,11 @@ class size_tiered_compaction_strategy : public compaction_strategy_impl {
     compaction_backlog_tracker _backlog_tracker;
 
     // Return a list of pair of shared_sstable and its respective size.
-    std::vector<std::pair<sstables::shared_sstable, uint64_t>> create_sstable_and_length_pairs(const std::vector<sstables::shared_sstable>& sstables) const;
+    static std::vector<std::pair<sstables::shared_sstable, uint64_t>> create_sstable_and_length_pairs(const std::vector<sstables::shared_sstable>& sstables);
 
     // Group files of similar size into buckets.
+    static std::vector<std::vector<sstables::shared_sstable>> get_buckets(const std::vector<sstables::shared_sstable>& sstables, size_tiered_compaction_strategy_options options);
+
     std::vector<std::vector<sstables::shared_sstable>> get_buckets(const std::vector<sstables::shared_sstable>& sstables) const;
 
     // Maybe return a bucket of sstables to compact
@@ -143,6 +126,8 @@ public:
 
     virtual compaction_descriptor get_sstables_for_compaction(column_family& cfs, std::vector<sstables::shared_sstable> candidates) override;
 
+    static int64_t estimated_pending_compactions(const std::vector<sstables::shared_sstable>& sstables,
+        int min_threshold, int max_threshold, size_tiered_compaction_strategy_options options);
     virtual int64_t estimated_pending_compactions(column_family& cf) const override;
 
     virtual compaction_strategy_type type() const {
@@ -157,6 +142,9 @@ public:
     virtual compaction_backlog_tracker& get_backlog_tracker() override {
         return _backlog_tracker;
     }
+
+    virtual compaction_descriptor get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, const ::io_priority_class& iop, reshape_mode mode) override;
+
 };
 
 }

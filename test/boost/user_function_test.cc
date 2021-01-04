@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <seastar/testing/test_case.hh>
@@ -574,7 +563,7 @@ SEASTAR_TEST_CASE(test_user_function_utf8_return) {
 
         e.execute_cql("CREATE FUNCTION my_func3(val varint) CALLED ON NULL INPUT RETURNS text LANGUAGE Lua AS 'return \"\\xFF\"';").get();
         auto fut = e.execute_cql("SELECT my_func3(val) FROM my_table;");
-        BOOST_REQUIRE_EXCEPTION(fut.get(), ire, message_equals("value is not valid utf8"));
+        BOOST_REQUIRE_EXCEPTION(fut.get(), ire, message_equals("value is not valid utf8, invalid character at byte offset 0"));
 
         e.execute_cql("CREATE TABLE my_table2 (key text PRIMARY KEY, val decimal);").get();
         e.execute_cql("INSERT INTO my_table2 (key, val) VALUES ('foo', 4.2);").get();

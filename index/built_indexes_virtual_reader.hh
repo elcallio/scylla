@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "database.hh"
@@ -46,6 +35,7 @@ class built_indexes_virtual_reader {
         built_indexes_reader(
                 database& db,
                 schema_ptr schema,
+                reader_permit permit,
                 column_family& built_views,
                 const dht::partition_range& range,
                 const query::partition_slice& slice,
@@ -53,10 +43,11 @@ class built_indexes_virtual_reader {
                 tracing::trace_state_ptr trace_state,
                 streamed_mutation::forwarding fwd,
                 mutation_reader::forwarding fwd_mr)
-                : flat_mutation_reader::impl(std::move(schema))
+                : flat_mutation_reader::impl(std::move(schema), permit)
                 , _db(db)
                 , _underlying(built_views.make_reader(
                         built_views.schema(),
+                        std::move(permit),
                         range,
                         slice,
                         pc,
@@ -118,7 +109,7 @@ public:
 
     flat_mutation_reader operator()(
             schema_ptr s,
-            reader_permit,
+            reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
             const io_priority_class& pc,
@@ -128,6 +119,7 @@ public:
         return make_flat_mutation_reader<built_indexes_reader>(
                 _db,
                 std::move(s),
+                std::move(permit),
                 _db.find_column_family(s->ks_name(), system_keyspace::v3::BUILT_VIEWS),
                 range,
                 slice,

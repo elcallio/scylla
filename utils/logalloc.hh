@@ -433,12 +433,22 @@ private:
 class tracker {
 public:
     class impl;
+
+    struct config {
+        bool defragment_on_idle;
+        bool abort_on_lsa_bad_alloc;
+        size_t lsa_reclamation_step;
+    };
+
+    void configure(const config& cfg);
+
 private:
     std::unique_ptr<impl> _impl;
     memory::reclaimer _reclaimer;
     friend class region;
     friend class region_impl;
     memory::reclaiming_result reclaim(seastar::memory::reclaimer::request);
+
 public:
     tracker();
     ~tracker();
@@ -452,10 +462,6 @@ public:
     // Invalidates references to objects in all compactible and evictable regions.
     //
     size_t reclaim(size_t bytes);
-
-    // Compacts one segment at a time from sparsest segment to least sparse until work_waiting_on_reactor returns true
-    // or there are no more segments to compact.
-    idle_cpu_handler_result compact_on_idle(work_waiting_on_reactor);
 
     // Compacts as much as possible. Very expensive, mainly for testing.
     // Guarantees that every live object from reclaimable regions will be moved.
@@ -475,14 +481,8 @@ public:
 
     impl& get_impl() { return *_impl; }
 
-    // Set the minimum number of segments reclaimed during single reclamation cycle.
-    void set_reclamation_step(size_t step_in_segments);
-
     // Returns the minimum number of segments reclaimed during single reclamation cycle.
     size_t reclamation_step() const;
-
-    // Abort on allocation failure from LSA
-    void enable_abort_on_bad_alloc();
 
     bool should_abort_on_bad_alloc();
 };
@@ -600,10 +600,10 @@ public:
 
     occupancy_stats occupancy() const;
 
-    allocation_strategy& allocator() {
+    allocation_strategy& allocator() noexcept {
         return *_impl;
     }
-    const allocation_strategy& allocator() const {
+    const allocation_strategy& allocator() const noexcept {
         return *_impl;
     }
 
@@ -674,9 +674,16 @@ struct reclaim_lock {
 // also allocate LSA memory. The object learns from failures how much it
 // should reserve up front in order to not cause allocation failures.
 class allocating_section {
-    size_t _lsa_reserve = 10; // in segments
-    size_t _std_reserve = 1024; // in bytes
+    // Do not decay below these minimal values
+    static constexpr size_t s_min_lsa_reserve = 10;
+    static constexpr size_t s_min_std_reserve = 1024;
+    static constexpr uint64_t s_bytes_per_decay = 10'000'000'000;
+    static constexpr unsigned s_segments_per_decay = 100'000;
+    size_t _lsa_reserve = s_min_lsa_reserve; // in segments
+    size_t _std_reserve = s_min_std_reserve; // in bytes
     size_t _minimum_lsa_emergency_reserve = 0;
+    int64_t _remaining_std_bytes_until_decay = s_bytes_per_decay;
+    int _remaining_lsa_segments_until_decay = s_segments_per_decay;
 private:
     struct guard {
         size_t _prev;
@@ -684,6 +691,7 @@ private:
         ~guard();
     };
     void reserve();
+    void maybe_decay_reserve();
     void on_alloc_failure(logalloc::region&);
 public:
 
@@ -728,6 +736,7 @@ public:
     template<typename Func>
     decltype(auto) with_reclaiming_disabled(logalloc::region& r, Func&& fn) {
         assert(r.reclaiming_enabled());
+        maybe_decay_reserve();
         while (true) {
             try {
                 logalloc::reclaim_lock _(r);
@@ -763,5 +772,7 @@ future<> prime_segment_pool(size_t available_memory, size_t min_free_memory);
 
 uint64_t memory_allocated();
 uint64_t memory_compacted();
+
+occupancy_stats lsa_global_occupancy_stats();
 
 }

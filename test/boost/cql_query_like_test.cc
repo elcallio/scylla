@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 
@@ -104,10 +93,7 @@ SEASTAR_TEST_CASE(test_like_operator_conjunction) {
         require_rows(e, "select s1 from t where s1 like 'a%' and s1 like '%' allow filtering", {{T("a")}, {T("abc")}});
         require_rows(e, "select s1 from t where s1 like 'a%' and s1 like '_b_' and s1 like '%c' allow filtering",
                      {{T("abc")}});
-        BOOST_REQUIRE_EXCEPTION(
-                e.execute_cql("select * from t where s1 like 'a%' and s1 = 'abc' allow filtering").get(),
-                exceptions::invalid_request_exception,
-                exception_predicate::message_contains("LIKE and non-LIKE"));
+        require_rows(e, "select s1 from t where s1 like 'a%' and s1 = 'abc' allow filtering", {{T("abc")}});
     });
 }
 

@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
         auto std_obj_size = app.configuration()["standard-object-size"].as<unsigned>();
         auto obj_count = app.configuration()["count"].as<unsigned>();
 
-        if (app.configuration().count("debug")) {
+        if (app.configuration().contains("debug")) {
             logging::logger_registry().set_all_loggers_level(logging::log_level::debug);
         }
 
@@ -56,7 +56,8 @@ int main(int argc, char** argv) {
                 }
 
                 // Evict in random order to stress more
-                std::shuffle(refs.begin(), refs.end(), std::random_device());
+                std::random_device rd;
+                std::shuffle(refs.begin(), refs.end(), std::default_random_engine(rd()));
                 r.make_evictable([&] {
                     return with_allocator(r.allocator(), [&] {
                         if (refs.empty()) {

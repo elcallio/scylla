@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 /*
@@ -41,7 +30,6 @@
 #include "exceptions/exceptions.hh"
 #include "timestamp.hh"
 #include "tracing/trace_state.hh"
-#include "cdc_options.hh"
 #include "utils/UUID.hh"
 
 class schema;
@@ -63,6 +51,7 @@ class query_state;
 
 class mutation;
 class partition_key;
+class database;
 
 namespace cdc {
 
@@ -75,7 +64,7 @@ class metadata;
 /// CDC service will listen for schema changes and iff CDC is enabled/changed
 /// create/modify/delete corresponding log tables etc as part of the schema change. 
 ///
-class cdc_service {
+class cdc_service final : public async_sharded_service<cdc::cdc_service> {
     class impl;
     std::unique_ptr<impl> _impl;
 public:
@@ -91,7 +80,8 @@ public:
     future<std::tuple<std::vector<mutation>, lw_shared_ptr<operation_result_tracker>>> augment_mutation_call(
         lowres_clock::time_point timeout,
         std::vector<mutation>&& mutations,
-        tracing::trace_state_ptr tr_state
+        tracing::trace_state_ptr tr_state,
+        db::consistency_level write_cl
         );
     bool needs_cdc_augmentation(const std::vector<mutation>&) const;
 };
@@ -99,19 +89,16 @@ public:
 struct db_context final {
     service::storage_proxy& _proxy;
     service::migration_notifier& _migration_notifier;
-    locator::token_metadata& _token_metadata;
     cdc::metadata& _cdc_metadata;
 
     class builder final {
         service::storage_proxy& _proxy;
         std::optional<std::reference_wrapper<service::migration_notifier>> _migration_notifier;
-        std::optional<std::reference_wrapper<locator::token_metadata>> _token_metadata;
         std::optional<std::reference_wrapper<cdc::metadata>> _cdc_metadata;
     public:
         builder(service::storage_proxy& proxy);
 
         builder& with_migration_notifier(service::migration_notifier& migration_notifier);
-        builder& with_token_metadata(locator::token_metadata& token_metadata);
         builder& with_cdc_metadata(cdc::metadata&);
 
         db_context build();
@@ -128,7 +115,12 @@ enum class operation : int8_t {
 };
 
 bool is_log_for_some_table(const sstring& ks_name, const std::string_view& table_name);
-seastar::sstring log_name(const seastar::sstring& table_name);
+
+schema_ptr get_base_table(const database&, const schema&);
+schema_ptr get_base_table(const database&, sstring_view, std::string_view);
+
+seastar::sstring base_name(std::string_view log_name);
+seastar::sstring log_name(std::string_view table_name);
 seastar::sstring log_data_column_name(std::string_view column_name);
 seastar::sstring log_meta_column_name(std::string_view column_name);
 bytes log_data_column_name_bytes(const bytes& column_name);
@@ -139,6 +131,8 @@ bytes log_data_column_deleted_name_bytes(const bytes& column_name);
 
 seastar::sstring log_data_column_deleted_elements_name(std::string_view column_name);
 bytes log_data_column_deleted_elements_name_bytes(const bytes& column_name);
+
+bool is_cdc_metacolumn_name(const sstring& name);
 
 utils::UUID generate_timeuuid(api::timestamp_type t);
 

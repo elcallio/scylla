@@ -6,18 +6,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 // TODO: upstream this to Boost.
@@ -26,13 +15,11 @@
 
 #include <boost/program_options/errors.hpp>
 #include <iostream>
-#include <seastar/util/gcc6-concepts.hh>
 #include <sstream>
 #include <type_traits>
 
-GCC6_CONCEPT(
 template<typename T>
-concept bool HasMapInterface = requires(T t) {
+concept HasMapInterface = requires(T t) {
     typename std::remove_reference<T>::type::mapped_type;
     typename std::remove_reference<T>::type::key_type;
     typename std::remove_reference<T>::type::value_type;
@@ -42,7 +29,6 @@ concept bool HasMapInterface = requires(T t) {
     t.cbegin();
     t.cend();
 };
-)
 
 /// A Boost program option holding an enum value.
 ///
@@ -74,7 +60,7 @@ concept bool HasMapInterface = requires(T t) {
 ///     ("vec", po::value<vector<enum_option<Type>>>()->multitoken(), "Type vector");
 /// }
 template<typename Mapper>
-GCC6_CONCEPT(requires HasMapInterface<decltype(Mapper::map())>)
+requires HasMapInterface<decltype(Mapper::map())>
 class enum_option {
     using map_t = typename std::remove_reference<decltype(Mapper::map())>::type;
     typename map_t::mapped_type _value;

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <boost/range/algorithm/heap_algorithm.hpp>
@@ -25,7 +14,6 @@
 #include "partition_version.hh"
 #include "row_cache.hh"
 #include "partition_snapshot_row_cursor.hh"
-#include "partition_snapshot_reader.hh"
 #include "utils/coroutine.hh"
 #include "real_dirty_memory_accounter.hh"
 
@@ -84,34 +72,26 @@ size_t partition_version::size_in_allocator(const schema& s, allocation_strategy
 
 namespace {
 
-GCC6_CONCEPT(
-
 // A functor which transforms objects from Domain into objects from CoDomain
 template<typename U, typename Domain, typename CoDomain>
-concept bool Mapper() {
-    return requires(U obj, const Domain& src) {
-        { obj(src) } -> const CoDomain&;
+concept Mapper =
+    requires(U obj, const Domain& src) {
+        { obj(src) } -> std::convertible_to<const CoDomain&>;
     };
-}
 
 // A functor which merges two objects from Domain into one. The result is stored in the first argument.
 template<typename U, typename Domain>
-concept bool Reducer() {
-    return requires(U obj, Domain& dst, const Domain& src) {
-        { obj(dst, src) } -> void;
+concept Reducer =
+    requires(U obj, Domain& dst, const Domain& src) {
+        { obj(dst, src) } -> std::same_as<void>;
     };
-}
-
-)
 
 // Calculates the value of particular part of mutation_partition represented by
 // the version chain starting from v.
 // |map| extracts the part from each version.
 // |reduce| Combines parts from the two versions.
 template <typename Result, typename Map, typename Initial, typename Reduce>
-GCC6_CONCEPT(
-requires Mapper<Map, mutation_partition, Result>() && Reducer<Reduce, Result>()
-)
+requires Mapper<Map, mutation_partition, Result> && Reducer<Reduce, Result>
 inline Result squashed(const partition_version_ref& v, Map&& map, Initial&& initial, Reduce&& reduce) {
     const partition_version* this_v = &*v;
     partition_version* it = v->last();
@@ -124,9 +104,7 @@ inline Result squashed(const partition_version_ref& v, Map&& map, Initial&& init
 }
 
 template <typename Result, typename Map, typename Reduce>
-GCC6_CONCEPT(
-requires Mapper<Map, mutation_partition, Result>() && Reducer<Reduce, Result>()
-)
+requires Mapper<Map, mutation_partition, Result> && Reducer<Reduce, Result>
 inline Result squashed(const partition_version_ref& v, Map&& map, Reduce&& reduce) {
     return squashed<Result>(v, map,
                             [] (auto&& o) -> decltype(auto) { return std::forward<decltype(o)>(o); },
@@ -378,103 +356,6 @@ void partition_entry::apply(const schema& s, mutation_partition&& mp, const sche
     app_stats.row_writes += new_version->partition().row_count();
 }
 
-// Iterates over all rows in mutation represented by partition_entry.
-// It abstracts away the fact that rows may be spread across multiple versions.
-class partition_entry::rows_iterator final {
-    struct version {
-        mutation_partition::rows_type::iterator current_row;
-        mutation_partition::rows_type* rows;
-        bool can_move;
-        struct compare {
-            const rows_entry::tri_compare& _cmp;
-        public:
-            explicit compare(const rows_entry::tri_compare& cmp) : _cmp(cmp) { }
-            bool operator()(const version& a, const version& b) const {
-                return _cmp(*a.current_row, *b.current_row) > 0;
-            }
-        };
-    };
-    const schema& _schema;
-    rows_entry::tri_compare _rows_cmp;
-    rows_entry::compare _rows_less_cmp;
-    version::compare _version_cmp;
-    std::vector<version> _heap;
-    std::vector<version> _current_row;
-    bool _current_row_dummy;
-public:
-    rows_iterator(partition_version* version, const schema& schema)
-        : _schema(schema)
-        , _rows_cmp(schema)
-        , _rows_less_cmp(schema)
-        , _version_cmp(_rows_cmp)
-    {
-        bool can_move = true;
-        while (version) {
-            can_move &= !version->is_referenced();
-            auto& rows = version->partition().clustered_rows();
-            if (!rows.empty()) {
-                _heap.push_back({rows.begin(), &rows, can_move});
-            }
-            version = version->next();
-        }
-        boost::range::make_heap(_heap, _version_cmp);
-        move_to_next_row();
-    }
-    bool done() const {
-        return _current_row.empty();
-    }
-    // Return clustering key of the current row in source.
-    // Valid only when !is_dummy().
-    const clustering_key& key() const {
-        return _current_row[0].current_row->key();
-    }
-    position_in_partition_view position() const {
-        return _current_row[0].current_row->position();
-    }
-    bool is_dummy() const {
-        return _current_row_dummy;
-    }
-    template<typename RowConsumer>
-    void consume_row(RowConsumer&& consumer) {
-        assert(!_current_row.empty());
-        // versions in _current_row are not ordered but it is not a problem
-        // due to the fact that all rows are continuous.
-        for (version& v : _current_row) {
-            if (!v.can_move) {
-                consumer(deletable_row(_schema, v.current_row->row()));
-            } else {
-                consumer(std::move(v.current_row->row()));
-            }
-        }
-    }
-    void remove_current_row_when_possible() {
-        assert(!_current_row.empty());
-        auto deleter = current_deleter<rows_entry>();
-        for (version& v : _current_row) {
-            if (v.can_move) {
-                v.rows->erase_and_dispose(v.current_row, deleter);
-            }
-        }
-    }
-    void move_to_next_row() {
-        _current_row.clear();
-        _current_row_dummy = true;
-        while (!_heap.empty() &&
-                (_current_row.empty() || _rows_cmp(*_current_row[0].current_row, *_heap[0].current_row) == 0)) {
-            boost::range::pop_heap(_heap, _version_cmp);
-            auto& curr = _heap.back();
-            _current_row.push_back({curr.current_row, curr.rows, curr.can_move});
-            _current_row_dummy &= bool(curr.current_row->dummy());
-            ++curr.current_row;
-            if (curr.current_row == curr.rows->end()) {
-                _heap.pop_back();
-            } else {
-                boost::range::push_heap(_heap, _version_cmp);
-            }
-        }
-    }
-};
-
 coroutine partition_entry::apply_to_incomplete(const schema& s,
     partition_entry&& pe,
     mutation_cleaner& pe_cleaner,
@@ -650,12 +531,12 @@ partition_snapshot_ptr partition_entry::read(logalloc::region& r,
     return partition_snapshot_ptr(std::move(snp));
 }
 
-std::vector<range_tombstone>
+partition_snapshot::range_tombstone_result
 partition_snapshot::range_tombstones(position_in_partition_view start, position_in_partition_view end)
 {
     partition_version* v = &*version();
     if (!v->next()) {
-        return boost::copy_range<std::vector<range_tombstone>>(
+        return boost::copy_range<range_tombstone_result>(
             v->partition().row_tombstones().slice(*_schema, start, end));
     }
     range_tombstone_list list(*_schema);
@@ -665,10 +546,10 @@ partition_snapshot::range_tombstones(position_in_partition_view start, position_
         }
         v = v->next();
     }
-    return boost::copy_range<std::vector<range_tombstone>>(list.slice(*_schema, start, end));
+    return boost::copy_range<range_tombstone_result>(list.slice(*_schema, start, end));
 }
 
-std::vector<range_tombstone>
+partition_snapshot::range_tombstone_result
 partition_snapshot::range_tombstones()
 {
     return range_tombstones(

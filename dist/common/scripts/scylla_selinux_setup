@@ -7,23 +7,13 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 import os
 import sys
 import subprocess
 from scylla_util import *
+from subprocess import run
 
 if __name__ == '__main__':
     if os.getuid() > 0:
@@ -34,9 +24,9 @@ if __name__ == '__main__':
         print("scylla_selinux_setup only supports Red Hat variants")
         sys.exit(0)
 
-    res = out('sestatus')
+    res = run('sestatus', shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
     if res.split(None)[2] != 'disabled':
-        run('setenforce 0')
+        run('setenforce 0', shell=True, check=True)
         cfg = sysconfig_parser('/etc/sysconfig/selinux')
         cfg.set('SELINUX', 'disabled')
         cfg.commit()

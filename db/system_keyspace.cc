@@ -34,7 +34,6 @@
 
 #include "system_keyspace.hh"
 #include "types.hh"
-#include "service/storage_service.hh"
 #include "service/storage_proxy.hh"
 #include "service/client_state.hh"
 #include "service/query_state.hh"
@@ -59,7 +58,7 @@
 #include "serializer.hh"
 #include <seastar/core/enum.hh>
 #include <seastar/net/inet_address.hh>
-#include <index/secondary_index.hh>
+#include "index/secondary_index.hh"
 #include "service/storage_proxy.hh"
 #include "message/messaging_service.hh"
 #include "mutation_query.hh"
@@ -69,6 +68,7 @@
 #include "db/view/build_progress_virtual_reader.hh"
 #include "db/schema_tables.hh"
 #include "index/built_indexes_virtual_reader.hh"
+#include "utils/generation-number.hh"
 
 #include "idl/frozen_mutation.dist.hh"
 #include "serializer_impl.hh"
@@ -118,7 +118,7 @@ table_schema_version generate_schema_version(utils::UUID table_id, uint16_t offs
 
 schema_ptr hints() {
     static thread_local auto hints = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, HINTS), NAME, HINTS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, HINTS), NAME, HINTS,
         // partition key
         {{"target_id", uuid_type}},
         // clustering key
@@ -131,7 +131,7 @@ schema_ptr hints() {
         utf8_type,
         // comment
         "hints awaiting delivery"
-       )));
+       ));
        builder.set_gc_grace_seconds(0);
        builder.set_compaction_strategy_options({{ "enabled", "false" }});
        builder.with_version(generate_schema_version(builder.uuid()));
@@ -142,7 +142,7 @@ schema_ptr hints() {
 
 schema_ptr batchlog() {
     static thread_local auto batchlog = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, BATCHLOG), NAME, BATCHLOG,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, BATCHLOG), NAME, BATCHLOG,
         // partition key
         {{"id", uuid_type}},
         // clustering key
@@ -158,7 +158,7 @@ schema_ptr batchlog() {
         // FIXME: the original Java code also had:
         // operations on resulting CFMetaData:
         //    .compactionStrategyOptions(Collections.singletonMap("min_threshold", "2"))
-       )));
+       ));
        builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
@@ -169,7 +169,7 @@ schema_ptr batchlog() {
 /*static*/ schema_ptr paxos() {
     static thread_local auto paxos = [] {
         // FIXME: switch to the new schema_builder interface (with_column(...), etc)
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, PAXOS), NAME, PAXOS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, PAXOS), NAME, PAXOS,
         // partition key
         {{"row_key", bytes_type}}, // byte representation of a row key that hashes to the same token as original
         // clustering key
@@ -191,7 +191,8 @@ schema_ptr batchlog() {
         // FIXME: the original Java code also had:
         // operations on resulting CFMetaData:
         //    .compactionStrategyClass(LeveledCompactionStrategy.class);
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        builder.set_wait_for_sync_to_commitlog(true);
        return builder.build(schema_builder::compact_storage::no);
@@ -201,7 +202,7 @@ schema_ptr batchlog() {
 
 schema_ptr built_indexes() {
     static thread_local auto built_indexes = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, BUILT_INDEXES), NAME, BUILT_INDEXES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, BUILT_INDEXES), NAME, BUILT_INDEXES,
         // partition key
         {{"table_name", utf8_type}}, // table_name here is the name of the keyspace - don't be fooled
         // clustering key
@@ -214,7 +215,8 @@ schema_ptr built_indexes() {
         utf8_type,
         // comment
         "built column indexes"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::yes);
     }();
@@ -223,7 +225,7 @@ schema_ptr built_indexes() {
 
 /*static*/ schema_ptr local() {
     static thread_local auto local = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, LOCAL), NAME, LOCAL,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, LOCAL), NAME, LOCAL,
         // partition key
         {{"key", utf8_type}},
         // clustering key
@@ -260,7 +262,8 @@ schema_ptr built_indexes() {
         utf8_type,
         // comment
         "information about the local node"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        builder.remove_column("scylla_cpu_sharding_algorithm");
        builder.remove_column("scylla_nr_shards");
@@ -272,7 +275,7 @@ schema_ptr built_indexes() {
 
 /*static*/ schema_ptr peers() {
     static thread_local auto peers = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, PEERS), NAME, PEERS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, PEERS), NAME, PEERS,
         // partition key
         {{"peer", inet_addr_type}},
         // clustering key
@@ -295,7 +298,8 @@ schema_ptr built_indexes() {
         utf8_type,
         // comment
         "information about known peers in the cluster"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
     }();
@@ -304,7 +308,7 @@ schema_ptr built_indexes() {
 
 /*static*/ schema_ptr peer_events() {
     static thread_local auto peer_events = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, PEER_EVENTS), NAME, PEER_EVENTS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, PEER_EVENTS), NAME, PEER_EVENTS,
         // partition key
         {{"peer", inet_addr_type}},
         // clustering key
@@ -319,7 +323,8 @@ schema_ptr built_indexes() {
         utf8_type,
         // comment
         "events related to peers"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
     }();
@@ -328,7 +333,7 @@ schema_ptr built_indexes() {
 
 /*static*/ schema_ptr range_xfers() {
     static thread_local auto range_xfers = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, RANGE_XFERS), NAME, RANGE_XFERS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, RANGE_XFERS), NAME, RANGE_XFERS,
         // partition key
         {{"token_bytes", bytes_type}},
         // clustering key
@@ -341,7 +346,8 @@ schema_ptr built_indexes() {
         utf8_type,
         // comment
         "ranges requested for transfer"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
     }();
@@ -350,7 +356,7 @@ schema_ptr built_indexes() {
 
 /*static*/ schema_ptr compactions_in_progress() {
     static thread_local auto compactions_in_progress = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, COMPACTIONS_IN_PROGRESS), NAME, COMPACTIONS_IN_PROGRESS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, COMPACTIONS_IN_PROGRESS), NAME, COMPACTIONS_IN_PROGRESS,
         // partition key
         {{"id", uuid_type}},
         // clustering key
@@ -367,7 +373,7 @@ schema_ptr built_indexes() {
         utf8_type,
         // comment
         "unfinished compactions"
-        )));
+        ));
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
     }();
@@ -376,7 +382,7 @@ schema_ptr built_indexes() {
 
 /*static*/ schema_ptr compaction_history() {
     static thread_local auto compaction_history = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, COMPACTION_HISTORY), NAME, COMPACTION_HISTORY,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, COMPACTION_HISTORY), NAME, COMPACTION_HISTORY,
         // partition key
         {{"id", uuid_type}},
         // clustering key
@@ -396,7 +402,7 @@ schema_ptr built_indexes() {
         utf8_type,
         // comment
         "week-long compaction history"
-        )));
+        ));
         builder.set_default_time_to_live(std::chrono::duration_cast<std::chrono::seconds>(days(7)));
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build(schema_builder::compact_storage::no);
@@ -406,7 +412,7 @@ schema_ptr built_indexes() {
 
 /*static*/ schema_ptr sstable_activity() {
     static thread_local auto sstable_activity = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, SSTABLE_ACTIVITY), NAME, SSTABLE_ACTIVITY,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, SSTABLE_ACTIVITY), NAME, SSTABLE_ACTIVITY,
         // partition key
         {
             {"keyspace_name", utf8_type},
@@ -426,7 +432,7 @@ schema_ptr built_indexes() {
         utf8_type,
         // comment
         "historic sstable read rates"
-       )));
+       ));
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
     }();
@@ -435,7 +441,7 @@ schema_ptr built_indexes() {
 
 schema_ptr size_estimates() {
     static thread_local auto size_estimates = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, SIZE_ESTIMATES), NAME, SIZE_ESTIMATES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, SIZE_ESTIMATES), NAME, SIZE_ESTIMATES,
             // partition key
             {{"keyspace_name", utf8_type}},
             // clustering key
@@ -451,7 +457,7 @@ schema_ptr size_estimates() {
             utf8_type,
             // comment
             "per-table primary range size estimates"
-            )));
+            ));
         builder.set_gc_grace_seconds(0);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build(schema_builder::compact_storage::no);
@@ -461,7 +467,7 @@ schema_ptr size_estimates() {
 
 /*static*/ schema_ptr large_partitions() {
     static thread_local auto large_partitions = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, LARGE_PARTITIONS), NAME, LARGE_PARTITIONS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, LARGE_PARTITIONS), NAME, LARGE_PARTITIONS,
         // partition key
         {{"keyspace_name", utf8_type}, {"table_name", utf8_type}},
         // clustering key
@@ -478,7 +484,8 @@ schema_ptr size_estimates() {
         utf8_type,
         // comment
         "partitions larger than specified threshold"
-        )));
+        ));
+        builder.set_gc_grace_seconds(0);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build(schema_builder::compact_storage::no);
     }();
@@ -499,6 +506,7 @@ static schema_ptr large_rows() {
                 .with_column("compaction_time", timestamp_type)
                 .set_comment("rows larger than specified threshold")
                 .with_version(generate_schema_version(id))
+                .set_gc_grace_seconds(0)
                 .build();
     }();
     return large_rows;
@@ -519,6 +527,7 @@ static schema_ptr large_cells() {
                 .with_column("compaction_time", timestamp_type)
                 .set_comment("cells larger than specified threshold")
                 .with_version(generate_schema_version(id))
+                .set_gc_grace_seconds(0)
                 .build();
     }();
     return large_cells;
@@ -526,7 +535,7 @@ static schema_ptr large_cells() {
 
 /*static*/ schema_ptr scylla_local() {
     static thread_local auto scylla_local = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, SCYLLA_LOCAL), NAME, SCYLLA_LOCAL,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, SCYLLA_LOCAL), NAME, SCYLLA_LOCAL,
         // partition key
         {{"key", utf8_type}},
         // clustering key
@@ -541,7 +550,8 @@ static schema_ptr large_cells() {
         utf8_type,
         // comment
         "Scylla specific information about the local node"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
     }();
@@ -552,7 +562,7 @@ static schema_ptr large_cells() {
   * but without `request_count'. Also CK is different: C* has only (`port'). */
 static schema_ptr clients() {
     thread_local auto clients = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, CLIENTS), NAME, CLIENTS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, CLIENTS), NAME, CLIENTS,
             // partition key
             {{"address", inet_addr_type}},
             // clustering key
@@ -576,7 +586,7 @@ static schema_ptr clients() {
             utf8_type,
             // comment
             "list of connected clients"
-            )));
+            ));
         builder.set_gc_grace_seconds(0);
         builder.with_version(generate_schema_version(builder.uuid()));
         return builder.build(schema_builder::compact_storage::no);
@@ -590,7 +600,7 @@ namespace v3 {
 
 schema_ptr batches() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, BATCHES), NAME, BATCHES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, BATCHES), NAME, BATCHES,
         // partition key
         {{"id", timeuuid_type}},
         // clustering key
@@ -603,12 +613,12 @@ schema_ptr batches() {
         utf8_type,
         // comment
         "batches awaiting replay"
-       )));
+       ));
        builder.set_gc_grace_seconds(0);
        // FIXME: the original Java code also had:
        //.copy(new LocalPartitioner(TimeUUIDType.instance))
        builder.set_gc_grace_seconds(0);
-       builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+       builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
        builder.set_compaction_strategy_options({{"min_threshold", "2"}});
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
@@ -623,7 +633,7 @@ schema_ptr built_indexes() {
 
 schema_ptr local() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, LOCAL), NAME, LOCAL,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, LOCAL), NAME, LOCAL,
         // partition key
         {{"key", utf8_type}},
         // clustering key
@@ -654,7 +664,8 @@ schema_ptr local() {
         utf8_type,
         // comment
         "information about the local node"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
     }();
@@ -663,7 +674,7 @@ schema_ptr local() {
 
 schema_ptr truncated() {
     static thread_local auto local = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, TRUNCATED), NAME, TRUNCATED,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, TRUNCATED), NAME, TRUNCATED,
         // partition key
         {{"table_uuid", uuid_type}},
         // clustering key
@@ -681,7 +692,8 @@ schema_ptr truncated() {
         utf8_type,
         // comment
         "information about table truncation"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
     }();
@@ -730,7 +742,7 @@ schema_ptr scylla_local() {
 
 schema_ptr available_ranges() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, AVAILABLE_RANGES), NAME, AVAILABLE_RANGES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, AVAILABLE_RANGES), NAME, AVAILABLE_RANGES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -743,7 +755,8 @@ schema_ptr available_ranges() {
         utf8_type,
         // comment
         "available keyspace/ranges during bootstrap/replace that are ready to be served"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build();
     }();
@@ -752,7 +765,7 @@ schema_ptr available_ranges() {
 
 schema_ptr views_builds_in_progress() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, VIEWS_BUILDS_IN_PROGRESS), NAME, VIEWS_BUILDS_IN_PROGRESS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, VIEWS_BUILDS_IN_PROGRESS), NAME, VIEWS_BUILDS_IN_PROGRESS,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -765,7 +778,8 @@ schema_ptr views_builds_in_progress() {
         utf8_type,
         // comment
         "views builds current progress"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build();
     }();
@@ -774,7 +788,7 @@ schema_ptr views_builds_in_progress() {
 
 schema_ptr built_views() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, BUILT_VIEWS), NAME, BUILT_VIEWS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, BUILT_VIEWS), NAME, BUILT_VIEWS,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -787,7 +801,8 @@ schema_ptr built_views() {
         utf8_type,
         // comment
         "built views"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build();
     }();
@@ -812,7 +827,7 @@ schema_ptr scylla_views_builds_in_progress() {
 
 /*static*/ schema_ptr cdc_local() {
     static thread_local auto cdc_local = [] {
-        schema_builder builder(make_lw_shared(schema(generate_legacy_id(NAME, CDC_LOCAL), NAME, CDC_LOCAL,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, CDC_LOCAL), NAME, CDC_LOCAL,
         // partition key
         {{"key", utf8_type}},
         // clustering key
@@ -830,7 +845,8 @@ schema_ptr scylla_views_builds_in_progress() {
         utf8_type,
         // comment
         "CDC-specific information that the local node stores"
-       )));
+       ));
+       builder.set_gc_grace_seconds(0);
        builder.with_version(generate_schema_version(builder.uuid()));
        return builder.build(schema_builder::compact_storage::no);
     }();
@@ -843,7 +859,7 @@ namespace legacy {
 
 schema_ptr hints() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, HINTS), NAME, HINTS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, HINTS), NAME, HINTS,
         // partition key
         {{"target_id", uuid_type}},
         // clustering key
@@ -856,9 +872,9 @@ schema_ptr hints() {
         utf8_type,
         // comment
         "*DEPRECATED* hints awaiting delivery"
-       )));
+       ));
        builder.set_gc_grace_seconds(0);
-       builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+       builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
        builder.set_compaction_strategy_options({{"enabled", "false"}});
        builder.with_version(generate_schema_version(builder.uuid()));
        builder.with(schema_builder::compact_storage::yes);
@@ -869,7 +885,7 @@ schema_ptr hints() {
 
 schema_ptr batchlog() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, BATCHLOG), NAME, BATCHLOG,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, BATCHLOG), NAME, BATCHLOG,
         // partition key
         {{"id", uuid_type}},
         // clustering key
@@ -882,9 +898,9 @@ schema_ptr batchlog() {
         utf8_type,
         // comment
         "*DEPRECATED* batchlog entries"
-       )));
+       ));
        builder.set_gc_grace_seconds(0);
-       builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+       builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
        builder.set_compaction_strategy_options({{"min_threshold", "2"}});
        builder.with(schema_builder::compact_storage::no);
        builder.with_version(generate_schema_version(builder.uuid()));
@@ -897,7 +913,7 @@ static constexpr auto schema_gc_grace = std::chrono::duration_cast<std::chrono::
 
 schema_ptr keyspaces() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, KEYSPACES), NAME, KEYSPACES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, KEYSPACES), NAME, KEYSPACES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -914,7 +930,7 @@ schema_ptr keyspaces() {
         utf8_type,
         // comment
         "*DEPRECATED* keyspace definitions"
-       )));
+       ));
        builder.set_gc_grace_seconds(schema_gc_grace);
        builder.with(schema_builder::compact_storage::yes);
        builder.with_version(generate_schema_version(builder.uuid()));
@@ -925,7 +941,7 @@ schema_ptr keyspaces() {
 
 schema_ptr column_families() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, COLUMNFAMILIES), NAME, COLUMNFAMILIES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, COLUMNFAMILIES), NAME, COLUMNFAMILIES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -967,7 +983,7 @@ schema_ptr column_families() {
         utf8_type,
         // comment
         "*DEPRECATED* table definitions"
-       )));
+       ));
        builder.set_gc_grace_seconds(schema_gc_grace);
        builder.with(schema_builder::compact_storage::no);
        builder.with_version(generate_schema_version(builder.uuid()));
@@ -978,7 +994,7 @@ schema_ptr column_families() {
 
 schema_ptr columns() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, COLUMNS), NAME, COLUMNS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, COLUMNS), NAME, COLUMNS,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -998,7 +1014,7 @@ schema_ptr columns() {
         utf8_type,
         // comment
         "column definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
         builder.with_version(generate_schema_version(builder.uuid()));
@@ -1009,7 +1025,7 @@ schema_ptr columns() {
 
 schema_ptr triggers() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, TRIGGERS), NAME, TRIGGERS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, TRIGGERS), NAME, TRIGGERS,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -1024,7 +1040,7 @@ schema_ptr triggers() {
         utf8_type,
         // comment
         "trigger definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
         builder.with_version(generate_schema_version(builder.uuid()));
@@ -1035,7 +1051,7 @@ schema_ptr triggers() {
 
 schema_ptr usertypes() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, USERTYPES), NAME, USERTYPES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, USERTYPES), NAME, USERTYPES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -1051,7 +1067,7 @@ schema_ptr usertypes() {
         utf8_type,
         // comment
         "user defined type definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
         builder.with_version(generate_schema_version(builder.uuid()));
@@ -1068,7 +1084,7 @@ schema_ptr functions() {
      * installations of that to migrate, rather than our own (if we dont use the table).
      */
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, FUNCTIONS), NAME, FUNCTIONS,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, FUNCTIONS), NAME, FUNCTIONS,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -1088,7 +1104,7 @@ schema_ptr functions() {
         utf8_type,
         // comment
         "*DEPRECATED* user defined type definitions"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
         builder.with_version(generate_schema_version(builder.uuid()));
@@ -1099,7 +1115,7 @@ schema_ptr functions() {
 
 schema_ptr aggregates() {
     static thread_local auto schema = [] {
-        schema_builder builder(make_lw_shared(::schema(generate_legacy_id(NAME, AGGREGATES), NAME, AGGREGATES,
+        schema_builder builder(make_shared_schema(generate_legacy_id(NAME, AGGREGATES), NAME, AGGREGATES,
         // partition key
         {{"keyspace_name", utf8_type}},
         // clustering key
@@ -1119,7 +1135,7 @@ schema_ptr aggregates() {
         utf8_type,
         // comment
         "*DEPRECATED* user defined aggregate definition"
-        )));
+        ));
         builder.set_gc_grace_seconds(schema_gc_grace);
         builder.with(schema_builder::compact_storage::no);
         builder.with_version(generate_schema_version(builder.uuid()));
@@ -1130,29 +1146,29 @@ schema_ptr aggregates() {
 
 } //</legacy>
 
-static future<> setup_version() {
-    return gms::inet_address::lookup(qctx->db().get_config().rpc_address()).then([](gms::inet_address a) {
+static future<> setup_version(distributed<gms::feature_service>& feat, sharded<netw::messaging_service>& ms, const db::config& cfg) {
+    return gms::inet_address::lookup(cfg.rpc_address()).then([&feat, &ms, &cfg](gms::inet_address a) {
         sstring req = sprint("INSERT INTO system.%s (key, release_version, cql_version, thrift_version, native_protocol_version, data_center, rack, partitioner, rpc_address, broadcast_address, listen_address, supported_features) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                         , db::system_keyspace::LOCAL);
         auto& snitch = locator::i_endpoint_snitch::get_local_snitch_ptr();
 
-        return execute_cql(req, sstring(db::system_keyspace::LOCAL),
+        return qctx->execute_cql(req, sstring(db::system_keyspace::LOCAL),
                              version::release(),
                              cql3::query_processor::CQL_VERSION,
                              ::cassandra::thrift_version,
                              to_sstring(cql_serialization_format::latest_version),
                              snitch->get_datacenter(utils::fb_utilities::get_broadcast_address()),
                              snitch->get_rack(utils::fb_utilities::get_broadcast_address()),
-                             sstring(qctx->db().get_config().partitioner()),
+                             sstring(cfg.partitioner()),
                              a.addr(),
                              utils::fb_utilities::get_broadcast_address().addr(),
-                             netw::get_local_messaging_service().listen_address().addr(),
-                             service::get_local_storage_service().get_config_supported_features()
+                             ms.local().listen_address().addr(),
+                             ::join(",", feat.local().supported_feature_set())
         ).discard_result();
     });
 }
 
-future<> check_health();
+future<> check_health(const sstring& cluster_name);
 future<> force_blocking_flush(sstring cfname);
 
 // Changing the real load_dc_rack_info into a future would trigger a tidal wave of futurization that would spread
@@ -1172,7 +1188,7 @@ struct local_cache {
 static distributed<local_cache> _local_cache;
 
 static future<> build_dc_rack_info() {
-    return execute_cql(format("SELECT peer, data_center, rack from system.{}", PEERS)).then([] (::shared_ptr<cql3::untyped_result_set> msg) {
+    return qctx->execute_cql(format("SELECT peer, data_center, rack from system.{}", PEERS)).then([] (::shared_ptr<cql3::untyped_result_set> msg) {
         return do_for_each(*msg, [] (auto& row) {
             net::inet_address peer = row.template get_as<net::inet_address>("peer");
             if (!row.has("data_center") || !row.has("rack")) {
@@ -1194,7 +1210,7 @@ static future<> build_dc_rack_info() {
 
 static future<> build_bootstrap_info() {
     sstring req = format("SELECT bootstrapped FROM system.{} WHERE key = ? ", LOCAL);
-    return execute_cql(req, sstring(LOCAL)).then([] (auto msg) {
+    return qctx->execute_cql(req, sstring(LOCAL)).then([] (auto msg) {
         static auto state_map = std::unordered_map<sstring, bootstrap_state>({
             { "NEEDS_BOOTSTRAP", bootstrap_state::NEEDS_BOOTSTRAP },
             { "COMPLETED", bootstrap_state::COMPLETED },
@@ -1228,17 +1244,18 @@ future<> deinit_local_cache() {
     return _local_cache.stop();
 }
 
-void minimal_setup(distributed<database>& db, distributed<cql3::query_processor>& qp) {
-    qctx = std::make_unique<query_context>(db, qp);
+void minimal_setup(distributed<cql3::query_processor>& qp) {
+    qctx = std::make_unique<query_context>(qp);
 }
 
 static future<> cache_truncation_record(distributed<database>& db);
 
 future<> setup(distributed<database>& db,
                distributed<cql3::query_processor>& qp,
-               distributed<service::storage_service>& ss) {
-    minimal_setup(db, qp);
-    return setup_version().then([&db] {
+               distributed<gms::feature_service>& feat,
+               sharded<netw::messaging_service>& ms) {
+    const db::config& cfg = db.local().get_config();
+    return setup_version(feat, ms, cfg).then([&db] {
         return update_schema_version(db.local().get_version());
     }).then([] {
         return init_local_cache();
@@ -1246,17 +1263,17 @@ future<> setup(distributed<database>& db,
         return build_dc_rack_info();
     }).then([] {
         return build_bootstrap_info();
-    }).then([] {
-        return check_health();
-    }).then([] {
-        return db::schema_tables::save_system_keyspace_schema();
-    }).then([] {
+    }).then([&cfg] {
+        return check_health(cfg.cluster_name());
+    }).then([&qp] {
+        return db::schema_tables::save_system_keyspace_schema(qp.local());
+    }).then([&qp] {
         // #2514 - make sure "system" is written to system_schema.keyspaces.
-        return db::schema_tables::save_system_schema(NAME);
+        return db::schema_tables::save_system_schema(qp.local(), NAME);
     }).then([&db] {
         return cache_truncation_record(db);
-    }).then([] {
-        return netw::get_messaging_service().invoke_on_all([] (auto& ms){
+    }).then([&ms] {
+        return ms.invoke_on_all([] (auto& ms){
             return ms.init_local_preferred_ip_cache();
         });
     });
@@ -1285,30 +1302,6 @@ typedef utils::UUID truncation_key;
 typedef std::unordered_map<truncation_key, truncation_record> truncation_map;
 
 static constexpr uint8_t current_version = 1;
-static bool need_legacy_truncation_records = true;
-
-static thread_local struct {
-    std::optional<future<>> done;
-    gms::feature::listener_registration reg;
-} migration_complete;
-
-future<> wait_for_truncation_record_migration_complete() {
-    // caller of this helper (test) first synchronously
-    // enables the feature migration_complete listens on,
-    // thus making thie future emplaced here
-    assert(migration_complete.done);
-    return std::move(*migration_complete.done);
-}
-
-/**
- * This method is used to remove information about truncation time for specified column family
- */
-future<> remove_truncation_record(utils::UUID id) {
-    sstring req = format("DELETE * from system.{} WHERE table_uuid = ?", TRUNCATED);
-    return qctx->qp().execute_internal(req, {id}).discard_result().then([] {
-        return force_blocking_flush(TRUNCATED);
-    });
-}
 
 static future<truncation_record> get_truncation_record(utils::UUID cf_id) {
     sstring req = format("SELECT * from system.{} WHERE table_uuid = ?", TRUNCATED);
@@ -1336,155 +1329,15 @@ static future<> cache_truncation_record(distributed<database>& db) {
             auto table_uuid = row.get_as<utils::UUID>("table_uuid");
             auto ts = row.get_as<db_clock::time_point>("truncated_at");
 
-            auto cpus = boost::irange(0u, smp::count);
-            return parallel_for_each(cpus.begin(), cpus.end(), [table_uuid, ts, &db] (unsigned int c) mutable {
-                return smp::submit_to(c, [table_uuid, ts, &db] () mutable {
-                    try {
-                        table& cf = db.local().find_column_family(table_uuid);
-                        cf.cache_truncation_record(ts);
-                    } catch (no_such_column_family&) {
-                        slogger.debug("Skip caching truncation time for {} since the table is no longer present", table_uuid);
-                    }
-                });
-            });
-        });
-    });
-}
-
-future<> migrate_truncation_records(const gms::feature& cluster_supports_truncation_table) {
-    sstring req = format("SELECT truncated_at FROM system.{} WHERE key = '{}'", LOCAL, LOCAL);
-    return qctx->qp().execute_internal(req).then([&cluster_supports_truncation_table](::shared_ptr<cql3::untyped_result_set> rs) {
-        truncation_map tmp;
-        if (!rs->empty() && rs->one().has("truncated_at")) {
-            auto map = rs->one().get_map<utils::UUID, bytes>("truncated_at");
-            for (auto& p : map) {
-                auto uuid = p.first;
-                auto buf = p.second;
-
+            return db.invoke_on_all([table_uuid, ts] (database& db) mutable {
                 try {
-                    truncation_record e;
-
-                    if (buf.size() & 1) {
-                        // new record.
-                        if (buf[0] != current_version) {
-                            slogger.warn("Found truncation record of unknown version {}. Ignoring.", int(buf[0]));
-                            continue;
-                        }
-                        e = ser::deserialize_from_buffer(buf, boost::type<truncation_record>(), 1);
-                        if (e.magic == truncation_record::current_magic) {
-                            tmp[uuid] = e;
-                            continue;
-                        }
-                    } else {
-                        // old scylla records. (We hope)
-                        // Read 64+64 bit RP:s, even though the
-                        // struct (and official serial size) is 64+32.
-                        data_input in(buf);
-
-                        slogger.debug("Reading old type record");
-                        while (in.avail() > sizeof(db_clock::rep)) {
-                            auto id = in.read<uint64_t>();
-                            auto pos = in.read<uint64_t>();
-                            e.positions.emplace_back(id, position_type(pos));
-                        }
-                        if (in.avail() == sizeof(db_clock::rep)) {
-                            e.time_stamp = db_clock::time_point(db_clock::duration(in.read<db_clock::rep>()));
-                            tmp[uuid] = e;
-                            continue;
-                        }
-                    }
-                } catch (std::out_of_range &) {
+                    table& cf = db.find_column_family(table_uuid);
+                    cf.cache_truncation_record(ts);
+                } catch (no_such_column_family&) {
+                    slogger.debug("Skip caching truncation time for {} since the table is no longer present", table_uuid);
                 }
-                // Trying to load an origin table.
-                // This is useless to us, because the only usage for this
-                // data is commit log and batch replay, and we cannot replay
-                // either from origin anyway.
-                slogger.warn("Error reading truncation record for {}. "
-                                "Most likely this is data from a cassandra instance."
-                                "Make sure you have cleared commit and batch logs before upgrading.",
-                                uuid
-                );
-            }
-        }
-
-        auto i = tmp.begin();
-        auto e = tmp.end();
-        return parallel_for_each(i, e, [](const truncation_map::value_type& p) {
-            const utils::UUID& uuid = p.first;
-            const truncation_record& tr = p.second;
-            return get_truncation_record(uuid).then([&](truncation_record new_record) {
-                if (!new_record.positions.empty() && new_record.time_stamp >= tr.time_stamp) {
-                    return make_ready_future<>();
-                }
-                return parallel_for_each(tr.positions, [&](replay_position rp) {
-                    return save_truncation_record(uuid, tr.time_stamp, rp);
-                });
             });
-        }).then([&cluster_supports_truncation_table, tmp = std::move(tmp)] {
-            if (!cluster_supports_truncation_table || !tmp.empty()) {
-                migration_complete.reg = cluster_supports_truncation_table.when_enabled([] {
-                    // this potentially races with a truncation, i.e. someone could be inserting into
-                    // the legacy column while we delete it. But this is ok, it will just mean we have
-                    // some unneeded data and will do a merge again next boot, but eventually we
-                    // will remove the legacy data...
-                    auto level = need_legacy_truncation_records ? seastar::log_level::info : seastar::log_level::debug;
-                    slogger.log(level, "Got cluster agreement on truncation table feature. Removing legacy records.");
-                    need_legacy_truncation_records = false;
-                    sstring req = format("DELETE truncated_at from system.{} WHERE key = '{}'", LOCAL, LOCAL);
-
-                    migration_complete.done = qctx->qp().execute_internal(req).discard_result().then([level] {
-                        slogger.log(level, "Legacy records deleted.");
-                        return force_blocking_flush(LOCAL);
-                    });
-                });
-            }
-            return make_ready_future<>();
         });
-    });
-}
-
-static future<> save_legacy_truncation_records(utils::UUID id, db_clock::time_point truncated_at, replay_positions positions) {
-    truncation_record r;
-
-    r.magic = truncation_record::current_magic;
-    r.time_stamp = truncated_at;
-    r.positions = std::move(positions);
-
-    auto buf = ser::serialize_to_buffer<bytes>(r, sizeof(current_version));
-
-    buf[0] = current_version;
-
-    static_assert(sizeof(current_version) == 1, "using this as mark");
-    assert(buf.size() & 1); // verify we've created an odd-numbered buffer
-
-    map_type_impl::native_type tmp;
-    tmp.emplace_back(id, data_value(buf));
-    auto map_type = map_type_impl::get_instance(uuid_type, bytes_type, true);
-
-    sstring req = format("UPDATE system.{} SET truncated_at = truncated_at + ? WHERE key = '{}'", LOCAL, LOCAL);
-    return qctx->qp().execute_internal(req, {make_map_value(map_type, tmp)}).then([](auto rs) {
-        return force_blocking_flush(LOCAL);
-    });
-}
-
-static future<> maybe_save_legacy_truncation_record(utils::UUID id, db_clock::time_point truncated_at, db::replay_position rp) {
-    if (!need_legacy_truncation_records) {
-        return make_ready_future<>();
-    }
-    // TODO: this is horribly ineffective, we're doing a full flush of all system tables for all cores
-    // once, for each core (calling us). But right now, redesigning so that calling here (or, rather,
-    // save_truncation_records), is done from "somewhere higher, once per machine, not shard" is tricky.
-    // Mainly because drop_tables also uses truncate. And is run per-core as well. Gah.
-    return get_truncation_record(id).then([id, truncated_at, rp](truncation_record e) {
-        auto i = std::find_if(e.positions.begin(), e.positions.end(), [rp](replay_position& p) {
-            return p.shard_id() == rp.shard_id();
-        });
-        if (i == e.positions.end()) {
-            e.positions.emplace_back(rp);
-        } else {
-            *i = rp;
-        }
-        return save_legacy_truncation_records(id, std::max(truncated_at, e.time_stamp), e.positions);
     });
 }
 
@@ -1492,8 +1345,6 @@ future<> save_truncation_record(utils::UUID id, db_clock::time_point truncated_a
     sstring req = format("INSERT INTO system.{} (table_uuid, shard, position, segment_id, truncated_at) VALUES(?,?,?,?,?)", TRUNCATED);
     return qctx->qp().execute_internal(req, {id, int32_t(rp.shard_id()), int32_t(rp.pos), int64_t(rp.base_id()), truncated_at}).discard_result().then([] {
         return force_blocking_flush(TRUNCATED);
-    }).then([=] {
-        return maybe_save_legacy_truncation_record(id, truncated_at, rp);
     });
 }
 
@@ -1550,7 +1401,7 @@ future<> update_tokens(gms::inet_address ep, const std::unordered_set<dht::token
 
     sstring req = format("INSERT INTO system.{} (peer, tokens) VALUES (?, ?)", PEERS);
     auto set_type = set_type_impl::get_instance(utf8_type, true);
-    return execute_cql(req, ep.addr(), make_set_value(set_type, prepare_tokens(tokens))).discard_result().then([] {
+    return qctx->execute_cql(req, ep.addr(), make_set_value(set_type, prepare_tokens(tokens))).discard_result().then([] {
         return force_blocking_flush(PEERS);
     });
 }
@@ -1558,7 +1409,7 @@ future<> update_tokens(gms::inet_address ep, const std::unordered_set<dht::token
 
 future<std::unordered_map<gms::inet_address, std::unordered_set<dht::token>>> load_tokens() {
     sstring req = format("SELECT peer, tokens FROM system.{}", PEERS);
-    return execute_cql(req).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
+    return qctx->execute_cql(req).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
         std::unordered_map<gms::inet_address, std::unordered_set<dht::token>> ret;
         for (auto& row : *cql_result) {
             auto peer = gms::inet_address(row.get_as<net::inet_address>("peer"));
@@ -1576,7 +1427,7 @@ future<std::unordered_map<gms::inet_address, std::unordered_set<dht::token>>> lo
 
 future<std::unordered_map<gms::inet_address, utils::UUID>> load_host_ids() {
     sstring req = format("SELECT peer, host_id FROM system.{}", PEERS);
-    return execute_cql(req).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
+    return qctx->execute_cql(req).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
         std::unordered_map<gms::inet_address, utils::UUID> ret;
         for (auto& row : *cql_result) {
             auto peer = gms::inet_address(row.get_as<net::inet_address>("peer"));
@@ -1590,7 +1441,7 @@ future<std::unordered_map<gms::inet_address, utils::UUID>> load_host_ids() {
 
 future<std::unordered_map<gms::inet_address, sstring>> load_peer_features() {
     sstring req = format("SELECT peer, supported_features FROM system.{}", PEERS);
-    return execute_cql(req).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
+    return qctx->execute_cql(req).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
         std::unordered_map<gms::inet_address, sstring> ret;
         for (auto& row : *cql_result) {
             if (row.has("supported_features")) {
@@ -1604,14 +1455,14 @@ future<std::unordered_map<gms::inet_address, sstring>> load_peer_features() {
 
 future<> update_preferred_ip(gms::inet_address ep, gms::inet_address preferred_ip) {
     sstring req = format("INSERT INTO system.{} (peer, preferred_ip) VALUES (?, ?)", PEERS);
-    return execute_cql(req, ep.addr(), preferred_ip.addr()).discard_result().then([] {
+    return qctx->execute_cql(req, ep.addr(), preferred_ip.addr()).discard_result().then([] {
         return force_blocking_flush(PEERS);
     });
 }
 
 future<std::unordered_map<gms::inet_address, gms::inet_address>> get_preferred_ips() {
     sstring req = format("SELECT peer, preferred_ip FROM system.{}", PEERS);
-    return execute_cql(req).then([] (::shared_ptr<cql3::untyped_result_set> cql_res_set) {
+    return qctx->execute_cql(req).then([] (::shared_ptr<cql3::untyped_result_set> cql_res_set) {
         std::unordered_map<gms::inet_address, gms::inet_address> res;
 
         for (auto& r : *cql_res_set) {
@@ -1652,7 +1503,7 @@ future<> update_peer_info(gms::inet_address ep, sstring column_name, Value value
 
     return update_cached_values(ep, column_name, value).then([ep, column_name, value] {
         sstring req = format("INSERT INTO system.{} (peer, {}) VALUES (?, ?)", PEERS, column_name);
-        return execute_cql(req, ep.addr(), value).discard_result();
+        return qctx->execute_cql(req, ep.addr(), value).discard_result();
     });
 }
 // sets are not needed, since tokens are updated by another method
@@ -1660,20 +1511,14 @@ template future<> update_peer_info<sstring>(gms::inet_address ep, sstring column
 template future<> update_peer_info<utils::UUID>(gms::inet_address ep, sstring column_name, utils::UUID);
 template future<> update_peer_info<net::inet_address>(gms::inet_address ep, sstring column_name, net::inet_address);
 
-future<> update_hints_dropped(gms::inet_address ep, utils::UUID time_period, int value) {
-    // with 30 day TTL
-    sstring req = format("UPDATE system.{} USING TTL 2592000 SET hints_dropped[ ? ] = ? WHERE peer = ?", PEER_EVENTS);
-    return execute_cql(req, time_period, value, ep.addr()).discard_result();
-}
-
 future<> set_scylla_local_param(const sstring& key, const sstring& value) {
     sstring req = format("UPDATE system.{} SET value = ? WHERE key = ?", SCYLLA_LOCAL);
-    return execute_cql(req, value, key).discard_result();
+    return qctx->execute_cql(req, value, key).discard_result();
 }
 
 future<std::optional<sstring>> get_scylla_local_param(const sstring& key){
     sstring req = format("SELECT value FROM system.{} WHERE key = ?", SCYLLA_LOCAL);
-    return execute_cql(req, key).then([] (::shared_ptr<cql3::untyped_result_set> res) {
+    return qctx->execute_cql(req, key).then([] (::shared_ptr<cql3::untyped_result_set> res) {
         if (res->empty() || !res->one().has("value")) {
             return std::optional<sstring>();
         }
@@ -1683,7 +1528,7 @@ future<std::optional<sstring>> get_scylla_local_param(const sstring& key){
 
 future<> update_schema_version(utils::UUID version) {
     sstring req = format("INSERT INTO system.{} (key, schema_version) VALUES (?, ?)", LOCAL);
-    return execute_cql(req, sstring(LOCAL), version).discard_result();
+    return qctx->execute_cql(req, sstring(LOCAL), version).discard_result();
 }
 
 /**
@@ -1694,7 +1539,7 @@ future<> remove_endpoint(gms::inet_address ep) {
         lc._cached_dc_rack_info.erase(ep);
     }).then([ep] {
         sstring req = format("DELETE FROM system.{} WHERE peer = ?", PEERS);
-        return execute_cql(req, ep.addr()).discard_result();
+        return qctx->execute_cql(req, ep.addr()).discard_result();
     }).then([] {
         return force_blocking_flush(PEERS);
     });
@@ -1707,23 +1552,22 @@ future<> update_tokens(const std::unordered_set<dht::token>& tokens) {
 
     sstring req = format("INSERT INTO system.{} (key, tokens) VALUES (?, ?)", LOCAL);
     auto set_type = set_type_impl::get_instance(utf8_type, true);
-    return execute_cql(req, sstring(LOCAL), make_set_value(set_type, prepare_tokens(tokens))).discard_result().then([] {
+    return qctx->execute_cql(req, sstring(LOCAL), make_set_value(set_type, prepare_tokens(tokens))).discard_result().then([] {
         return force_blocking_flush(LOCAL);
     });
 }
 
 future<> update_cdc_streams_timestamp(db_clock::time_point tp) {
-    return execute_cql(format("INSERT INTO system.{} (key, streams_timestamp) VALUES (?, ?)",
+    return qctx->execute_cql(format("INSERT INTO system.{} (key, streams_timestamp) VALUES (?, ?)",
                 v3::CDC_LOCAL), sstring(v3::CDC_LOCAL), tp)
             .discard_result().then([] { return force_blocking_flush(v3::CDC_LOCAL); });
 }
 
 future<> force_blocking_flush(sstring cfname) {
     assert(qctx);
-    return qctx->_db.invoke_on_all([cfname = std::move(cfname)](database& db) {
+    return qctx->_qp.invoke_on_all([cfname = std::move(cfname)] (cql3::query_processor& qp) {
         // if (!Boolean.getBoolean("cassandra.unsafesystem"))
-        column_family& cf = db.find_column_family(NAME, cfname);
-        return cf.flush();
+        return qp.db().flush(NAME, cfname);
     });
 }
 
@@ -1733,17 +1577,16 @@ future<> force_blocking_flush(sstring cfname) {
  * 2. no files are there: great (new node is assumed)
  * 3. files are present but you can't read them: bad
  */
-future<> check_health() {
+future<> check_health(const sstring& cluster_name) {
     using namespace cql_transport::messages;
     sstring req = format("SELECT cluster_name FROM system.{} WHERE key=?", LOCAL);
-    return execute_cql(req, sstring(LOCAL)).then([] (::shared_ptr<cql3::untyped_result_set> msg) {
+    return qctx->execute_cql(req, sstring(LOCAL)).then([&cluster_name] (::shared_ptr<cql3::untyped_result_set> msg) {
         if (msg->empty() || !msg->one().has("cluster_name")) {
             // this is a brand new node
             sstring ins_req = format("INSERT INTO system.{} (key, cluster_name) VALUES (?, ?)", LOCAL);
-            return execute_cql(ins_req, sstring(LOCAL), qctx->db().get_config().cluster_name()).discard_result();
+            return qctx->execute_cql(ins_req, sstring(LOCAL), cluster_name).discard_result();
         } else {
             auto saved_cluster_name = msg->one().get_as<sstring>("cluster_name");
-            auto cluster_name = qctx->db().get_config().cluster_name();
 
             if (cluster_name != saved_cluster_name) {
                 throw exceptions::configuration_exception("Saved cluster name " + saved_cluster_name + " != configured name " + cluster_name);
@@ -1756,7 +1599,7 @@ future<> check_health() {
 
 future<std::unordered_set<dht::token>> get_saved_tokens() {
     sstring req = format("SELECT tokens FROM system.{} WHERE key = ?", LOCAL);
-    return execute_cql(req, sstring(LOCAL)).then([] (auto msg) {
+    return qctx->execute_cql(req, sstring(LOCAL)).then([] (auto msg) {
         if (msg->empty() || !msg->one().has("tokens")) {
             return make_ready_future<std::unordered_set<dht::token>>();
         }
@@ -1782,7 +1625,7 @@ future<std::unordered_set<dht::token>> get_local_tokens() {
 }
 
 future<std::optional<db_clock::time_point>> get_saved_cdc_streams_timestamp() {
-    return execute_cql(format("SELECT streams_timestamp FROM system.{} WHERE key = ?", v3::CDC_LOCAL), sstring(v3::CDC_LOCAL))
+    return qctx->execute_cql(format("SELECT streams_timestamp FROM system.{} WHERE key = ?", v3::CDC_LOCAL), sstring(v3::CDC_LOCAL))
             .then([] (::shared_ptr<cql3::untyped_result_set> msg)-> std::optional<db_clock::time_point> {
         if (msg->empty() || !msg->one().has("streams_timestamp")) {
             return {};
@@ -1819,7 +1662,7 @@ future<> set_bootstrap_state(bootstrap_state state) {
     sstring state_name = state_to_name.at(state);
 
     sstring req = format("INSERT INTO system.{} (key, bootstrapped) VALUES (?, ?)", LOCAL);
-    return execute_cql(req, sstring(LOCAL), state_name).discard_result().then([state] {
+    return qctx->execute_cql(req, sstring(LOCAL), state_name).discard_result().then([state] {
         return force_blocking_flush(LOCAL).then([state] {
             return _local_cache.invoke_on_all([state] (local_cache& lc) {
                 lc._state = state;
@@ -1836,7 +1679,8 @@ std::vector<schema_ptr> all_tables() {
                     peers(), peer_events(), range_xfers(),
                     compactions_in_progress(), compaction_history(),
                     sstable_activity(), clients(), size_estimates(), large_partitions(), large_rows(), large_cells(),
-                    scylla_local(), v3::views_builds_in_progress(), v3::built_views(),
+                    scylla_local(), db::schema_tables::scylla_table_schema_history(),
+                    v3::views_builds_in_progress(), v3::built_views(),
                     v3::scylla_views_builds_in_progress(),
                     v3::truncated(),
                     v3::cdc_local(),
@@ -1870,6 +1714,7 @@ static bool maybe_write_in_user_memory(schema_ptr s, database& db) {
 }
 
 void make(database& db, bool durable, bool volatile_testing_only) {
+    auto enable_cache = db.get_config().enable_cache();
     for (auto&& table : all_tables()) {
         auto ks_name = table->ks_name();
         if (!db.has_keyspace(ks_name)) {
@@ -1882,13 +1727,12 @@ void make(database& db, bool durable, bool volatile_testing_only) {
             kscfg.enable_disk_reads = !volatile_testing_only;
             kscfg.enable_disk_writes = !volatile_testing_only;
             kscfg.enable_commitlog = !volatile_testing_only;
-            kscfg.enable_cache = true;
-            // don't make system keyspace reads wait for user reads
-            kscfg.read_concurrency_semaphore = &db._system_read_concurrency_sem;
+            kscfg.enable_cache = enable_cache;
+            kscfg.compaction_concurrency_semaphore = &db._compaction_concurrency_sem;
             // don't make system keyspace writes wait for user writes (if under pressure)
             kscfg.dirty_memory_manager = &db._system_dirty_memory_manager;
             keyspace _ks{ksm, std::move(kscfg)};
-            auto rs(locator::abstract_replication_strategy::create_replication_strategy(NAME, "LocalStrategy", db.get_token_metadata(), ksm->strategy_options()));
+            auto rs(locator::abstract_replication_strategy::create_replication_strategy(NAME, "LocalStrategy", db.get_shared_token_metadata(), ksm->strategy_options()));
             _ks.set_replication_strategy(std::move(rs));
             db.add_keyspace(ks_name, std::move(_ks));
         }
@@ -1908,7 +1752,7 @@ void make(database& db, bool durable, bool volatile_testing_only) {
 future<utils::UUID> get_local_host_id() {
     using namespace cql_transport::messages;
     sstring req = format("SELECT host_id FROM system.{} WHERE key=?", LOCAL);
-    return execute_cql(req, sstring(LOCAL)).then([] (::shared_ptr<cql3::untyped_result_set> msg) {
+    return qctx->execute_cql(req, sstring(LOCAL)).then([] (::shared_ptr<cql3::untyped_result_set> msg) {
         auto new_id = [] {
             auto host_id = utils::make_random_uuid();
             return set_local_host_id(host_id);
@@ -1924,7 +1768,7 @@ future<utils::UUID> get_local_host_id() {
 
 future<utils::UUID> set_local_host_id(const utils::UUID& host_id) {
     sstring req = format("INSERT INTO system.{} (key, host_id) VALUES (?, ?)", LOCAL);
-    return execute_cql(req, sstring(LOCAL), host_id).then([] (auto msg) {
+    return qctx->execute_cql(req, sstring(LOCAL), host_id).then([] (auto msg) {
         return force_blocking_flush(LOCAL);
     }).then([host_id] {
         return host_id;
@@ -1936,30 +1780,12 @@ load_dc_rack_info() {
     return _local_cache.local()._cached_dc_rack_info;
 }
 
-
-future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
-query_mutations(distributed<service::storage_proxy>& proxy, const sstring& cf_name) {
-    return query_mutations(proxy, db::system_keyspace::NAME, cf_name);
-}
-
-future<lw_shared_ptr<query::result_set>>
-query(distributed<service::storage_proxy>& proxy, const sstring& cf_name) {
-    return query(proxy, db::system_keyspace::NAME, cf_name);
-}
-
-future<lw_shared_ptr<query::result_set>>
-query(distributed<service::storage_proxy>& proxy, const sstring& cf_name, const dht::decorated_key& key, query::clustering_range row_range)
-{
-    return query(proxy, db::system_keyspace::NAME, cf_name, key, row_range);
-}
-
 future<foreign_ptr<lw_shared_ptr<reconcilable_result>>>
 query_mutations(distributed<service::storage_proxy>& proxy, const sstring& ks_name, const sstring& cf_name) {
     database& db = proxy.local().get_db().local();
     schema_ptr schema = db.find_schema(ks_name, cf_name);
     auto slice = partition_slice_builder(*schema).build();
-    auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(),
-        std::move(slice), std::numeric_limits<uint32_t>::max());
+    auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), proxy.local().get_max_result_size(slice));
     return proxy.local().query_mutations_locally(std::move(schema), std::move(cmd), query::full_partition_range, db::no_timeout)
             .then([] (rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature> rr_ht) { return std::get<0>(std::move(rr_ht)); });
 }
@@ -1969,11 +1795,10 @@ query(distributed<service::storage_proxy>& proxy, const sstring& ks_name, const 
     database& db = proxy.local().get_db().local();
     schema_ptr schema = db.find_schema(ks_name, cf_name);
     auto slice = partition_slice_builder(*schema).build();
-    auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(),
-        std::move(slice), std::numeric_limits<uint32_t>::max());
+    auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), proxy.local().get_max_result_size(slice));
     return proxy.local().query(schema, cmd, {query::full_partition_range}, db::consistency_level::ONE,
             {db::no_timeout, empty_service_permit(), service::client_state::for_internal_calls(), nullptr}).then([schema, cmd] (auto&& qr) {
-        return make_lw_shared(query::result_set::from_raw_result(schema, cmd->slice, *qr.query_result));
+        return make_lw_shared<query::result_set>(query::result_set::from_raw_result(schema, cmd->slice, *qr.query_result));
     });
 }
 
@@ -1985,11 +1810,11 @@ query(distributed<service::storage_proxy>& proxy, const sstring& ks_name, const 
     auto slice = partition_slice_builder(*schema)
         .with_range(std::move(row_range))
         .build();
-    auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), query::max_rows);
+    auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), std::move(slice), proxy.local().get_max_result_size(slice));
 
     return proxy.local().query(schema, cmd, {dht::partition_range::make_singular(key)}, db::consistency_level::ONE,
             {db::no_timeout, empty_service_permit(), service::client_state::for_internal_calls(), nullptr}).then([schema, cmd] (auto&& qr) {
-        return make_lw_shared(query::result_set::from_raw_result(schema, cmd->slice, *qr.query_result));
+        return make_lw_shared<query::result_set>(query::result_set::from_raw_result(schema, cmd->slice, *qr.query_result));
     });
 }
 
@@ -2004,7 +1829,7 @@ static map_type_impl::native_type prepare_rows_merged(std::unordered_map<int32_t
     return tmp;
 }
 
-future<> update_compaction_history(sstring ksname, sstring cfname, int64_t compacted_at, int64_t bytes_in, int64_t bytes_out,
+future<> update_compaction_history(utils::UUID uuid, sstring ksname, sstring cfname, int64_t compacted_at, int64_t bytes_in, int64_t bytes_out,
                                    std::unordered_map<int32_t, int64_t> rows_merged)
 {
     // don't write anything when the history table itself is compacted, since that would in turn cause new compactions
@@ -2018,7 +1843,7 @@ future<> update_compaction_history(sstring ksname, sstring cfname, int64_t compa
                     , COMPACTION_HISTORY);
 
     db_clock::time_point tp{db_clock::duration{compacted_at}};
-    return execute_cql(req, utils::UUID_gen::get_time_UUID(), ksname, cfname, tp, bytes_in, bytes_out,
+    return qctx->execute_cql(req, uuid, ksname, cfname, tp, bytes_in, bytes_out,
                        make_map_value(map_type, prepare_rows_merged(rows_merged))).discard_result().handle_exception([] (auto ep) {
         slogger.error("update compaction history failed: {}: ignored", ep);
     });
@@ -2054,11 +1879,11 @@ future<int> increment_and_get_generation() {
             // seconds-since-epoch isn't a foolproof new generation
             // (where foolproof is "guaranteed to be larger than the last one seen at this ip address"),
             // but it's as close as sanely possible
-            generation = service::get_generation_number();
+            generation = utils::get_generation_number();
         } else {
             // Other nodes will ignore gossip messages about a node that have a lower generation than previously seen.
             int stored_generation = rs->one().template get_as<int>("gossip_generation") + 1;
-            int now = service::get_generation_number();
+            int now = utils::get_generation_number();
             if (stored_generation >= now) {
                 slogger.warn("Using stored Gossip Generation {} as it is greater than current system time {}."
                             "See CASSANDRA-3654 if you experience problems", stored_generation, now);
@@ -2095,7 +1920,7 @@ mutation make_size_estimates_mutation(const sstring& ks, std::vector<range_estim
 future<> register_view_for_building(sstring ks_name, sstring view_name, const dht::token& token) {
     sstring req = format("INSERT INTO system.{} (keyspace_name, view_name, generation_number, cpu_id, first_token) VALUES (?, ?, ?, ?, ?)",
             v3::SCYLLA_VIEWS_BUILDS_IN_PROGRESS);
-    return execute_cql(
+    return qctx->execute_cql(
             std::move(req),
             std::move(ks_name),
             std::move(view_name),
@@ -2107,7 +1932,7 @@ future<> register_view_for_building(sstring ks_name, sstring view_name, const dh
 future<> update_view_build_progress(sstring ks_name, sstring view_name, const dht::token& token) {
     sstring req = format("INSERT INTO system.{} (keyspace_name, view_name, next_token, cpu_id) VALUES (?, ?, ?, ?)",
             v3::SCYLLA_VIEWS_BUILDS_IN_PROGRESS);
-    return execute_cql(
+    return qctx->execute_cql(
             std::move(req),
             std::move(ks_name),
             std::move(view_name),
@@ -2116,14 +1941,14 @@ future<> update_view_build_progress(sstring ks_name, sstring view_name, const dh
 }
 
 future<> remove_view_build_progress_across_all_shards(sstring ks_name, sstring view_name) {
-    return execute_cql(
+    return qctx->execute_cql(
             format("DELETE FROM system.{} WHERE keyspace_name = ? AND view_name = ?", v3::SCYLLA_VIEWS_BUILDS_IN_PROGRESS),
             std::move(ks_name),
             std::move(view_name)).discard_result();
 }
 
 future<> remove_view_build_progress(sstring ks_name, sstring view_name) {
-    return execute_cql(
+    return qctx->execute_cql(
             format("DELETE FROM system.{} WHERE keyspace_name = ? AND view_name = ? AND cpu_id = ?", v3::SCYLLA_VIEWS_BUILDS_IN_PROGRESS),
             std::move(ks_name),
             std::move(view_name),
@@ -2131,21 +1956,21 @@ future<> remove_view_build_progress(sstring ks_name, sstring view_name) {
 }
 
 future<> mark_view_as_built(sstring ks_name, sstring view_name) {
-    return execute_cql(
+    return qctx->execute_cql(
             format("INSERT INTO system.{} (keyspace_name, view_name) VALUES (?, ?)", v3::BUILT_VIEWS),
             std::move(ks_name),
             std::move(view_name)).discard_result();
 }
 
 future<> remove_built_view(sstring ks_name, sstring view_name) {
-    return execute_cql(
+    return qctx->execute_cql(
             format("DELETE FROM system.{} WHERE keyspace_name = ? AND view_name = ?", v3::BUILT_VIEWS),
             std::move(ks_name),
             std::move(view_name)).discard_result();
 }
 
 future<std::vector<view_name>> load_built_views() {
-    return execute_cql(format("SELECT * FROM system.{}", v3::BUILT_VIEWS)).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
+    return qctx->execute_cql(format("SELECT * FROM system.{}", v3::BUILT_VIEWS)).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
         return boost::copy_range<std::vector<view_name>>(*cql_result
                 | boost::adaptors::transformed([] (const cql3::untyped_result_set::row& row) {
             auto ks_name = row.get_as<sstring>("keyspace_name");
@@ -2156,7 +1981,7 @@ future<std::vector<view_name>> load_built_views() {
 }
 
 future<std::vector<view_build_progress>> load_view_build_progress() {
-    return execute_cql(format("SELECT keyspace_name, view_name, first_token, next_token, cpu_id FROM system.{}",
+    return qctx->execute_cql(format("SELECT keyspace_name, view_name, first_token, next_token, cpu_id FROM system.{}",
             v3::SCYLLA_VIEWS_BUILDS_IN_PROGRESS)).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
         std::vector<view_build_progress> progress;
         for (auto& row : *cql_result) {
@@ -2176,16 +2001,19 @@ future<std::vector<view_build_progress>> load_view_build_progress() {
                     static_cast<shard_id>(cpu_id)});
         }
         return progress;
+    }).handle_exception([] (const std::exception_ptr& eptr) {
+        slogger.warn("Failed to load view build progress: {}", eptr);
+        return std::vector<view_build_progress>();
     });
 }
 
-future<service::paxos::paxos_state> load_paxos_state(const partition_key& key, schema_ptr s, gc_clock::time_point now,
+future<service::paxos::paxos_state> load_paxos_state(partition_key_view key, schema_ptr s, gc_clock::time_point now,
         db::timeout_clock::time_point timeout) {
     static auto cql = format("SELECT * FROM system.{} WHERE row_key = ? AND cf_id = ?", PAXOS);
     // FIXME: we need execute_cql_with_now()
     (void)now;
-    auto f = execute_cql_with_timeout(cql, timeout, to_legacy(*key.get_compound_type(*s), key.representation()), s->id());
-    return f.then([s] (shared_ptr<cql3::untyped_result_set> results) mutable {
+    auto f = qctx->execute_cql_with_timeout(cql, timeout, to_legacy(*key.get_compound_type(*s), key.representation()), s->id());
+    return f.then([s, key = std::move(key)] (shared_ptr<cql3::untyped_result_set> results) mutable {
         if (results->empty()) {
             return service::paxos::paxos_state();
         }
@@ -2200,9 +2028,14 @@ future<service::paxos::paxos_state> load_paxos_state(const partition_key& key, s
         }
 
         std::optional<service::paxos::proposal> most_recent;
-        if (row.has("most_recent_commit")) {
+        if (row.has("most_recent_commit_at")) {
+            // the value can be missing if it was pruned, suply empty one since
+            // it will not going to be used anyway
+            auto fm = row.has("most_recent_commit") ?
+                     ser::deserialize_from_buffer<>(row.get_blob("most_recent_commit"), boost::type<frozen_mutation>(), 0) :
+                     freeze(mutation(s, key));
             most_recent = service::paxos::proposal(row.get_as<utils::UUID>("most_recent_commit_at"),
-                    ser::deserialize_from_buffer<>(row.get_blob("most_recent_commit"), boost::type<frozen_mutation>(), 0));
+                    std::move(fm));
         }
 
         return service::paxos::paxos_state(promised, std::move(accepted), std::move(most_recent));
@@ -2210,15 +2043,15 @@ future<service::paxos::paxos_state> load_paxos_state(const partition_key& key, s
 }
 
 static int32_t paxos_ttl_sec(const schema& s) {
-    // Keep paxos state around for at least 3h or gc_grace_seconds. If one of the Paxos participants
-    // is down for longer than gc_grace_seconds it is considered to be dead and must rebootstrap.
+    // Keep paxos state around for paxos_grace_seconds. If one of the Paxos participants
+    // is down for longer than paxos_grace_seconds it is considered to be dead and must rebootstrap.
     // Otherwise its Paxos table state will be repaired by nodetool repair or Paxos repair.
-    return std::max<int32_t>(3 * 3600, std::chrono::duration_cast<std::chrono::seconds>(s.gc_grace_seconds()).count());
+    return std::chrono::duration_cast<std::chrono::seconds>(s.paxos_grace_seconds()).count();
 }
 
 future<> save_paxos_promise(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout) {
     static auto cql = format("UPDATE system.{} USING TIMESTAMP ? AND TTL ? SET promise = ? WHERE row_key = ? AND cf_id = ?", PAXOS);
-    return execute_cql_with_timeout(cql,
+    return qctx->execute_cql_with_timeout(cql,
             timeout,
             utils::UUID_gen::micros_timestamp(ballot),
             paxos_ttl_sec(s),
@@ -2229,12 +2062,13 @@ future<> save_paxos_promise(const schema& s, const partition_key& key, const uti
 }
 
 future<> save_paxos_proposal(const schema& s, const service::paxos::proposal& proposal, db::timeout_clock::time_point timeout) {
-    static auto cql = format("UPDATE system.{} USING TIMESTAMP ? AND TTL ? SET proposal_ballot = ?, proposal = ? WHERE row_key = ? AND cf_id = ?", PAXOS);
+    static auto cql = format("UPDATE system.{} USING TIMESTAMP ? AND TTL ? SET promise = ?, proposal_ballot = ?, proposal = ? WHERE row_key = ? AND cf_id = ?", PAXOS);
     partition_key_view key = proposal.update.key();
-    return execute_cql_with_timeout(cql,
+    return qctx->execute_cql_with_timeout(cql,
             timeout,
             utils::UUID_gen::micros_timestamp(proposal.ballot),
             paxos_ttl_sec(s),
+            proposal.ballot,
             proposal.ballot,
             ser::serialize_to_buffer<bytes>(proposal.update),
             to_legacy(*key.get_compound_type(s), key.representation()),
@@ -2252,7 +2086,7 @@ future<> save_paxos_decision(const schema& s, const service::paxos::proposal& de
     static auto cql = format("UPDATE system.{} USING TIMESTAMP ? AND TTL ? SET proposal_ballot = null, proposal = null,"
             " most_recent_commit_at = ?, most_recent_commit = ? WHERE row_key = ? AND cf_id = ?", PAXOS);
     partition_key_view key = decision.update.key();
-    return execute_cql_with_timeout(cql,
+    return qctx->execute_cql_with_timeout(cql,
             timeout,
             utils::UUID_gen::micros_timestamp(decision.ballot),
             paxos_ttl_sec(s),
@@ -2265,11 +2099,11 @@ future<> save_paxos_decision(const schema& s, const service::paxos::proposal& de
 
 future<> delete_paxos_decision(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout) {
     // This should be called only if a learn stage succeeded on all replicas.
-    // In this case we can remove the paxos row using ballot's timestamp which
+    // In this case we can remove learned paxos value using ballot's timestamp which
     // guarantees that if there is more recent round it will not be affected.
-    static auto cql = format("DELETE FROM system.{} USING TIMESTAMP ?  WHERE row_key = ? AND cf_id = ?", PAXOS);
+    static auto cql = format("DELETE most_recent_commit FROM system.{} USING TIMESTAMP ?  WHERE row_key = ? AND cf_id = ?", PAXOS);
 
-    return execute_cql_with_timeout(cql,
+    return qctx->execute_cql_with_timeout(cql,
             timeout,
             utils::UUID_gen::micros_timestamp(ballot),
             to_legacy(*key.get_compound_type(s), key.representation()),

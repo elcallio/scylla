@@ -40,6 +40,7 @@
 #include "view_info.hh"
 #include "schema_builder.hh"
 #include "database.hh"
+#include "db/schema_tables.hh"
 #include "types/user.hh"
 
 namespace service {
@@ -52,8 +53,8 @@ using namespace std::chrono_literals;
 
 const std::chrono::milliseconds migration_manager::migration_delay = 60000ms;
 
-migration_manager::migration_manager(migration_notifier& notifier, gms::feature_service& feat) :
-        _notifier(notifier), _feat(feat)
+migration_manager::migration_manager(migration_notifier& notifier, gms::feature_service& feat, netw::messaging_service& ms) :
+        _notifier(notifier), _feat(feat), _messaging(ms)
 {
 }
 
@@ -61,9 +62,6 @@ future<> migration_manager::stop()
 {
     mlogger.info("stopping migration service");
     _as.request_abort();
-    if (!_cluster_upgraded) {
-        _wait_cluster_upgraded.broken();
-    }
 
   return uninit_messaging_service().then([this] {
     return parallel_for_each(_schema_pulls.begin(), _schema_pulls.end(), [] (auto&& e) {
@@ -81,7 +79,7 @@ void migration_manager::init_messaging_service()
         //FIXME: future discarded.
         (void)with_gate(_background_tasks, [this] {
             mlogger.debug("features changed, recalculating schema version");
-            return update_schema_version_and_announce(get_storage_proxy(), _feat.cluster_schema_features());
+            return db::schema_tables::recalculate_schema_version(get_storage_proxy(), _feat);
         });
     };
 
@@ -91,16 +89,9 @@ void migration_manager::init_messaging_service()
         _feature_listeners.push_back(_feat.cluster_supports_cdc().when_enabled(update_schema));
         _feature_listeners.push_back(_feat.cluster_supports_per_table_partitioners().when_enabled(update_schema));
         _feature_listeners.push_back(_feat.cluster_supports_in_memory_tables().when_enabled(update_schema));
-        _feature_listeners.push_back(_feat.cluster_supports_xxhash_digest_algorithm().when_enabled(update_schema));
-        _feature_listeners.push_back(_feat.cluster_supports_range_tombstones().when_enabled(update_schema));
     }
-    _feature_listeners.push_back(_feat.cluster_supports_schema_tables_v3().when_enabled([this] {
-        _cluster_upgraded = true;
-        _wait_cluster_upgraded.broadcast();
-    }));
 
-    auto& ms = netw::get_local_messaging_service();
-    ms.register_definitions_update([this] (const rpc::client_info& cinfo, std::vector<frozen_mutation> fm, rpc::optional<std::vector<canonical_mutation>> cm) {
+    _messaging.register_definitions_update([this] (const rpc::client_info& cinfo, std::vector<frozen_mutation> fm, rpc::optional<std::vector<canonical_mutation>> cm) {
         auto src = netw::messaging_service::get_source(cinfo);
         auto f = make_ready_future<>();
         if (cm) {
@@ -122,16 +113,11 @@ void migration_manager::init_messaging_service()
         });
         return netw::messaging_service::no_wait();
     });
-    ms.register_migration_request([this] (const rpc::client_info& cinfo, rpc::optional<netw::schema_pull_options> options) {
+    _messaging.register_migration_request([this] (const rpc::client_info& cinfo, rpc::optional<netw::schema_pull_options> options) {
         using frozen_mutations = std::vector<frozen_mutation>;
         using canonical_mutations = std::vector<canonical_mutation>;
         const auto cm_retval_supported = options && options->remote_supports_canonical_mutation_retval;
 
-        auto src = netw::messaging_service::get_source(cinfo);
-        if (!has_compatible_schema_tables_version(src.addr)) {
-            mlogger.debug("Ignoring schema request from incompatible node: {}", src);
-            return make_ready_future<rpc::tuple<frozen_mutations, canonical_mutations>>(rpc::tuple(frozen_mutations{}, canonical_mutations{}));
-        }
         auto features = _feat.cluster_schema_features();
         auto& proxy = get_storage_proxy();
         return db::schema_tables::convert_schema_to_mutations(proxy, features).then([&proxy, cm_retval_supported] (std::vector<canonical_mutation>&& cm) {
@@ -147,19 +133,27 @@ void migration_manager::init_messaging_service()
             // keep local proxy alive
         });
     });
-    ms.register_schema_check([] {
+    _messaging.register_schema_check([] {
         return make_ready_future<utils::UUID>(service::get_local_storage_proxy().get_db().local().get_version());
+    });
+    _messaging.register_get_schema_version([this] (unsigned shard, table_schema_version v) {
+        get_local_storage_proxy().get_stats().replica_cross_shard_ops += shard != this_shard_id();
+        // FIXME: should this get an smp_service_group? Probably one separate from reads and writes.
+        return container().invoke_on(shard, [v] (auto&& sp) {
+            mlogger.debug("Schema version request for {}", v);
+            return local_schema_registry().get_frozen(v);
+        });
     });
 }
 
 future<> migration_manager::uninit_messaging_service()
 {
-    auto& ms = netw::get_local_messaging_service();
     return when_all_succeed(
-        ms.unregister_migration_request(),
-        ms.unregister_definitions_update(),
-        ms.unregister_schema_check()
-    );
+        _messaging.unregister_migration_request(),
+        _messaging.unregister_definitions_update(),
+        _messaging.unregister_schema_check(),
+        _messaging.unregister_get_schema_version()
+    ).discard_result();
 }
 
 void migration_notifier::register_listener(migration_listener* listener)
@@ -227,15 +221,6 @@ future<> migration_manager::maybe_schedule_schema_pull(const utils::UUID& their_
         return make_ready_future<>();
     }
 
-    // Disable pulls during rolling upgrade from 1.7 to 2.0 to avoid
-    // schema version inconsistency. See https://github.com/scylladb/scylla/issues/2802.
-    if (!_cluster_upgraded) {
-        mlogger.debug("Delaying pull with {} until cluster upgrade is complete", endpoint);
-        return _wait_cluster_upgraded.wait().then([this, their_version, endpoint] {
-            return maybe_schedule_schema_pull(their_version, endpoint);
-        }).finally([me = shared_from_this()] {});
-    }
-
     if (db.get_version() == database::empty_version || runtime::get_uptime() < migration_delay) {
         // If we think we may be bootstrapping or have recently started, submit MigrationTask immediately
         mlogger.debug("Submitting migration task for {}", endpoint);
@@ -276,9 +261,8 @@ future<> migration_manager::submit_migration_task(const gms::inet_address& endpo
 
 future<> migration_manager::do_merge_schema_from(netw::messaging_service::msg_addr id)
 {
-    auto& ms = netw::get_local_messaging_service();
     mlogger.info("Pulling schema from {}", id);
-    return ms.send_migration_request(std::move(id), netw::schema_pull_options{}).then([this, id] (
+    return _messaging.send_migration_request(std::move(id), netw::schema_pull_options{}).then([this, id] (
             rpc::tuple<std::vector<frozen_mutation>, rpc::optional<std::vector<canonical_mutation>>> frozen_and_canonical_mutations) {
         auto&& [mutations, canonical_mutations] = frozen_and_canonical_mutations;
         if (canonical_mutations) {
@@ -333,9 +317,9 @@ future<> migration_manager::merge_schema_from(netw::messaging_service::msg_addr 
 future<> migration_manager::merge_schema_from(netw::messaging_service::msg_addr src, const std::vector<frozen_mutation>& mutations)
 {
     mlogger.debug("Applying schema mutations from {}", src);
-    return map_reduce(mutations, [src](const frozen_mutation& fm) {
+    return map_reduce(mutations, [this, src](const frozen_mutation& fm) {
         // schema table's schema is not syncable so just use get_schema_definition()
-        return get_schema_definition(fm.schema_version(), src).then([&fm](schema_ptr s) {
+        return get_schema_definition(fm.schema_version(), src, _messaging).then([&fm](schema_ptr s) {
             s->registry_entry()->mark_synced();
             return fm.unfreeze(std::move(s));
         });
@@ -588,26 +572,22 @@ public void notifyDropAggregate(UDAggregate udf)
 }
 #endif
 
-future<> migration_manager::announce_keyspace_update(lw_shared_ptr<keyspace_metadata> ksm, bool announce_locally) {
-    return announce_keyspace_update(ksm, api::new_timestamp(), announce_locally);
-}
-
-future<> migration_manager::announce_keyspace_update(lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type timestamp, bool announce_locally) {
+future<> migration_manager::announce_keyspace_update(lw_shared_ptr<keyspace_metadata> ksm) {
     auto& proxy = get_local_storage_proxy();
     auto& db = proxy.get_db().local();
 
     db.validate_keyspace_update(*ksm);
     mlogger.info("Update Keyspace: {}", ksm);
-    auto mutations = db::schema_tables::make_create_keyspace_mutations(ksm, timestamp);
-    return announce(std::move(mutations), announce_locally);
+    auto mutations = db::schema_tables::make_create_keyspace_mutations(ksm, api::new_timestamp());
+    return announce(std::move(mutations));
 }
 
-future<>migration_manager::announce_new_keyspace(lw_shared_ptr<keyspace_metadata> ksm, bool announce_locally)
+future<>migration_manager::announce_new_keyspace(lw_shared_ptr<keyspace_metadata> ksm)
 {
-    return announce_new_keyspace(ksm, api::new_timestamp(), announce_locally);
+    return announce_new_keyspace(ksm, api::new_timestamp());
 }
 
-future<> migration_manager::announce_new_keyspace(lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type timestamp, bool announce_locally)
+future<> migration_manager::announce_new_keyspace(lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type timestamp)
 {
     auto& proxy = get_local_storage_proxy();
     auto& db = proxy.get_db().local();
@@ -615,7 +595,7 @@ future<> migration_manager::announce_new_keyspace(lw_shared_ptr<keyspace_metadat
     db.validate_new_keyspace(*ksm);
     mlogger.info("Create new Keyspace: {}", ksm);
     auto mutations = db::schema_tables::make_create_keyspace_mutations(ksm, timestamp);
-    return announce(std::move(mutations), announce_locally);
+    return announce(std::move(mutations));
 }
 
 future<> migration_manager::validate(schema_ptr schema) {
@@ -624,26 +604,26 @@ future<> migration_manager::validate(schema_ptr schema) {
     });
 }
 
-future<> migration_manager::announce_new_column_family(schema_ptr cfm, bool announce_locally)
+future<> migration_manager::announce_new_column_family(schema_ptr cfm)
 {
-    return announce_new_column_family(std::move(cfm), api::new_timestamp(), announce_locally);
+    return announce_new_column_family(std::move(cfm), api::new_timestamp());
 }
 
 future<> migration_manager::include_keyspace_and_announce(
-        const keyspace_metadata& keyspace, std::vector<mutation> mutations, bool announce_locally) {
+        const keyspace_metadata& keyspace, std::vector<mutation> mutations) {
     // Include the serialized keyspace in case the target node missed a CREATE KEYSPACE migration (see CASSANDRA-5631).
     return db::schema_tables::read_keyspace_mutation(service::get_storage_proxy(), keyspace.name())
-            .then([announce_locally, mutations = std::move(mutations)] (mutation m) mutable {
+            .then([mutations = std::move(mutations)] (mutation m) mutable {
                 mutations.push_back(std::move(m));
-                return migration_manager::announce(std::move(mutations), announce_locally);
+                return migration_manager::announce(std::move(mutations));
             });
 }
 
-future<> migration_manager::announce_new_column_family(schema_ptr cfm, api::timestamp_type timestamp, bool announce_locally) {
+future<> migration_manager::announce_new_column_family(schema_ptr cfm, api::timestamp_type timestamp) {
 #if 0
     cfm.validate();
 #endif
-  return validate(cfm).then([this, cfm, announce_locally, timestamp] {
+  return validate(cfm).then([this, cfm, timestamp] {
     try {
         auto& db = get_local_storage_proxy().get_db().local();
         auto&& keyspace = db.find_keyspace(cfm->ks_name());
@@ -661,8 +641,8 @@ future<> migration_manager::announce_new_column_family(schema_ptr cfm, api::time
             auto mutations = db::schema_tables::make_create_table_mutations(ksm, cfm, timestamp);
             get_notifier().before_create_column_family(*cfm, mutations, timestamp);
             return mutations;
-        }).then([announce_locally, ksm](std::vector<mutation> mutations) {
-            return include_keyspace_and_announce(*ksm, std::move(mutations), announce_locally);
+        }).then([ksm](std::vector<mutation> mutations) {
+            return include_keyspace_and_announce(*ksm, std::move(mutations));
         });
     } catch (const no_such_keyspace& e) {
         throw exceptions::configuration_exception(format("Cannot add table '{}' to non existing keyspace '{}'.", cfm->cf_name(), cfm->ks_name()));
@@ -670,12 +650,12 @@ future<> migration_manager::announce_new_column_family(schema_ptr cfm, api::time
   });
 }
 
-future<> migration_manager::announce_column_family_update(schema_ptr cfm, bool from_thrift, std::vector<view_ptr>&& view_updates, bool announce_locally) {
+future<> migration_manager::announce_column_family_update(schema_ptr cfm, bool from_thrift, std::vector<view_ptr>&& view_updates) {
     warn(unimplemented::cause::VALIDATION);
 #if 0
     cfm.validate();
 #endif
-  return validate(cfm).then([this, cfm, from_thrift, view_updates, announce_locally] {
+  return validate(cfm).then([this, cfm, from_thrift, view_updates] {
     try {
         auto ts = api::new_timestamp();
         auto& db = get_local_storage_proxy().get_db().local();
@@ -686,14 +666,14 @@ future<> migration_manager::announce_column_family_update(schema_ptr cfm, bool f
         mlogger.info("Update table '{}.{}' From {} To {}", cfm->ks_name(), cfm->cf_name(), *old_schema, *cfm);
         auto&& keyspace = db.find_keyspace(cfm->ks_name()).metadata();
 
-        return seastar::async([this, cfm, old_schema, ts, keyspace, from_thrift, view_updates] {
+        return seastar::async([this, cfm, old_schema, ts, keyspace, from_thrift, view_updates, &db] {
             auto mutations = map_reduce(view_updates,
                 [keyspace, ts] (auto&& view) {
                     auto& old_view = keyspace->cf_meta_data().at(view->cf_name());
                     mlogger.info("Update view '{}.{}' From {} To {}", view->ks_name(), view->cf_name(), *old_view, *view);
                     auto mutations = db::schema_tables::make_update_view_mutations(keyspace, view_ptr(old_view), std::move(view), ts, false);
                     return make_ready_future<std::vector<mutation>>(std::move(mutations));
-                }, db::schema_tables::make_update_table_mutations(keyspace, old_schema, cfm, ts, from_thrift),
+                }, db::schema_tables::make_update_table_mutations(db, keyspace, old_schema, cfm, ts, from_thrift),
                 [] (auto&& result, auto&& view_mutations) {
                     std::move(view_mutations.begin(), view_mutations.end(), std::back_inserter(result));
                     return std::move(result);
@@ -701,8 +681,8 @@ future<> migration_manager::announce_column_family_update(schema_ptr cfm, bool f
 
             get_notifier().before_update_column_family(*cfm, *old_schema, mutations, ts);
             return mutations;
-        }).then([keyspace, announce_locally] (auto&& mutations) {
-            return include_keyspace_and_announce(*keyspace, std::move(mutations), announce_locally);
+        }).then([keyspace] (auto&& mutations) {
+            return include_keyspace_and_announce(*keyspace, std::move(mutations));
         });
     } catch (const no_such_column_family& e) {
         throw exceptions::configuration_exception(format("Cannot update non existing table '{}' in keyspace '{}'.",
@@ -711,36 +691,36 @@ future<> migration_manager::announce_column_family_update(schema_ptr cfm, bool f
   });
 }
 
-future<> migration_manager::do_announce_new_type(user_type new_type, bool announce_locally) {
+future<> migration_manager::do_announce_new_type(user_type new_type) {
     auto& db = get_local_storage_proxy().get_db().local();
     auto&& keyspace = db.find_keyspace(new_type->_keyspace);
     auto mutations = db::schema_tables::make_create_type_mutations(keyspace.metadata(), new_type, api::new_timestamp());
-    return include_keyspace_and_announce(*keyspace.metadata(), std::move(mutations), announce_locally);
+    return include_keyspace_and_announce(*keyspace.metadata(), std::move(mutations));
 }
 
-future<> migration_manager::announce_new_type(user_type new_type, bool announce_locally) {
+future<> migration_manager::announce_new_type(user_type new_type) {
     mlogger.info("Create new User Type: {}", new_type->get_name_as_string());
-    return do_announce_new_type(new_type, announce_locally);
+    return do_announce_new_type(new_type);
 }
 
-future<> migration_manager::announce_type_update(user_type updated_type, bool announce_locally) {
+future<> migration_manager::announce_type_update(user_type updated_type) {
     mlogger.info("Update User Type: {}", updated_type->get_name_as_string());
-    return do_announce_new_type(updated_type, announce_locally);
+    return do_announce_new_type(updated_type);
 }
 
-future<> migration_manager::announce_new_function(shared_ptr<cql3::functions::user_function> func, bool announce_locally) {
+future<> migration_manager::announce_new_function(shared_ptr<cql3::functions::user_function> func) {
     auto& db = get_local_storage_proxy().get_db().local();
     auto&& keyspace = db.find_keyspace(func->name().keyspace);
     auto mutations = db::schema_tables::make_create_function_mutations(func, api::new_timestamp());
-    return include_keyspace_and_announce(*keyspace.metadata(), std::move(mutations), announce_locally);
+    return include_keyspace_and_announce(*keyspace.metadata(), std::move(mutations));
 }
 
 future<> migration_manager::announce_function_drop(
-        shared_ptr<cql3::functions::user_function> func, bool announce_locally) {
+        shared_ptr<cql3::functions::user_function> func) {
     auto& db = get_local_storage_proxy().get_db().local();
     auto&& keyspace = db.find_keyspace(func->name().keyspace);
     auto mutations = db::schema_tables::make_drop_function_mutations(func, api::new_timestamp());
-    return include_keyspace_and_announce(*keyspace.metadata(), std::move(mutations), announce_locally);
+    return include_keyspace_and_announce(*keyspace.metadata(), std::move(mutations));
 }
 
 #if 0
@@ -789,7 +769,7 @@ public static void announceColumnFamilyUpdate(CFMetaData cfm, boolean fromThrift
 }
 #endif
 
-future<> migration_manager::announce_keyspace_drop(const sstring& ks_name, bool announce_locally)
+future<> migration_manager::announce_keyspace_drop(const sstring& ks_name)
 {
     auto& db = get_local_storage_proxy().get_db().local();
     if (!db.has_keyspace(ks_name)) {
@@ -798,12 +778,11 @@ future<> migration_manager::announce_keyspace_drop(const sstring& ks_name, bool 
     auto& keyspace = db.find_keyspace(ks_name);
     mlogger.info("Drop Keyspace '{}'", ks_name);
     auto&& mutations = db::schema_tables::make_drop_keyspace_mutations(keyspace.metadata(), api::new_timestamp());
-    return announce(std::move(mutations), announce_locally);
+    return announce(std::move(mutations));
 }
 
 future<> migration_manager::announce_column_family_drop(const sstring& ks_name,
                                                         const sstring& cf_name,
-                                                        bool announce_locally,
                                                         drop_views drop_views)
 {
     try {
@@ -815,7 +794,7 @@ future<> migration_manager::announce_column_family_drop(const sstring& ks_name,
         }
         auto keyspace = db.find_keyspace(ks_name).metadata();
 
-        return seastar::async([this, keyspace, schema, &old_cfm, drop_views] {
+        return seastar::async([this, keyspace, schema, &old_cfm, drop_views, &db] {
             // If drop_views is false (the default), we don't allow to delete a
             // table which has views which aren't part of an index. If drop_views
             // is true, we delete those views as well.
@@ -832,7 +811,7 @@ future<> migration_manager::announce_column_family_drop(const sstring& ks_name,
             std::vector<mutation> drop_si_mutations;
             if (!schema->all_indices().empty()) {
                 auto builder = schema_builder(schema).without_indexes();
-                drop_si_mutations = db::schema_tables::make_update_table_mutations(keyspace, schema, builder.build(), api::new_timestamp(), false);
+                drop_si_mutations = db::schema_tables::make_update_table_mutations(db, keyspace, schema, builder.build(), api::new_timestamp(), false);
             }
             auto ts = api::new_timestamp();
             auto mutations = db::schema_tables::make_drop_table_mutations(keyspace, schema, ts);
@@ -847,8 +826,8 @@ future<> migration_manager::announce_column_family_drop(const sstring& ks_name,
 
             get_notifier().before_drop_column_family(*schema, mutations, ts);
             return mutations;
-        }).then([this, keyspace, announce_locally](std::vector<mutation> mutations) {
-            return include_keyspace_and_announce(*keyspace, std::move(mutations), announce_locally);
+        }).then([this, keyspace](std::vector<mutation> mutations) {
+            return include_keyspace_and_announce(*keyspace, std::move(mutations));
         });
     } catch (const no_such_column_family& e) {
         throw exceptions::configuration_exception(format("Cannot drop non existing table '{}' in keyspace '{}'.", cf_name, ks_name));
@@ -856,43 +835,43 @@ future<> migration_manager::announce_column_family_drop(const sstring& ks_name,
 
 }
 
-future<> migration_manager::announce_type_drop(user_type dropped_type, bool announce_locally)
+future<> migration_manager::announce_type_drop(user_type dropped_type)
 {
     auto& db = get_local_storage_proxy().get_db().local();
     auto&& keyspace = db.find_keyspace(dropped_type->_keyspace);
     mlogger.info("Drop User Type: {}", dropped_type->get_name_as_string());
     auto mutations =
             db::schema_tables::make_drop_type_mutations(keyspace.metadata(), dropped_type, api::new_timestamp());
-    return include_keyspace_and_announce(*keyspace.metadata(), std::move(mutations), announce_locally);
+    return include_keyspace_and_announce(*keyspace.metadata(), std::move(mutations));
 }
 
-future<> migration_manager::announce_new_view(view_ptr view, bool announce_locally)
+future<> migration_manager::announce_new_view(view_ptr view)
 {
 #if 0
     view.metadata.validate();
 #endif
-  return validate(view).then([this, view, announce_locally] {
+  return validate(view).then([this, view] {
     auto& db = get_local_storage_proxy().get_db().local();
     try {
         auto&& keyspace = db.find_keyspace(view->ks_name()).metadata();
-        if (keyspace->cf_meta_data().find(view->cf_name()) != keyspace->cf_meta_data().end()) {
+        if (keyspace->cf_meta_data().contains(view->cf_name())) {
             throw exceptions::already_exists_exception(view->ks_name(), view->cf_name());
         }
         mlogger.info("Create new view: {}", view);
         auto mutations = db::schema_tables::make_create_view_mutations(keyspace, std::move(view), api::new_timestamp());
-        return include_keyspace_and_announce(*keyspace, std::move(mutations), announce_locally);
+        return include_keyspace_and_announce(*keyspace, std::move(mutations));
     } catch (const no_such_keyspace& e) {
         throw exceptions::configuration_exception(format("Cannot add view '{}' to non existing keyspace '{}'.", view->cf_name(), view->ks_name()));
     }
   });
 }
 
-future<> migration_manager::announce_view_update(view_ptr view, bool announce_locally)
+future<> migration_manager::announce_view_update(view_ptr view)
 {
 #if 0
     view.metadata.validate();
 #endif
-  return validate(view).then([this, view, announce_locally] {
+  return validate(view).then([this, view] {
     auto& db = get_local_storage_proxy().get_db().local();
     try {
         auto&& keyspace = db.find_keyspace(view->ks_name()).metadata();
@@ -902,7 +881,7 @@ future<> migration_manager::announce_view_update(view_ptr view, bool announce_lo
         }
         mlogger.info("Update view '{}.{}' From {} To {}", view->ks_name(), view->cf_name(), *old_view, *view);
         auto mutations = db::schema_tables::make_update_view_mutations(keyspace, view_ptr(old_view), std::move(view), api::new_timestamp(), true);
-        return include_keyspace_and_announce(*keyspace, std::move(mutations), announce_locally);
+        return include_keyspace_and_announce(*keyspace, std::move(mutations));
     } catch (const std::out_of_range& e) {
         throw exceptions::configuration_exception(format("Cannot update non existing materialized view '{}' in keyspace '{}'.",
                                                          view->cf_name(), view->ks_name()));
@@ -911,8 +890,7 @@ future<> migration_manager::announce_view_update(view_ptr view, bool announce_lo
 }
 
 future<> migration_manager::announce_view_drop(const sstring& ks_name,
-                                               const sstring& cf_name,
-                                               bool announce_locally)
+                                               const sstring& cf_name)
 {
     auto& db = get_local_storage_proxy().get_db().local();
     try {
@@ -926,7 +904,7 @@ future<> migration_manager::announce_view_drop(const sstring& ks_name,
         auto keyspace = db.find_keyspace(ks_name).metadata();
         mlogger.info("Drop view '{}.{}'", view->ks_name(), view->cf_name());
         auto mutations = db::schema_tables::make_drop_view_mutations(keyspace, view_ptr(std::move(view)), api::new_timestamp());
-        return include_keyspace_and_announce(*keyspace, std::move(mutations), announce_locally);
+        return include_keyspace_and_announce(*keyspace, std::move(mutations));
     } catch (const no_such_column_family& e) {
         throw exceptions::configuration_exception(format("Cannot drop non existing materialized view '{}' in keyspace '{}'.",
                                                          cf_name, ks_name));
@@ -942,48 +920,29 @@ public static void announceAggregateDrop(UDAggregate udf, boolean announceLocall
 }
 #endif
 
-/**
- * actively announce a new version to active hosts via rpc
- * @param schema The schema mutation to be applied
- */
-future<> migration_manager::announce(mutation schema, bool announce_locally)
-{
-    std::vector<mutation> mutations;
-    mutations.emplace_back(std::move(schema));
-    return announce(std::move(mutations), announce_locally);
-}
-
-future<> migration_manager::announce(std::vector<mutation> mutations, bool announce_locally)
-{
-    if (announce_locally) {
-        return db::schema_tables::merge_schema(get_storage_proxy(), std::move(mutations), false);
-    } else {
-        return announce(std::move(mutations));
-    }
-}
-
 future<> migration_manager::push_schema_mutation(const gms::inet_address& endpoint, const std::vector<mutation>& schema)
 {
     netw::messaging_service::msg_addr id{endpoint, 0};
-    auto schema_features = get_local_migration_manager()._feat.cluster_schema_features();
+    auto schema_features = _feat.cluster_schema_features();
     auto adjusted_schema = db::schema_tables::adjust_schema_for_schema_features(schema, schema_features);
     auto fm = std::vector<frozen_mutation>(adjusted_schema.begin(), adjusted_schema.end());
     auto cm = std::vector<canonical_mutation>(adjusted_schema.begin(), adjusted_schema.end());
-    return netw::get_local_messaging_service().send_definitions_update(id, std::move(fm), std::move(cm));
+    return _messaging.send_definitions_update(id, std::move(fm), std::move(cm));
 }
 
 // Returns a future on the local application of the schema
 future<> migration_manager::announce(std::vector<mutation> schema) {
-    auto f = db::schema_tables::merge_schema(get_storage_proxy(), get_local_migration_manager()._feat, schema);
+    migration_manager& mm = get_local_migration_manager();
+    auto f = db::schema_tables::merge_schema(get_storage_proxy(), mm._feat, schema);
 
-    return do_with(std::move(schema), [live_members = gms::get_local_gossiper().get_live_members()](auto && schema) {
-        return parallel_for_each(live_members.begin(), live_members.end(), [&schema](auto& endpoint) {
+    return do_with(std::move(schema), [live_members = gms::get_local_gossiper().get_live_members(), &mm](auto && schema) {
+        return parallel_for_each(live_members.begin(), live_members.end(), [&schema, &mm](auto& endpoint) {
             // only push schema to nodes with known and equal versions
             if (endpoint != utils::fb_utilities::get_broadcast_address() &&
-                netw::get_local_messaging_service().knows_version(endpoint) &&
-                netw::get_local_messaging_service().get_raw_version(endpoint) ==
+                mm._messaging.knows_version(endpoint) &&
+                mm._messaging.get_raw_version(endpoint) ==
                 netw::messaging_service::current_version) {
-                return push_schema_mutation(endpoint, schema);
+                return mm.push_schema_mutation(endpoint, schema);
             } else {
                 return make_ready_future<>();
             }
@@ -999,9 +958,8 @@ future<> migration_manager::announce(std::vector<mutation> schema) {
  */
 future<> migration_manager::passive_announce(utils::UUID version) {
     return gms::get_gossiper().invoke_on(0, [version] (auto&& gossiper) {
-        gms::versioned_value::factory value_factory;
         mlogger.debug("Gossiping my schema version {}", version);
-        return gossiper.add_local_application_state(gms::application_state::SCHEMA, value_factory.schema(version));
+        return gossiper.add_local_application_state(gms::application_state::SCHEMA, gms::versioned_value::schema(version));
     });
 }
 
@@ -1103,20 +1061,43 @@ static future<> maybe_sync(const schema_ptr& s, netw::messaging_service::msg_add
     });
 }
 
-future<schema_ptr> get_schema_definition(table_schema_version v, netw::messaging_service::msg_addr dst) {
-    return local_schema_registry().get_or_load(v, [dst] (table_schema_version v) {
+future<schema_ptr> get_schema_definition(table_schema_version v, netw::messaging_service::msg_addr dst, netw::messaging_service& ms) {
+    return local_schema_registry().get_or_load(v, [&ms, dst] (table_schema_version v) {
         mlogger.debug("Requesting schema {} from {}", v, dst);
-        auto& ms = netw::get_local_messaging_service();
-        return ms.send_get_schema_version(dst, v);
+        return ms.send_get_schema_version(dst, v).then([] (frozen_schema s) {
+            auto& proxy = get_storage_proxy();
+            // Since the latest schema version is always present in the schema registry
+            // we only happen to query already outdated schema version, which is
+            // referenced by the incoming request.
+            // That means the column mapping for the schema should always be inserted
+            // with TTL (refresh TTL in case column mapping already existed prior to that).
+            return db::schema_tables::store_column_mapping(proxy, s.unfreeze(db::schema_ctxt(proxy)), true).then([s] {
+                return s;
+            });
+        });
+    }).then([] (schema_ptr s) {
+        // If this is a view so this schema also needs a reference to the base
+        // table.
+        if (s->is_view()) {
+            if (!s->view_info()->base_info()) {
+                auto& db = service::get_local_storage_proxy().get_db().local();
+                // This line might throw a no_such_column_family
+                // It should be fine since if we tried to register a view for which
+                // we don't know the base table, our registry is broken.
+                schema_ptr base_schema = db.find_schema(s->view_info()->base_id());
+                s->view_info()->set_base_info(s->view_info()->make_base_dependent_view_info(*base_schema));
+            }
+        }
+        return s;
     });
 }
 
-future<schema_ptr> get_schema_for_read(table_schema_version v, netw::messaging_service::msg_addr dst) {
-    return get_schema_definition(v, dst);
+future<schema_ptr> get_schema_for_read(table_schema_version v, netw::messaging_service::msg_addr dst, netw::messaging_service& ms) {
+    return get_schema_definition(v, dst, ms);
 }
 
-future<schema_ptr> get_schema_for_write(table_schema_version v, netw::messaging_service::msg_addr dst) {
-    return get_schema_definition(v, dst).then([dst] (schema_ptr s) {
+future<schema_ptr> get_schema_for_write(table_schema_version v, netw::messaging_service::msg_addr dst, netw::messaging_service& ms) {
+    return get_schema_definition(v, dst, ms).then([dst] (schema_ptr s) {
         return maybe_sync(s, dst).then([s] {
             return s;
         });
@@ -1127,7 +1108,7 @@ future<> migration_manager::sync_schema(const database& db, const std::vector<gm
     using schema_and_hosts = std::unordered_map<utils::UUID, std::vector<gms::inet_address>>;
     return do_with(schema_and_hosts(), db.get_version(), [this, &nodes] (schema_and_hosts& schema_map, utils::UUID& my_version) {
         return parallel_for_each(nodes, [this, &schema_map, &my_version] (const gms::inet_address& node) {
-            return netw::get_messaging_service().local().send_schema_check(netw::msg_addr(node)).then([node, &schema_map, &my_version] (utils::UUID remote_version) {
+            return _messaging.send_schema_check(netw::msg_addr(node)).then([node, &schema_map, &my_version] (utils::UUID remote_version) {
                 if (my_version != remote_version) {
                     schema_map[remote_version].emplace_back(node);
                 }
@@ -1140,6 +1121,14 @@ future<> migration_manager::sync_schema(const database& db, const std::vector<gm
             });
         });
     });
+}
+
+future<column_mapping> get_column_mapping(utils::UUID table_id, table_schema_version v) {
+    schema_ptr s = local_schema_registry().get_or_null(v);
+    if (s) {
+        return make_ready_future<column_mapping>(s->get_column_mapping());
+    }
+    return db::schema_tables::get_column_mapping(table_id, v);
 }
 
 }

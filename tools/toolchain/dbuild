@@ -1,5 +1,17 @@
 #!/bin/bash
 
+if [[ -f ~/.config/scylladb/dbuild ]]; then
+    . ~/.config/scylladb/dbuild
+fi
+
+if which docker >/dev/null 2>&1 ; then
+  tool=${DBUILD_TOOL-docker}
+elif which podman >/dev/null 2>&1 ; then
+  tool=${DBUILD_TOOL-podman}
+else
+  die "Please make sure you install either podman or docker on this machine to run dbuild"
+fi
+
 here="$(realpath $(dirname "$0"))"
 toplevel="$(realpath "$here/../..")"
 group_args=()
@@ -42,6 +54,17 @@ OPTIONS
        Run an interactive session.
 
    See \`docker help run' for available options.
+
+ENVIRONMENT
+
+    SCYLLADB_DBUILD this variable, which can be a string or a bash
+                    array, is prepended to the parmeters passed to
+                    docker. This can be used to mount the ccache
+                    directory (~/.ccache) and set up environment
+                    variables (e.g. CCACHE_PREFIX)
+
+    If the file ~/.config/scylladb/dbuild exists, it is sourced. This can
+    be used to set up the SCYLLADB_DBUILD environment variable.
 EOF
     exit 0
 }
@@ -73,7 +96,7 @@ elif [[ "$1" = -* ]]; then
                 if [[ -z "$image" ]]; then
                     die "Expected docker image identifier to follow the --image option"
                 fi
-                if ! docker image inspect "$image" >/dev/null && ! docker image pull "$image"; then
+                if ! $tool image inspect "$image" >/dev/null && ! $tool image pull "$image"; then
                     die
                 fi
                 continue
@@ -110,17 +133,25 @@ MAVEN_LOCAL_REPO="$HOME/.m2"
 
 mkdir -p "$MAVEN_LOCAL_REPO"
 
-is_podman="$(docker --help | grep -o podman)"
+is_podman="$($tool --help | grep -o podman)"
 
 docker_common_args=()
 
+docker_common_args+=("${SCYLLADB_DBUILD[@]}")
+
 if [ -z "$is_podman" ]; then
+    unset TMP_PASSWD
     docker_common_args+=(
        -u "$(id -u):$(id -g)"
        "${group_args[@]}"
        -v /etc/passwd:/etc/passwd:ro
        -v /etc/group:/etc/group:ro
        )
+else
+    TMP_PASSWD=$(mktemp --tmpdir passwd.XXXXXX)
+    FULLNAME=$(getent passwd $USER | cut -d ':' -f 5)
+    echo "$USER:x:0:0:$FULLNAME:$HOME:/bin/bash" > "$TMP_PASSWD"
+    docker_common_args+=(-v "$TMP_PASSWD:/etc/passwd:ro")
 fi
 
 if [ "$PWD" != "$toplevel" ]; then
@@ -133,6 +164,7 @@ fi
 tmpdir=$(mktemp -d)
 
 docker_common_args+=(
+       --security-opt seccomp=unconfined \
        --pids-limit -1 \
        --network host \
        --cap-add SYS_PTRACE \
@@ -141,11 +173,18 @@ docker_common_args+=(
        -v "$MAVEN_LOCAL_REPO:$MAVEN_LOCAL_REPO:z" \
        -v /etc/localtime:/etc/localtime:ro \
        -w "$PWD" \
-       -e HOME \
+       -e HOME="$HOME" \
        "${docker_args[@]}" \
        "$image" \
        "${args[@]}"
 )
+
+cleanup() {
+    rm -rf "$tmpdir"
+    if [ -v TMP_PASSWD ]; then
+        rm -f "$TMP_PASSWD"
+    fi
+}
 
 if [[ -n "$interactive" || -n "$is_podman" ]]; then
     # If --interactive was given on the command line, we can't run in detached mode
@@ -153,32 +192,32 @@ if [[ -n "$interactive" || -n "$is_podman" ]]; then
 
     # We also avoid detached mode with podman, which doesn't need it
     # (it does not proxy SIGTERM) and doesn't work well with it.
-    docker run --rm "${docker_common_args[@]}"
+    $tool run --rm "${docker_common_args[@]}"
     ret=$?
-    rm -rf "$tmpdir"
+    cleanup
     exit $ret
 fi
 
 container=$(
-    docker run \
+    $tool run \
        "--detach=true" \
        "${docker_common_args[@]}"
 )
 
 kill_it() {
     if [[ -n "$container" ]]; then
-        docker rm -f "$container" > /dev/null
+        $tool rm -f "$container" > /dev/null
         container=
     fi
-    rm -rf "$tmpdir"
+    cleanup
 }
 
 trap kill_it SIGTERM SIGINT SIGHUP EXIT
 
-docker logs --follow "$container"
+$tool logs --follow "$container"
 
 if [[ -n "$container" ]]; then
-    exitcode="$(docker wait "$container")"
+    exitcode="$($tool wait "$container")"
 else
     exitcode=99
 fi

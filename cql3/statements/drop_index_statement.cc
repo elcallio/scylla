@@ -59,7 +59,7 @@ future<> drop_index_statement::check_access(service::storage_proxy& proxy, const
     if (!cfm) {
         return make_ready_future<>();
     }
-    return state.has_column_family_access(cfm->ks_name(), cfm->cf_name(), auth::permission::ALTER);
+    return state.has_column_family_access(proxy.local_db(), cfm->ks_name(), cfm->cf_name(), auth::permission::ALTER);
 }
 
 void drop_index_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const
@@ -75,11 +75,8 @@ void drop_index_statement::validate(service::storage_proxy& proxy, const service
     }
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> drop_index_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
+future<shared_ptr<cql_transport::event::schema_change>> drop_index_statement::announce_migration(service::storage_proxy& proxy) const
 {
-    if (!proxy.features().cluster_supports_indexes()) {
-        throw exceptions::invalid_request_exception("Index support is not enabled");
-    }
     auto cfm = lookup_indexed_table(proxy);
     if (!cfm) {
         return make_ready_future<::shared_ptr<cql_transport::event::schema_change>>(nullptr);
@@ -87,7 +84,7 @@ future<shared_ptr<cql_transport::event::schema_change>> drop_index_statement::an
     ++_cql_stats->secondary_index_drops;
     auto builder = schema_builder(cfm);
     builder.without_index(_index_name);
-    return service::get_local_migration_manager().announce_column_family_update(builder.build(), false, {}, is_local_only).then([cfm] {
+    return service::get_local_migration_manager().announce_column_family_update(builder.build(), false, {}).then([cfm] {
         // Dropping an index is akin to updating the CF
         // Note that we shouldn't call columnFamily() at this point because the index has been dropped and the call to lookupIndexedTable()
         // in that method would now throw.

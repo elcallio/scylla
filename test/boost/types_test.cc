@@ -10,7 +10,7 @@
 
 #include <seastar/testing/test_case.hh>
 #include <seastar/net/inet_address.hh>
-#include <utils/UUID_gen.hh>
+#include "utils/UUID_gen.hh"
 #include <boost/asio/ip/address_v4.hpp>
 #include <seastar/net/ip.hh>
 #include <boost/multiprecision/cpp_int.hpp>
@@ -87,6 +87,13 @@ BOOST_AUTO_TEST_CASE(test_byte_type_string_conversions) {
     test_parsing_fails(byte_type, "128");
 
     BOOST_REQUIRE_EQUAL(byte_type->to_string(bytes()), "");
+}
+
+BOOST_AUTO_TEST_CASE(test_ascii_type_string_conversions) {
+    BOOST_REQUIRE(ascii_type->equal(ascii_type->from_string("ascii"), ascii_type->decompose("ascii")));
+    BOOST_REQUIRE_EQUAL(ascii_type->to_string(ascii_type->decompose("ascii")), "ascii");
+
+    test_parsing_fails(ascii_type, "¡Hola!");
 }
 
 BOOST_AUTO_TEST_CASE(test_short_type_string_conversions) {
@@ -274,7 +281,8 @@ void test_timestamp_like_string_conversions(data_type timestamp_type) {
     BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "2015-07-03T00:00:00");
 
     auto now = time(nullptr);
-    auto local_now = *localtime(&now);
+    ::tm local_now;
+    ::localtime_r(&now, &local_now);
     char buf[100];
     db_clock::time_point now_tp(db_clock::duration(now * 1000));
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S%z", &local_now);
@@ -904,8 +912,10 @@ SEASTAR_TEST_CASE(test_simple_type_compatibility) {
     test_case tests[] = {
         { vc, bytes_type, int32_type },
         { nc, int32_type, bytes_type },
-        { vc, varint_type, int32_type },
-        { vc, varint_type, long_type },
+        { cc, varint_type, int32_type },
+        { cc, varint_type, long_type },
+        { cc, varint_type, short_type },
+        { cc, varint_type, byte_type },
         { nc, int32_type, varint_type },
         { nc, long_type, varint_type },
         { cc, bytes_type, utf8_type },

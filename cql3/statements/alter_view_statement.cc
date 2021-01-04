@@ -49,9 +49,10 @@ alter_view_statement::alter_view_statement(::shared_ptr<cf_name> view_name, ::sh
 future<> alter_view_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const
 {
     try {
-        auto&& s = proxy.get_db().local().find_schema(keyspace(), column_family());
+        const database& db = proxy.local_db();
+        auto&& s = db.find_schema(keyspace(), column_family());
         if (s->is_view())  {
-            return state.has_column_family_access(keyspace(), s->view_info()->base_name(), auth::permission::ALTER);
+            return state.has_column_family_access(db, keyspace(), s->view_info()->base_name(), auth::permission::ALTER);
         }
     } catch (const no_such_column_family& e) {
         // Will be validated afterwards.
@@ -64,7 +65,7 @@ void alter_view_statement::validate(service::storage_proxy&, const service::clie
     // validated in announce_migration()
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> alter_view_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
+future<shared_ptr<cql_transport::event::schema_change>> alter_view_statement::announce_migration(service::storage_proxy& proxy) const
 {
     auto&& db = proxy.get_db().local();
     schema_ptr schema = validation::validate_column_family(db, keyspace(), column_family());
@@ -96,7 +97,7 @@ future<shared_ptr<cql_transport::event::schema_change>> alter_view_statement::an
                 "the corresponding data in the parent table.");
     }
 
-    return service::get_local_migration_manager().announce_view_update(view_ptr(builder.build()), is_local_only).then([this] {
+    return service::get_local_migration_manager().announce_view_update(view_ptr(builder.build())).then([this] {
         using namespace cql_transport;
 
         return ::make_shared<event::schema_change>(

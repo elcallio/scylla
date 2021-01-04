@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -29,7 +18,7 @@
 #include <seastar/core/future.hh>
 #include "seastarx.hh"
 #include <unordered_set>
-#include <gms/gossiper.hh>
+#include "gms/gossiper.hh"
 #include "utils/small_vector.hh"
 #include "lister.hh"
 
@@ -78,6 +67,7 @@ private:
     size_t _total_size = 0;
     shard_managers_set& _shard_managers;
     per_device_limits_map& _per_device_limits_map;
+    seastar::named_semaphore _update_lock;
 
     future<> _started = make_ready_future<>();
     seastar::abort_source _as;
@@ -87,6 +77,10 @@ public:
     space_watchdog(shard_managers_set& managers, per_device_limits_map& per_device_limits_map);
     void start();
     future<> stop() noexcept;
+
+    seastar::named_semaphore& update_lock() {
+        return _update_lock;
+    }
 
 private:
     /// \brief Check that hints don't occupy too much disk space.
@@ -119,9 +113,46 @@ class resource_manager {
     const size_t _min_send_hint_budget;
     seastar::named_semaphore _send_limiter;
 
+    seastar::named_semaphore _operation_lock;
     space_watchdog::shard_managers_set _shard_managers;
     space_watchdog::per_device_limits_map _per_device_limits_map;
     space_watchdog _space_watchdog;
+
+    shared_ptr<service::storage_proxy> _proxy_ptr;
+    shared_ptr<gms::gossiper> _gossiper_ptr;
+    shared_ptr<service::storage_service> _ss_ptr;
+
+    enum class state {
+        running,
+        replay_allowed,
+    };
+    using state_set = enum_set<super_enum<state,
+        state::running,
+        state::replay_allowed>>;
+
+    state_set _state;
+
+    void set_running() noexcept {
+        _state.set(state::running);
+    }
+
+    void unset_running() noexcept {
+        _state.remove(state::running);
+    }
+
+    bool running() const noexcept {
+        return _state.contains(state::running);
+    }
+
+    void set_replay_allowed() noexcept {
+        _state.set(state::replay_allowed);
+    }
+
+    bool replay_allowed() const noexcept {
+        return _state.contains(state::replay_allowed);
+    }
+
+    future<> prepare_per_device_limits(manager& shard_manager);
 
 public:
     static constexpr size_t hint_segment_size_in_mb = 32;
@@ -133,6 +164,7 @@ public:
         : _max_send_in_flight_memory(std::max(max_send_in_flight_memory, max_hints_send_queue_length))
         , _min_send_hint_budget(_max_send_in_flight_memory / max_hints_send_queue_length)
         , _send_limiter(_max_send_in_flight_memory, named_semaphore_exception_factory{"send limiter"})
+        , _operation_lock(1, named_semaphore_exception_factory{"operation lock"})
         , _space_watchdog(_shard_managers, _per_device_limits_map)
     {}
 
@@ -140,12 +172,19 @@ public:
     resource_manager& operator=(resource_manager&&) = delete;
 
     future<semaphore_units<named_semaphore::exception_factory>> get_send_units_for(size_t buf_size);
+    size_t sending_queue_length() const;
 
     future<> start(shared_ptr<service::storage_proxy> proxy_ptr, shared_ptr<gms::gossiper> gossiper_ptr, shared_ptr<service::storage_service> ss_ptr);
-    void allow_replaying() noexcept;
     future<> stop() noexcept;
-    void register_manager(manager& m);
-    future<> prepare_per_device_limits();
+
+    /// \brief Allows replaying hints for managers which are registered now or will be in the future.
+    void allow_replaying() noexcept;
+
+    /// \brief Registers the hints::manager in resource_manager, and starts it, if resource_manager is already running.
+    ///
+    /// The hints::managers can be added either before or after resource_manager starts.
+    /// If resource_manager is already started, the hints manager will also be started.
+    future<> register_manager(manager& m);
 };
 
 }

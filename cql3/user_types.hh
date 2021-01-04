@@ -44,7 +44,7 @@ namespace cql3 {
 class user_types {
     user_types() = delete;
 public:
-    static shared_ptr<column_specification> field_spec_of(const column_specification& column, size_t field);
+    static lw_shared_ptr<column_specification> field_spec_of(const column_specification& column, size_t field);
 
     class literal : public term::raw {
     public:
@@ -52,11 +52,11 @@ public:
         elements_map_type _entries;
 
         literal(elements_map_type entries);
-        virtual shared_ptr<term> prepare(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) const override;
+        virtual shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const override;
     private:
         void validate_assignable_to(database& db, const sstring& keyspace, const column_specification& receiver) const;
     public:
-        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) const override;
+        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const override;
         virtual sstring assignment_testable_source_context() const override;
         virtual sstring to_string() const override;
     };
@@ -80,7 +80,6 @@ public:
         std::vector<shared_ptr<term>> _values;
     public:
         delayed_value(user_type type, std::vector<shared_ptr<term>> values);
-        virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
         virtual bool contains_bind_marker() const override;
         virtual void collect_marker_specification(variable_specifications& bound_names) const;
     private:
@@ -92,7 +91,7 @@ public:
 
     class marker : public abstract_marker {
     public:
-        marker(int32_t bind_index, ::shared_ptr<column_specification> receiver)
+        marker(int32_t bind_index, lw_shared_ptr<column_specification> receiver)
             : abstract_marker{bind_index, std::move(receiver)}
         {
             assert(_receiver->type->is_user_type());

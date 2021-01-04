@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -e
 #
 # This file is open source software, licensed to you under the terms
 # of the Apache License, Version 2.0 (the "License").  See the NOTICE file
@@ -27,9 +27,8 @@ else
     exit 1
 fi
 
-bash seastar/install-dependencies.sh
-
 debian_base_packages=(
+    clang
     liblua5.3-dev
     python3-pyparsing
     python3-colorama
@@ -42,11 +41,13 @@ debian_base_packages=(
     git
     pigz
     libunistring-dev
+    libzstd-dev
     slapd
     ldap-utils
 )
 
 fedora_packages=(
+    clang
     lua-devel
     yaml-cpp-devel
     thrift-devel
@@ -60,26 +61,18 @@ fedora_packages=(
     python
     sudo
     java-1.8.0-openjdk-headless
+    java-1.8.0-openjdk-devel
     ant
     ant-junit
     maven
-    pystache
     patchelf
     python3
-    python3-PyYAML
-    python3-pyudev
-    python3-setuptools
-    python3-urwid
-    python3-pyparsing
-    python3-requests
-    python3-pyudev
-    python3-setuptools
+    python3-pip
     python3-magic
-    python3-psutil
-    python3-cassandra-driver
     python3-colorama
     python3-boto3
     python3-pytest
+    python3-redis
     dnf-utils
     pigz
     net-tools
@@ -91,9 +84,32 @@ fedora_packages=(
     hwloc
     glibc-langpack-en
     lld
+    xxhash-devel
+    makeself
+    libzstd-static libzstd-devel
+    rpm-build
+    devscripts
+    debhelper
+    fakeroot
+    file
+    dpkg-dev
+    curl
+
     openldap-servers
     openldap-devel
     toxiproxy
+    cyrus-sasl
+)
+
+fedora_python3_packages=(
+    python3-pyyaml
+    python3-urwid
+    python3-pyparsing
+    python3-requests
+    python3-pyudev
+    python3-setuptools
+    python3-psutil
+    python3-distro
 )
 
 centos_packages=(
@@ -134,6 +150,80 @@ arch_packages=(
     thrift
 )
 
+NODE_EXPORTER_VERSION=1.0.1
+declare -A NODE_EXPORTER_CHECKSUM=(
+    ["x86_64"]=3369b76cd2b0ba678b6d618deab320e565c3d93ccb5c2a0d5db51a53857768ae
+    ["aarch64"]=017514906922fcc4b7d727655690787faed0562bc7a17aa9f72b0651cb1b47fb
+    ["s390x"]=2f22d1ce18969017fb32dbd285a264adf3da6252eec05f03f105cf638ec0bb06
+)
+declare -A NODE_EXPORTER_ARCH=(
+    ["x86_64"]=amd64
+    ["aarch64"]=arm64
+    ["s390x"]=s390x
+)
+NODE_EXPORTER_DIR=/opt/scylladb/dependencies
+
+node_exporter_filename() {
+    echo "node_exporter-$NODE_EXPORTER_VERSION.linux-${NODE_EXPORTER_ARCH["$(arch)"]}.tar.gz"
+}
+
+node_exporter_fullpath() {
+    echo "$NODE_EXPORTER_DIR/$(node_exporter_filename)"
+}
+
+node_exporter_checksum() {
+    sha256sum "$(node_exporter_fullpath)" | while read -r sum _; do [[ "$sum" == "${NODE_EXPORTER_CHECKSUM["$(arch)"]}" ]]; done
+}
+
+node_exporter_url() {
+    echo "https://github.com/prometheus/node_exporter/releases/download/v$NODE_EXPORTER_VERSION/$(node_exporter_filename)"
+}
+
+
+print_usage() {
+    echo "Usage: install-dependencies.sh [OPTION]..."
+    echo ""
+    echo "  --print-python3-runtime-packages Print required python3 packages for Scylla"
+    echo "  --print-node-exporter-filename Print node_exporter filename"
+    exit 1
+}
+
+PRINT_PYTHON3=false
+PRINT_NODE_EXPORTER=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        "--print-python3-runtime-packages")
+            PRINT_PYTHON3=true
+            shift 1
+            ;;
+        "--print-node-exporter-filename")
+            PRINT_NODE_EXPORTER=true
+            shift 1
+            ;;
+         *)
+            print_usage
+            ;;
+    esac
+done
+
+if $PRINT_PYTHON3; then
+    if [ "$ID" != "fedora" ]; then
+        echo "Unsupported Distribution: $ID"
+        exit 1
+    fi
+    echo "${fedora_python3_packages[@]}"
+    exit 0
+fi
+
+if $PRINT_NODE_EXPORTER; then
+    node_exporter_fullpath
+    exit 0
+fi
+
+bash seastar/install-dependencies.sh
+bash tools/jmx/install-dependencies.sh
+bash tools/java/install-dependencies.sh
+
 if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
     apt-get -y install "${debian_base_packages[@]}"
     if [ "$VERSION_ID" = "8" ]; then
@@ -156,7 +246,19 @@ elif [ "$ID" = "fedora" ]; then
         echo "Please remove the package and try to run this script again."
         exit 1
     fi
-    yum install -y "${fedora_packages[@]}"
+    yum install -y "${fedora_packages[@]}" "${fedora_python3_packages[@]}"
+    pip3 install cassandra-driver
+
+    if [ -f "$(node_exporter_fullpath)" ] && node_exporter_checksum; then
+        echo "$(node_exporter_filename) already exists, skipping download"
+    else
+        mkdir -p "$NODE_EXPORTER_DIR"
+        curl -fSL -o "$(node_exporter_fullpath)" "$(node_exporter_url)"
+        if ! node_exporter_checksum; then
+            echo "$(node_exporter_filename) download failed"
+            exit 1
+        fi
+    fi
 elif [ "$ID" = "centos" ]; then
     centos_packages+=(openssl-devel)
     yum install -y "${centos_packages[@]}"

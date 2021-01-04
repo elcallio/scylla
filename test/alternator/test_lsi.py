@@ -2,18 +2,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests of LSI (Local Secondary Indexes)
 #
@@ -29,19 +18,19 @@ from util import create_test_table, random_string, full_scan, full_query, multis
 # LSIs support strongly-consistent reads, so the following functions do not
 # need to retry like we did in test_gsi.py for GSIs:
 def assert_index_query(table, index_name, expected_items, **kwargs):
-    assert multiset(expected_items) == multiset(full_query(table, IndexName=index_name, ConsistentRead=True, **kwargs))
+    assert multiset(expected_items) == multiset(full_query(table, IndexName=index_name, **kwargs))
 def assert_index_scan(table, index_name, expected_items, **kwargs):
-    assert multiset(expected_items) == multiset(full_scan(table, IndexName=index_name, ConsistentRead=True, **kwargs))
+    assert multiset(expected_items) == multiset(full_scan(table, IndexName=index_name, **kwargs))
 
 # A version doing retries instead of ConsistentRead, to be used just for the
 # one test below which has both GSI and LSI:
 def retrying_assert_index_query(table, index_name, expected_items, **kwargs):
     for i in range(3):
-        if multiset(expected_items) == multiset(full_query(table, IndexName=index_name, **kwargs)):
+        if multiset(expected_items) == multiset(full_query(table, IndexName=index_name, ConsistentRead=False, **kwargs)):
             return
         print('retrying_assert_index_query retrying')
         time.sleep(1)
-    assert multiset(expected_items) == multiset(full_query(table, IndexName=index_name, **kwargs))
+    assert multiset(expected_items) == multiset(full_query(table, IndexName=index_name, ConsistentRead=False, **kwargs))
 
 # Although quite silly, it is actually allowed to create an index which is
 # identical to the base table.
@@ -125,8 +114,9 @@ def test_lsi_wrong(dynamodb):
             ])
         table.delete()
 
-# A simple scenario for LSI. Base table has just hash key, Index has an
-# additional sort key - one of the non-key attributes from the base table.
+# A simple scenario for LSI. Base table has a partition key and a sort key,
+# index has the same partition key key but a different sort key - one of
+# the non-key attributes from the base table.
 @pytest.fixture(scope="session")
 def test_table_lsi_1(dynamodb):
     table = create_test_table(dynamodb,
@@ -211,6 +201,12 @@ def test_lsi_4(test_table_lsi_4):
         assert_index_query(test_table_lsi_4, 'hello_' + column, expected_items,
             KeyConditions={'p': {'AttributeValueList': [i5], 'ComparisonOperator': 'EQ'},
                            column: {'AttributeValueList': [i5], 'ComparisonOperator': 'EQ'}})
+
+# Test that setting an indexed string column to an empty string is illegal,
+# since keys cannot contain empty strings
+def test_lsi_empty_value(test_table_lsi_1):
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_lsi_1.put_item(Item={'p': random_string(), 'c': random_string(), 'b': ''})
 
 def test_lsi_describe(test_table_lsi_4):
     desc = test_table_lsi_4.meta.client.describe_table(TableName=test_table_lsi_4.name)
@@ -358,3 +354,33 @@ def test_lsi_and_gsi(test_table_lsi_gsi):
         retrying_assert_index_query(test_table_lsi_gsi, index, expected_items,
             KeyConditions={'p': {'AttributeValueList': [p1], 'ComparisonOperator': 'EQ'},
                            'x1': {'AttributeValueList': [x1], 'ComparisonOperator': 'EQ'}})
+
+# This test is a version of test_filter_expression_and_projection_expression
+# from test_filter_expression, which involves a Query which projects only
+# one column but filters on another one, and the point is to verify that
+# the implementation got also the filtered column (for the filtering to work)
+# but did not return it with the results. This version does the same, except
+# that either the filtered column, or the projected column, is an LSI key.
+# In our implementation, LSI keys are implemented differently from ordinary
+# attributes - they are real Scylla columns and not just items in the
+# ":attrs" map - so this test checks that our implementation of the filtering
+# and projection (and their combination) did not mess up this special case.
+# This test reproduces issue #6951.
+def test_lsi_filter_expression_and_projection_expression(test_table_lsi_1):
+    p = random_string()
+    test_table_lsi_1.put_item(Item={'p': p, 'c': 'hi', 'b': 'dog', 'y': 'cat'})
+    test_table_lsi_1.put_item(Item={'p': p, 'c': 'yo', 'b': 'mouse', 'y': 'horse'})
+    # Case 1: b (the LSI key) is in filter but not in projection:
+    got_items = full_query(test_table_lsi_1,
+        KeyConditionExpression='p=:p',
+        FilterExpression='b=:b',
+        ProjectionExpression='y',
+        ExpressionAttributeValues={':p': p, ':b': 'mouse'})
+    assert(got_items == [{'y': 'horse'}])
+    # Case 2: b (the LSI key) is in the projection, but not the filter:
+    got_items = full_query(test_table_lsi_1,
+        KeyConditionExpression='p=:p',
+        FilterExpression='y=:y',
+        ProjectionExpression='b',
+        ExpressionAttributeValues={':p': p, ':y': 'cat'})
+    assert(got_items == [{'b': 'dog'}])

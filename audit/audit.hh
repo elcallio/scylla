@@ -26,6 +26,7 @@ class config;
 namespace cql3 {
 
 class cql_statement;
+class query_processor;
 
 }
 
@@ -99,7 +100,7 @@ public:
         return audit_instance().local();
     }
     static future<> create_audit(const db::config& cfg);
-    static future<> start_audit(const db::config& cfg);
+    static future<> start_audit(const db::config& cfg, sharded<cql3::query_processor>& qp);
     static future<> stop_audit();
     static audit_info_ptr create_audit_info(statement_category cat, const sstring& keyspace, const sstring& table);
     static audit_info_ptr create_no_audit_info();
@@ -107,7 +108,7 @@ public:
           std::set<sstring>&& audited_keyspaces,
           std::map<sstring, std::set<sstring>>&& audited_tables,
           category_set&& audited_categories);
-    future<> start(const db::config& cfg);
+    future<> start(const db::config& cfg, cql3::query_processor& qp);
     future<> stop();
     future<> shutdown();
     bool should_log(const audit_info* audit_info) const;

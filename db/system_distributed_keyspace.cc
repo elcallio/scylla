@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "db/system_distributed_keyspace.hh"
@@ -33,6 +22,7 @@
 #include "types/set.hh"
 #include "cdc/generation.hh"
 #include "cql3/query_processor.hh"
+#include "gms/feature_service.hh"
 
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -73,7 +63,7 @@ schema_ptr view_build_status() {
 }
 
 /* An internal table used by nodes to exchange CDC generation data. */
-schema_ptr cdc_topology_description() {
+schema_ptr cdc_generations() {
     thread_local auto schema = [] {
         auto id = generate_legacy_id(system_distributed_keyspace::NAME, system_distributed_keyspace::CDC_TOPOLOGY_DESCRIPTION);
         return schema_builder(system_distributed_keyspace::NAME, system_distributed_keyspace::CDC_TOPOLOGY_DESCRIPTION, {id})
@@ -118,16 +108,28 @@ schema_ptr service_levels() {
     return schema;
 }
 
-static std::vector<schema_ptr> all_tables(const db::config& cfg) {
+static std::vector<schema_ptr> workload_prioritization_tables() {
+    return std::vector({service_levels()});
+}
+
+static std::vector<schema_ptr> all_tables(const database& db) {
     auto ret = std::vector<schema_ptr>({
-            view_build_status(),
-        cdc_topology_description(),
+        view_build_status(),
+        cdc_generations(),
         cdc_desc(),
     });
-    if (cfg.create_service_levels_table) {
-        ret.push_back(service_levels());
+
+    if (db.get_config().create_service_levels_table &&
+            db.features().cluster_supports_workload_prioritization()) {
+        auto wp_tables = workload_prioritization_tables();
+        std::copy(std::begin(wp_tables), std::end(wp_tables), std::back_inserter(ret));
     }
+
     return ret;
+}
+
+bool system_distributed_keyspace::is_extra_durable(const sstring& cf_name) {
+    return cf_name == CDC_TOPOLOGY_DESCRIPTION;
 }
 
 system_distributed_keyspace::system_distributed_keyspace(cql3::query_processor& qp, service::migration_manager& mm)
@@ -135,11 +137,7 @@ system_distributed_keyspace::system_distributed_keyspace(cql3::query_processor& 
         , _mm(mm) {
 }
 
-future<> system_distributed_keyspace::start() {
-    if (this_shard_id() != 0) {
-        return make_ready_future<>();
-    }
-
+future<> system_distributed_keyspace::create_tables(std::vector<schema_ptr> tables) {
     static auto ignore_existing = [] (seastar::noncopyable_function<future<>()> func) {
         return futurize_invoke(std::move(func)).handle_exception_type([] (exceptions::already_exists_exception& ignored) { });
     };
@@ -152,16 +150,34 @@ future<> system_distributed_keyspace::start() {
                 "org.apache.cassandra.locator.SimpleStrategy",
                 {{"replication_factor", "3"}},
                 true);
-        return _mm.announce_new_keyspace(ksm, api::min_timestamp, false);
-    }).then([this] {
-        return do_with(all_tables(_qp.db().get_config()), [this] (std::vector<schema_ptr>& tables) {
+        return _mm.announce_new_keyspace(ksm, api::min_timestamp);
+    }).then([this, tables = std::move(tables)] () mutable {
+        return do_with(std::vector<schema_ptr>{std::move(tables)}, [this] (std::vector<schema_ptr>& tables) {
             return do_for_each(tables, [this] (schema_ptr table) {
                 return ignore_existing([this, table = std::move(table)] {
-                    return _mm.announce_new_column_family(std::move(table), api::min_timestamp, false);
+                    return _mm.announce_new_column_family(std::move(table), api::min_timestamp);
                 });
             });
         });
     });
+}
+
+future<> system_distributed_keyspace::start_workload_prioritization() {
+    if (this_shard_id() != 0) {
+        return make_ready_future<>();
+    }
+    if (_qp.db().get_config().create_service_levels_table &&
+            _qp.db().features().cluster_supports_workload_prioritization()) {
+        return create_tables(workload_prioritization_tables());
+    }
+    return make_ready_future();
+}
+
+future<> system_distributed_keyspace::start() {
+    if (this_shard_id() != 0) {
+        return make_ready_future<>();
+    }
+    return create_tables(all_tables(_qp.db()));
 }
 
 future<> system_distributed_keyspace::stop() {
@@ -221,7 +237,7 @@ future<> system_distributed_keyspace::remove_view(sstring ks_name, sstring view_
             false).discard_result();
 }
 
-/* We want to make sure that writes/reads to/from cdc_topology_description and cdc_description
+/* We want to make sure that writes/reads to/from cdc_generations and cdc_streams
  * are consistent: a read following an acknowledged write to the same partition should contact
  * at least one of the replicas that the write contacted.
  * Normally we would achieve that by always using CL = QUORUM,
@@ -388,6 +404,37 @@ system_distributed_keyspace::cdc_desc_exists(
     });
 }
 
+future<std::map<db_clock::time_point, cdc::streams_version>> 
+system_distributed_keyspace::cdc_get_versioned_streams(context ctx) {
+    return _qp.execute_internal(
+            format("SELECT * FROM {}.{}", NAME, CDC_DESC),
+            quorum_if_many(ctx.num_token_owners),
+            internal_distributed_timeout_config,
+            {},
+            false
+    ).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
+        std::map<db_clock::time_point, cdc::streams_version> result;
+
+        for (auto& row : *cql_result) {
+            auto ts = row.get_as<db_clock::time_point>("time");
+            auto exp = row.get_opt<db_clock::time_point>("expired");
+            std::vector<cdc::stream_id> ids;
+            row.get_list_data<bytes>("streams", std::back_inserter(ids)); 
+            result.emplace(ts, cdc::streams_version(std::move(ids), ts, exp));
+        }
+
+        return result;
+    });
+}
+
+bool system_distributed_keyspace::workload_prioritization_tables_exists() {
+    auto tables = workload_prioritization_tables();
+    auto table_exists = [this] (schema_ptr& table) {
+        return  _qp.db().has_schema(NAME, table->cf_name());
+    };
+    return std::all_of(std::begin(tables), std::end(tables), table_exists);
+}
+
 future<qos::service_levels_info> system_distributed_keyspace::get_service_levels() const {
     static sstring prepared_query = format("SELECT * FROM {}.{};", NAME, SERVICE_LEVELS);
     return _qp.execute_internal(prepared_query,
@@ -436,4 +483,5 @@ future<> system_distributed_keyspace::drop_service_level(sstring service_level_n
             internal_distributed_timeout_config,
             {service_level_name}, true).discard_result();
 }
+
 }

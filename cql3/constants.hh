@@ -35,6 +35,7 @@
 #include "cql3/operation.hh"
 #include "cql3/values.hh"
 #include "cql3/term.hh"
+#include "mutation.hh"
 #include <seastar/core/shared_ptr.hh>
 
 namespace cql3 {
@@ -76,8 +77,8 @@ public:
         };
     public:
         static thread_local const ::shared_ptr<terminal> NULL_VALUE;
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) const override {
-            if (!is_assignable(test_assignment(db, keyspace, receiver))) {
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const override {
+            if (!is_assignable(test_assignment(db, keyspace, *receiver))) {
                 throw exceptions::invalid_request_exception("Invalid null value for counter increment/decrement");
             }
             return NULL_VALUE;
@@ -85,8 +86,8 @@ public:
 
         virtual assignment_testable::test_result test_assignment(database& db,
             const sstring& keyspace,
-            ::shared_ptr<column_specification> receiver) const override {
-                return receiver->type->is_counter()
+            const column_specification& receiver) const override {
+                return receiver.type->is_counter()
                     ? assignment_testable::test_result::NOT_ASSIGNABLE
                     : assignment_testable::test_result::WEAKLY_ASSIGNABLE;
         }
@@ -142,7 +143,7 @@ public:
             return ::make_shared<literal>(type::DURATION, text);
         }
 
-        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) const override;
+        virtual ::shared_ptr<term> prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const override;
     private:
         bytes parsed_value(data_type validator) const;
     public:
@@ -150,7 +151,7 @@ public:
             return _text;
         }
 
-        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) const;
+        virtual assignment_testable::test_result test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const;
 
         virtual sstring to_string() const override {
             return _type == type::STRING ? sstring(format("'{}'", _text)) : _text;
@@ -159,7 +160,7 @@ public:
 
     class marker : public abstract_marker {
     public:
-        marker(int32_t bind_index, ::shared_ptr<column_specification> receiver)
+        marker(int32_t bind_index, lw_shared_ptr<column_specification> receiver)
             : abstract_marker{bind_index, std::move(receiver)}
         {
             assert(!_receiver->type->is_collection() && !_receiver->type->is_user_type());
@@ -173,7 +174,8 @@ public:
                 }
                 return value;
             } catch (const marshal_exception& e) {
-                throw exceptions::invalid_request_exception(e.what());
+                throw exceptions::invalid_request_exception(
+                        format("Exception while binding column {:s}: {:s}", _receiver->name->to_cql_string(), e.what()));
             }
         }
 
@@ -214,9 +216,7 @@ public:
             } else if (value.is_unset_value()) {
                 return;
             }
-            auto increment = with_linearized(*value, [] (bytes_view value_view) {
-                return value_cast<int64_t>(long_type->deserialize_value(value_view));
-            });
+            auto increment = value_cast<int64_t>(long_type->deserialize_value(*value));
             m.set_cell(prefix, column, make_counter_update_cell(increment, params));
         }
     };
@@ -231,9 +231,7 @@ public:
             } else if (value.is_unset_value()) {
                 return;
             }
-            auto increment = with_linearized(*value, [] (bytes_view value_view) {
-                return value_cast<int64_t>(long_type->deserialize_value(value_view));
-            });
+            auto increment = value_cast<int64_t>(long_type->deserialize_value(*value));
             if (increment == std::numeric_limits<int64_t>::min()) {
                 throw exceptions::invalid_request_exception(format("The negation of {:d} overflows supported counter precision (signed 8 bytes integer)", increment));
             }

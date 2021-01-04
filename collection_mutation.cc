@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "types/collection.hh"
@@ -61,7 +50,7 @@ bool collection_mutation_view::is_empty() const {
 }
 
 template <typename F>
-GCC6_CONCEPT(requires std::is_invocable_r_v<const data::type_info&, F, collection_mutation_input_stream&>)
+requires std::is_invocable_r_v<const data::type_info&, F, collection_mutation_input_stream&>
 static bool is_any_live(const atomic_cell_value_view& data, tombstone tomb, gc_clock::time_point now, F&& read_cell_type_info) {
     auto in = collection_mutation_input_stream(data);
     auto has_tomb = in.read_trivial<bool>();
@@ -108,7 +97,7 @@ bool collection_mutation_view::is_any_live(const abstract_type& type, tombstone 
 }
 
 template <typename F>
-GCC6_CONCEPT(requires std::is_invocable_r_v<const data::type_info&, F, collection_mutation_input_stream&>)
+requires std::is_invocable_r_v<const data::type_info&, F, collection_mutation_input_stream&>
 static api::timestamp_type last_update(const atomic_cell_value_view& data, F&& read_cell_type_info) {
     auto in = collection_mutation_input_stream(data);
     api::timestamp_type max = api::missing_timestamp;
@@ -313,7 +302,7 @@ collection_mutation collection_mutation_view_description::serialize(const abstra
 }
 
 template <typename C>
-GCC6_CONCEPT(requires std::is_base_of_v<abstract_type, std::remove_reference_t<C>>)
+requires std::is_base_of_v<abstract_type, std::remove_reference_t<C>>
 static collection_mutation_view_description
 merge(collection_mutation_view_description a, collection_mutation_view_description b, C&& key_type) {
     using element_type = std::pair<bytes_view, atomic_cell_view>;
@@ -375,7 +364,7 @@ collection_mutation merge(const abstract_type& type, collection_mutation_view a,
 }
 
 template <typename C>
-GCC6_CONCEPT(requires std::is_base_of_v<abstract_type, std::remove_reference_t<C>>)
+requires std::is_base_of_v<abstract_type, std::remove_reference_t<C>>
 static collection_mutation_view_description
 difference(collection_mutation_view_description a, collection_mutation_view_description b, C&& key_type)
 {
@@ -421,7 +410,7 @@ collection_mutation difference(const abstract_type& type, collection_mutation_vi
 }
 
 template <typename F>
-GCC6_CONCEPT(requires std::is_invocable_r_v<std::pair<bytes_view, atomic_cell_view>, F, collection_mutation_input_stream&>)
+requires std::is_invocable_r_v<std::pair<bytes_view, atomic_cell_view>, F, collection_mutation_input_stream&>
 static collection_mutation_view_description
 deserialize_collection_mutation(collection_mutation_input_stream& in, F&& read_kv) {
     collection_mutation_view_description ret;

@@ -5,27 +5,16 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "alternator/server.hh"
 #include "log.hh"
 #include <seastar/http/function_handlers.hh>
 #include <seastar/json/json_elements.hh>
-#include <seastarx.hh>
+#include "seastarx.hh"
 #include "error.hh"
-#include "rjson.hh"
+#include "utils/rjson.hh"
 #include "auth.hh"
 #include <cctype>
 #include "cql3/query_processor.hh"
@@ -75,20 +64,17 @@ public:
                  // returned to the client as expected. Other types of
                  // exceptions are unexpected, and returned to the user
                  // as an internal server error:
-                 api_error ret;
                  try {
                      resf.get();
                  } catch (api_error &ae) {
-                     ret = ae;
+                     generate_error_reply(*rep, ae);
                  } catch (rjson::error & re) {
-                     ret = api_error("ValidationException", re.what());
+                     generate_error_reply(*rep,
+                             api_error::validation(re.what()));
                  } catch (...) {
-                     ret = api_error(
-                             "Internal Server Error",
-                             format("Internal server error: {}", std::current_exception()),
-                             reply::status_type::internal_server_error);
+                     generate_error_reply(*rep,
+                             api_error::internal(format("Internal server error: {}", std::current_exception())));
                  }
-                 generate_error_reply(*rep, ret);
                  return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
              }
              auto res = resf.get0();
@@ -188,11 +174,11 @@ future<> server::verify_signature(const request& req) {
     }
     auto host_it = req._headers.find("Host");
     if (host_it == req._headers.end()) {
-        throw api_error("InvalidSignatureException", "Host header is mandatory for signature verification");
+        throw api_error::invalid_signature("Host header is mandatory for signature verification");
     }
     auto authorization_it = req._headers.find("Authorization");
     if (authorization_it == req._headers.end()) {
-        throw api_error("InvalidSignatureException", "Authorization header is mandatory for signature verification");
+        throw api_error::missing_authentication_token("Authorization header is mandatory for signature verification");
     }
     std::string host = host_it->second;
     std::vector<std::string_view> credentials_raw = split(authorization_it->second, ' ');
@@ -204,7 +190,7 @@ future<> server::verify_signature(const request& req) {
         std::vector<std::string_view> entry_split = split(entry, '=');
         if (entry_split.size() != 2) {
             if (entry != "AWS4-HMAC-SHA256") {
-                throw api_error("InvalidSignatureException", format("Only AWS4-HMAC-SHA256 algorithm is supported. Found: {}", entry));
+                throw api_error::invalid_signature(format("Only AWS4-HMAC-SHA256 algorithm is supported. Found: {}", entry));
             }
             continue;
         }
@@ -225,7 +211,7 @@ future<> server::verify_signature(const request& req) {
     }
     std::vector<std::string_view> credential_split = split(credential, '/');
     if (credential_split.size() != 5) {
-        throw api_error("ValidationException", format("Incorrect credential information format: {}", credential));
+        throw api_error::validation(format("Incorrect credential information format: {}", credential));
     }
     std::string user(credential_split[0]);
     std::string datestamp(credential_split[1]);
@@ -246,8 +232,8 @@ future<> server::verify_signature(const request& req) {
         }
     }
 
-    auto cache_getter = [] (std::string username) {
-        return get_key_from_roles(cql3::get_query_processor().local(), std::move(username));
+    auto cache_getter = [&qp = _qp] (std::string username) {
+        return get_key_from_roles(qp, std::move(username));
     };
     return _key_cache.get_ptr(user, cache_getter).then([this, &req,
                                                     user = std::move(user),
@@ -263,7 +249,7 @@ future<> server::verify_signature(const request& req) {
 
         if (signature != std::string_view(user_signature)) {
             _key_cache.remove(user);
-            throw api_error("UnrecognizedClientException", "The security token included in the request is invalid.");
+            throw api_error::unrecognized_client("The security token included in the request is invalid.");
         }
     });
 }
@@ -274,13 +260,12 @@ future<executor::request_return_type> server::handle_api_request(std::unique_ptr
     std::vector<std::string_view> split_target = split(target, '.');
     //NOTICE(sarna): Target consists of Dynamo API version followed by a dot '.' and operation type (e.g. CreateTable)
     std::string op = split_target.empty() ? std::string() : std::string(split_target.back());
-    slogger.trace("Request: {} {}", op, req->content);
+    slogger.trace("Request: {} {} {}", op, req->content, req->_headers);
     return verify_signature(*req).then([this, op, req = std::move(req)] () mutable {
         auto callback_it = _callbacks.find(op);
         if (callback_it == _callbacks.end()) {
             _executor._stats.unsupported_operations++;
-            throw api_error("UnknownOperationException",
-                    format("Unsupported operation {}", op));
+            throw api_error::unknown_operation(format("Unsupported operation {}", op));
         }
         return with_gate(_pending_requests, [this, callback_it = std::move(callback_it), op = std::move(op), req = std::move(req)] () mutable {
             //FIXME: Client state can provide more context, e.g. client's endpoint address
@@ -332,10 +317,11 @@ void server::set_routes(routes& r) {
 //FIXME: A way to immediately invalidate the cache should be considered,
 // e.g. when the system table which stores the keys is changed.
 // For now, this propagation may take up to 1 minute.
-server::server(executor& exec)
+server::server(executor& exec, cql3::query_processor& qp)
         : _http_server("http-alternator")
         , _https_server("https-alternator")
         , _executor(exec)
+        , _qp(qp)
         , _key_cache(1024, 1min, slogger)
         , _enforce_authorization(false)
         , _enabled_servers{}
@@ -349,6 +335,9 @@ server::server(executor& exec)
         }},
         {"DeleteTable", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
             return e.delete_table(client_state, std::move(trace_state), std::move(permit), std::move(json_request));
+        }},
+        {"UpdateTable", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
+            return e.update_table(client_state, std::move(trace_state), std::move(permit), std::move(json_request));
         }},
         {"PutItem", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
             return e.put_item(client_state, std::move(trace_state), std::move(permit), std::move(json_request));
@@ -389,6 +378,18 @@ server::server(executor& exec)
         {"ListTagsOfResource", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
             return e.list_tags_of_resource(client_state, std::move(permit), std::move(json_request));
         }},
+        {"ListStreams", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
+            return e.list_streams(client_state, std::move(permit), std::move(json_request));
+        }},
+        {"DescribeStream", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
+            return e.describe_stream(client_state, std::move(permit), std::move(json_request));
+        }},
+        {"GetShardIterator", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
+            return e.get_shard_iterator(client_state, std::move(permit), std::move(json_request));
+        }},
+        {"GetRecords", [] (executor& e, executor::client_state& client_state, tracing::trace_state_ptr trace_state, service_permit permit, rjson::value json_request, std::unique_ptr<request> req) {
+            return e.get_records(client_state, std::move(trace_state), std::move(permit), std::move(json_request));
+        }},
     } {
 }
 
@@ -409,15 +410,19 @@ future<> server::init(net::inet_address addr, std::optional<uint16_t> port, std:
                 _http_server.set_content_length_limit(server::content_length_limit);
                 _http_server.listen(socket_address{addr, *port}).get();
                 _enabled_servers.push_back(std::ref(_http_server));
-                slogger.info("Alternator HTTP server listening on {} port {}", addr, *port);
             }
             if (https_port) {
                 set_routes(_https_server._routes);
                 _https_server.set_content_length_limit(server::content_length_limit);
-                _https_server.set_tls_credentials(creds->build_server_credentials());
+                _https_server.set_tls_credentials(creds->build_reloadable_server_credentials([](const std::unordered_set<sstring>& files, std::exception_ptr ep) {
+                    if (ep) {
+                        slogger.warn("Exception loading {}: {}", files, ep);
+                    } else {
+                        slogger.info("Reloaded {}", files);
+                    }
+                }).get0());
                 _https_server.listen(socket_address{addr, *https_port}).get();
                 _enabled_servers.push_back(std::ref(_https_server));
-                slogger.info("Alternator HTTPS server listening on {} port {}", addr, *https_port);
             }
         } catch (...) {
             slogger.error("Failed to set up Alternator HTTP server on {} port {}, TLS port {}: {}",

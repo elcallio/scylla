@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -26,6 +15,7 @@
 #include "utils/anchorless_list.hh"
 #include "utils/logalloc.hh"
 #include "utils/coroutine.hh"
+#include "utils/chunked_vector.hh"
 
 #include <boost/intrusive/parent_from_member.hpp>
 #include <boost/intrusive/slist.hpp>
@@ -400,10 +390,13 @@ public:
     ::static_row static_row(bool digest_requested) const;
     bool static_row_continuous() const;
     mutation_partition squashed() const;
+
+    using range_tombstone_result = utils::chunked_vector<range_tombstone>;
+
     // Returns range tombstones overlapping with [start, end)
-    std::vector<range_tombstone> range_tombstones(position_in_partition_view start, position_in_partition_view end);
+    range_tombstone_result range_tombstones(position_in_partition_view start, position_in_partition_view end);
     // Returns all range tombstones
-    std::vector<range_tombstone> range_tombstones();
+    range_tombstone_result range_tombstones();
 };
 
 class partition_snapshot_ptr {
@@ -469,7 +462,6 @@ private:
     void set_version(partition_version*);
 public:
     struct evictable_tag {};
-    class rows_iterator;
     // Constructs a non-evictable entry holding empty partition
     partition_entry() = default;
     // Constructs a non-evictable entry

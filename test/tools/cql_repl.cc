@@ -5,21 +5,12 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 #include <filesystem>
-#include <regex>
+// use boost::regex instead of std::regex due
+// to stack overflow in debug mode
+#include <boost/regex.hpp>
 
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
@@ -34,11 +25,13 @@
 #include "types/list.hh"
 #include "types/set.hh"
 #include "db/config.hh"
+#include "db/paxos_grace_seconds_extension.hh"
 #include "cql3/cql_config.hh"
 #include "cql3/type_json.hh"
 #include "test/lib/exception_utils.hh"
 #include "alternator/tags_extension.hh"
 #include "cdc/cdc_extension.hh"
+#include <json/json.h>
 
 static std::ofstream std_cout;
 
@@ -118,15 +111,16 @@ void repl(seastar::app_template& app) {
     auto ext = std::make_shared<db::extensions>();
     ext->add_schema_extension<alternator::tags_extension>(alternator::tags_extension::NAME);
     ext->add_schema_extension<cdc::cdc_extension>(cdc::cdc_extension::NAME);
+    ext->add_schema_extension<db::paxos_grace_seconds_extension>(db::paxos_grace_seconds_extension::NAME);
     auto db_cfg = ::make_shared<db::config>(std::move(ext));
     db_cfg->enable_user_defined_functions({true}, db::config::config_source::CommandLine);
     db_cfg->experimental_features(db::experimental_features_t::all(), db::config::config_source::CommandLine);
     do_with_cql_env_thread([] (cql_test_env& e) {
 
         // Comments allowed by CQL - -- and //
-        const std::regex comment_re("^[[:space:]]*((--|//).*)?$");
+        const boost::regex comment_re("^[[:space:]]*((--|//).*)?$");
         // A comment is not a delimiter even if ends with one
-        const std::regex delimiter_re("^(?![[:space:]]*(--|//)).*;[[:space:]]*$");
+        const boost::regex delimiter_re("^(?![[:space:]]*(--|//)).*;[[:space:]]*$");
 
         while (std::cin) {
             std::string line;
@@ -135,12 +129,12 @@ void repl(seastar::app_template& app) {
                 break;
             }
             // Handle multiline input and comments
-            if (std::regex_match(line.begin(), line.end(), comment_re)) {
+            if (boost::regex_match(line.begin(), line.end(), comment_re)) {
                 std_cout << line << std::endl;
                 continue;
             }
             stmt << line << std::endl;
-            while (!std::regex_match(line.begin(), line.end(), delimiter_re)) {
+            while (!boost::regex_match(line.begin(), line.end(), delimiter_re)) {
                 // Read the rest of input until delimiter or EOF
                 if (!std::getline(std::cin, line)) {
                     break;
@@ -182,7 +176,7 @@ void repl(seastar::app_template& app) {
 // on the command line.
 void apply_configuration(const boost::program_options::variables_map& cfg) {
 
-    if (cfg.count("input")) {
+    if (cfg.contains("input")) {
         static std::ifstream input(cfg["input"].as<std::string>());
         std::cin.rdbuf(input.rdbuf());
     }
@@ -191,7 +185,7 @@ void apply_configuration(const boost::program_options::variables_map& cfg) {
     // by redirecting std::cout to a file and capturing
     // the old std::cout in std_cout
     auto save_filebuf = std::cout.rdbuf(log.rdbuf());
-    if (cfg.count("output")) {
+    if (cfg.contains("output")) {
         std_cout.open(cfg["output"].as<std::string>());
     } else  {
         std_cout.std::ios::rdbuf(save_filebuf);

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -39,7 +28,12 @@
 
 namespace utils {
 
-inline auto& get_local_injector();
+// Exception thrown by enabled error injection
+class injected_error : public std::runtime_error {
+public:
+    injected_error(const sstring& err_name)
+    : runtime_error{err_name} { }
+};
 
 extern logging::logger errinj_logger;
 
@@ -104,6 +98,7 @@ extern logging::logger errinj_logger;
 
 template <bool injection_enabled>
 class error_injection {
+    inline static thread_local error_injection _local;
     using handler_fun = std::function<void()>;
 
     // String cross-type comparator
@@ -123,7 +118,7 @@ class error_injection {
     std::map<sstring, bool, str_less> _enabled;
 
     bool is_enabled(const std::string_view& injection_name) const {
-        return _enabled.find(injection_name) != _enabled.end();
+        return _enabled.contains(injection_name);
     }
 
     bool is_one_shot(const std::string_view& injection_name) const {
@@ -135,6 +130,18 @@ class error_injection {
     }
 
 public:
+    // \brief Enter into error injection if it's enabled
+    // \param name error injection name to check
+    bool enter(const std::string_view& name) {
+        if (!is_enabled(name)) {
+            return false;
+        }
+        if (is_one_shot(name)) {
+            disable(name);
+        }
+        return true;
+    }
+
     void enable(const std::string_view& injection_name, bool one_shot = false) {
         _enabled.emplace(injection_name, one_shot);
         errinj_logger.debug("Enabling injection {} \"{}\"",
@@ -187,8 +194,8 @@ public:
         return seastar::sleep(duration);
     }
 
-    template <typename Clock, typename Duration>
     // \brief Inject a sleep to deadline (timeout)
+    template <typename Clock, typename Duration>
     [[gnu::always_inline]]
     future<> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline) {
 
@@ -202,7 +209,26 @@ public:
         // Time left until deadline
         std::chrono::milliseconds duration = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
         errinj_logger.debug("Triggering sleep injection \"{}\" ({}ms)", name, duration.count());
-        return seastar::sleep(duration);
+        return seastar::sleep<Clock>(duration);
+    }
+
+    // \brief Inject a sleep to deadline with lambda(timeout)
+    // Avoid adding a sleep continuation in the chain for disabled error injection
+    template <typename Clock, typename Duration, typename Func>
+    [[gnu::always_inline]]
+    std::result_of_t<Func()> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
+                Func&& func) {
+        if (is_enabled(name)) {
+            if (is_one_shot(name)) {
+                disable(name);
+            }
+            std::chrono::milliseconds duration = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
+            errinj_logger.debug("Triggering sleep injection \"{}\" ({}ms)", name, duration.count());
+            return seastar::sleep<Clock>(duration).then([func = std::move(func)] {
+                    return func(); });
+        } else {
+            return func();
+        }
     }
 
     // \brief Inject exception
@@ -227,21 +253,21 @@ public:
 
     future<> enable_on_all(const std::string_view& injection_name, bool one_shot = false) {
         return smp::invoke_on_all([injection_name = sstring(injection_name), one_shot] {
-            auto& errinj = utils::get_local_injector();
+            auto& errinj = _local;
             errinj.enable(injection_name, one_shot);
         });
     }
 
     static future<> disable_on_all(const std::string_view& injection_name) {
         return smp::invoke_on_all([injection_name = sstring(injection_name)] {
-            auto& errinj = utils::get_local_injector();
+            auto& errinj = _local;
             errinj.disable(injection_name);
         });
     }
 
     static future<> disable_on_all() {
         return smp::invoke_on_all([] {
-            auto& errinj = utils::get_local_injector();
+            auto& errinj = _local;
             errinj.disable_all();
         });
     }
@@ -251,18 +277,26 @@ public:
         // so returning the list from the current shard will do.
         // In future different shards may have different enabled sets,
         // in which case we may want to extend the API.
-        auto& errinj = utils::get_local_injector();
+        auto& errinj = _local;
         return errinj.enabled_injections();
     }
 
+    static error_injection& get_local() {
+        return _local;
+    }
 };
 
 
 // no-op, should be optimized away
 template <>
 class error_injection<false> {
+    static thread_local error_injection _local;
     using handler_fun = std::function<void()>;
 public:
+    bool enter(const std::string_view& name) const {
+        return false;
+    }
+
     [[gnu::always_inline]]
     void enable(const std::string_view& injection_name, const bool one_shot = false) {}
 
@@ -286,11 +320,20 @@ public:
         return make_ready_future<>();
     }
 
-    // Inject a sleep to deadline (timeout)
-    template<class TimePoint>
+    // \brief Inject a sleep to deadline (timeout)
+    template <typename Clock, typename Duration>
     [[gnu::always_inline]]
-    future<> inject(const std::string_view& name, TimePoint deadline) {
+    future<> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline) {
         return make_ready_future<>();
+    }
+
+    // \brief Inject a sleep to deadline (timeout) with lambda
+    // Avoid adding a continuation in the chain for disabled error injections
+    template <typename Clock, typename Duration, typename Func>
+    [[gnu::always_inline]]
+    std::result_of_t<Func()> inject(const std::string_view& name, std::chrono::time_point<Clock, Duration> deadline,
+                Func&& func) {
+        return func();
     }
 
     // Inject exception
@@ -321,15 +364,20 @@ public:
 
     [[gnu::always_inline]]
     static std::vector<sstring> enabled_injections_on_all() { return {}; }
+
+    static error_injection& get_local() {
+        return _local;
+    }
 };
 
-inline auto& get_local_injector() {
 #ifdef SCYLLA_ENABLE_ERROR_INJECTION
-    thread_local error_injection<true> local_injector;        // debug, dev
+using error_injection_type = error_injection<true>;        // debug, dev
 #else
-    thread_local error_injection<false> local_injector;       // release
+using error_injection_type = error_injection<false>;       // release
 #endif
-    return local_injector;
+
+inline error_injection_type& get_local_injector() {
+    return error_injection_type::get_local();
 }
 
 } // namespace utils

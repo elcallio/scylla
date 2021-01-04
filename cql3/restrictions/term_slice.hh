@@ -35,6 +35,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include "to_string.hh"
 #include "exceptions/exceptions.hh"
+#include "index/secondary_index_manager.hh"
 
 namespace cql3 {
 
@@ -110,13 +111,13 @@ public:
         bool supported = false;
         if (has_bound(statements::bound::START)) {
             supported |= is_inclusive(statements::bound::START)
-                         ? index.supports_expression(cdef, cql3::operator_type::GTE)
-                         : index.supports_expression(cdef, cql3::operator_type::GT);
+                    ? index.supports_expression(cdef, cql3::expr::oper_t::GTE)
+                    : index.supports_expression(cdef, cql3::expr::oper_t::GT);
         }
         if (has_bound(statements::bound::END)) {
             supported |= is_inclusive(statements::bound::END)
-                         ? index.supports_expression(cdef, cql3::operator_type::LTE)
-                         : index.supports_expression(cdef, cql3::operator_type::LT);
+                    ? index.supports_expression(cdef, cql3::expr::oper_t::LTE)
+                    : index.supports_expression(cdef, cql3::expr::oper_t::LT);
         }
         return supported;
     }

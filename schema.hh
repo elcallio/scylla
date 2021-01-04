@@ -28,10 +28,9 @@
 #include "unimplemented.hh"
 #include "utils/UUID.hh"
 #include "compress.hh"
-#include "compaction_strategy.hh"
+#include "compaction_strategy_type.hh"
 #include "caching_options.hh"
 #include "column_computation.hh"
-#include "cdc/cdc_options.hh"
 
 namespace dht {
 
@@ -39,6 +38,12 @@ class i_partitioner;
 class sharder;
 
 }
+
+namespace cdc {
+class options;
+}
+
+class database;
 
 using column_count_type = uint32_t;
 
@@ -304,7 +309,7 @@ public:
     ordinal_column_id ordinal_id;
 
     column_kind kind;
-    ::shared_ptr<cql3::column_specification> column_specification;
+    lw_shared_ptr<cql3::column_specification> column_specification;
 
     // NOTICE(sarna): This copy constructor is hand-written instead of default,
     // because it involves deep copying of the computation object.
@@ -431,6 +436,9 @@ public:
     bool is_atomic() const { return _is_atomic; }
 };
 
+bool operator==(const column_mapping_entry& lhs, const column_mapping_entry& rhs);
+bool operator!=(const column_mapping_entry& lhs, const column_mapping_entry& rhs);
+
 // Encapsulates information needed for converting mutations between different schema versions.
 //
 // Unsafe to access across shards.
@@ -469,6 +477,8 @@ public:
     }
     friend std::ostream& operator<<(std::ostream& out, const column_mapping& cm);
 };
+
+bool operator==(const column_mapping& lhs, const column_mapping& rhs);
 
 /**
  * Augments a schema with fields related to materialized views.
@@ -608,7 +618,8 @@ private:
         bool _is_counter = false;
         cf_type _type = cf_type::standard;
         int32_t _gc_grace_seconds = DEFAULT_GC_GRACE_SECONDS;
-        double _dc_local_read_repair_chance = 0.1;
+        std::optional<int32_t> _paxos_grace_seconds;
+        double _dc_local_read_repair_chance = 0.0;
         double _read_repair_chance = 0.0;
         double _crc_check_chance = 1;
         int32_t _min_compaction_threshold = DEFAULT_MIN_COMPACTION_THRESHOLD;
@@ -619,7 +630,7 @@ private:
         speculative_retry _speculative_retry = ::speculative_retry(speculative_retry::type::PERCENTILE, 0.99);
         // FIXME: SizeTiered doesn't really work yet. Being it marked here only means that this is the strategy
         // we will use by default - when we have the choice.
-        sstables::compaction_strategy_type _compaction_strategy = sstables::compaction_strategy_type::size_tiered;
+        sstables::compaction_strategy_type _compaction_strategy = sstables::compaction_strategy_type::incremental;
         std::map<sstring, sstring> _compaction_strategy_options;
         bool _compaction_enabled = true;
         caching_options _caching_options;
@@ -680,7 +691,7 @@ public:
         data_type type;
     };
 private:
-    ::shared_ptr<cql3::column_specification> make_column_specification(const column_definition& def);
+    lw_shared_ptr<cql3::column_specification> make_column_specification(const column_definition& def);
     void rebuild();
     schema(const raw_schema&, std::optional<raw_view_info>);
 public:
@@ -755,6 +766,8 @@ public:
         auto seconds = std::chrono::seconds(_raw._gc_grace_seconds);
         return std::chrono::duration_cast<gc_clock::duration>(seconds);
     }
+
+    gc_clock::duration paxos_grace_seconds() const;
 
     double dc_local_read_repair_chance() const {
         return _raw._dc_local_read_repair_chance;
@@ -944,7 +957,7 @@ public:
      * Index or Local Index).
      *
      */
-    std::ostream& describe(std::ostream& os) const;
+    std::ostream& describe(database& db, std::ostream& os) const;
     friend bool operator==(const schema&, const schema&);
     const column_mapping& get_column_mapping() const;
     friend class schema_registry_entry;
@@ -964,6 +977,10 @@ public:
         return _v3_columns;
     }
 };
+
+lw_shared_ptr<schema> make_shared_schema(std::optional<utils::UUID> id, std::string_view ks_name, std::string_view cf_name,
+    std::vector<schema::column> partition_key, std::vector<schema::column> clustering_key, std::vector<schema::column> regular_columns,
+    std::vector<schema::column> static_columns, data_type regular_column_name_type, std::string_view comment = {});
 
 bool operator==(const schema&, const schema&);
 

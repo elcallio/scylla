@@ -6,18 +6,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -52,8 +41,6 @@
 #include "utils/disk-error-handler.hh"
 #include "sstables/progress_monitor.hh"
 #include "db/commitlog/replay_position.hh"
-#include "flat_mutation_reader.hh"
-#include "utils/phased_barrier.hh"
 #include "component_type.hh"
 #include "sstable_version.hh"
 #include "db/large_data_handler.hh"
@@ -61,12 +48,14 @@
 #include "stats.hh"
 #include "utils/observable.hh"
 #include "sstables/shareable_components.hh"
+#include "sstables/open_info.hh"
+#include "query-request.hh"
 
 #include <seastar/util/optimized_optional.hh>
 #include <boost/intrusive/list.hpp>
 
 class sstable_assertions;
-
+class flat_mutation_reader;
 class row_consumer;
 
 namespace sstables {
@@ -81,33 +70,29 @@ extern logging::logger sstlog;
 class key;
 class sstable_writer;
 class sstable_writer_k_l;
-struct foreign_sstable_open_info;
-struct sstable_open_info;
 class sstables_manager;
 
-GCC6_CONCEPT(
 template<typename T>
-concept bool ConsumeRowsContext() {
-    return requires(T c, indexable_element el, size_t s) {
-        { c.consume_input() } -> future<>;
-        { c.reset(el) } -> void;
-        { c.fast_forward_to(s, s) } -> future<>;
-        { c.position() } -> uint64_t;
-        { c.skip_to(s) } -> future<>;
-        { c.reader_position() } -> const sstables::reader_position_tracker&;
-        { c.eof() } -> bool;
-        { c.close() } -> future<>;
+concept ConsumeRowsContext =
+    requires(T c, indexable_element el, size_t s) {
+        { c.consume_input() } -> std::same_as<future<>>;
+        { c.reset(el) } -> std::same_as<void>;
+        { c.fast_forward_to(s, s) } -> std::same_as<future<>>;
+        { c.position() } -> std::same_as<uint64_t>;
+        { c.skip_to(s) } -> std::same_as<future<>>;
+        { c.reader_position() } -> std::same_as<const sstables::reader_position_tracker&>;
+        { c.eof() } -> std::same_as<bool>;
+        { c.close() } -> std::same_as<future<>>;
     };
-}
-)
 
 template <typename DataConsumeRowsContext>
-GCC6_CONCEPT(
-    requires ConsumeRowsContext<DataConsumeRowsContext>()
-)
+requires ConsumeRowsContext<DataConsumeRowsContext>
 class data_consume_context;
 
 class index_reader;
+class sstables_manager;
+
+extern bool use_binary_search_in_promoted_index;
 
 extern size_t summary_byte_cost(double summary_ratio);
 
@@ -118,6 +103,7 @@ struct sstable_writer_config {
     bool leave_unsealed = false;
     bool validate_keys;
     std::optional<db::replay_position> replay_position;
+    std::optional<int> sstable_level;
     write_monitor* monitor = &default_write_monitor();
     bool correctly_serialize_non_compound_range_tombstones;
     bool correctly_serialize_static_compact_in_mc;
@@ -138,6 +124,7 @@ public:
     using version_types = sstable_version_types;
     using format_types = sstable_format_types;
     using tracker_link_type = bi::list_member_hook<bi::link_mode<bi::auto_unlink>>;
+    using manager_link_type = bi::list_member_hook<bi::link_mode<bi::auto_unlink>>;
 public:
     sstable(schema_ptr schema,
             sstring dir,
@@ -152,8 +139,6 @@ public:
     sstable& operator=(const sstable&) = delete;
     sstable(const sstable&) = delete;
     sstable(sstable&&) = delete;
-
-    ~sstable();
 
     // disk_read_range describes a byte ranges covering part of an sstable
     // row that we need to read from disk. Usually this is the whole byte
@@ -190,12 +175,12 @@ public:
                                                  version_types v, format_types f);
 
     // load sstable using components shared by a shard
-    future<> load(foreign_sstable_open_info info);
+    future<> load(foreign_sstable_open_info info) noexcept;
     // load all components from disk
     // this variant will be useful for testing purposes and also when loading
     // a new sstable from scratch for sharing its components.
-    future<> load(const io_priority_class& pc = default_priority_class());
-    future<> open_data();
+    future<> load(const io_priority_class& pc = default_priority_class()) noexcept;
+    future<> open_data() noexcept;
     future<> update_info_for_opened_data();
 
     future<> set_generation(int64_t generation);
@@ -309,18 +294,16 @@ public:
         return _marked_for_deletion == mark_for_deletion::marked;
     }
 
+    const std::set<int>& compaction_ancestors() const {
+        return _compaction_ancestors;
+    }
+
     void add_ancestor(int64_t generation) {
-        _collector.add_ancestor(generation);
+        _compaction_ancestors.insert(generation);
     }
 
     // Returns true iff this sstable contains data which belongs to many shards.
-    bool is_shared() const {
-        return _shared;
-    }
-
-    void set_unshared() {
-        _shared = false;
-    }
+    bool is_shared() const;
 
     // Returns uncompressed size of data component.
     uint64_t data_size() const;
@@ -419,10 +402,6 @@ public:
 
     bool requires_view_building() const;
 
-    metadata_collector& get_metadata_collector() {
-        return _collector;
-    }
-
     std::vector<std::pair<component_type, sstring>> all_components() const;
 
     future<> create_links(const sstring& dir, int64_t generation) const;
@@ -455,16 +434,44 @@ public:
     }
 
     template<typename Func, typename... Args>
-    auto sstable_write_io_check(Func&& func, Args&&... args) const {
-        return do_io_check(_write_error_handler, func, std::forward<Args>(args)...);
+    requires std::is_nothrow_move_constructible_v<Func>
+    auto sstable_write_io_check(Func&& func, Args&&... args) const noexcept {
+        return do_io_check(_write_error_handler, std::forward<Func>(func), std::forward<Args>(args)...);
     }
 
     // required since touch_directory has an optional parameter
-    auto sstable_touch_directory_io_check(sstring name) const {
+    auto sstable_touch_directory_io_check(sstring name) const noexcept {
         return do_io_check(_write_error_handler, [name = std::move(name)] () mutable {
             return touch_directory(std::move(name));
         });
     }
+    future<> close_files();
+
+    /* Returns a lower-bound for the set of `position_in_partition`s appearing in the sstable across all partitions.
+     *
+     * Might be `before_all_keys` if, for example, the sstable comes from outside Scylla and lacks sufficient metadata,
+     * or the sstable's schema does not have clustering columns.
+     *
+     * But if the schema has clustering columns and the sstable is sufficiently ``modern'',
+     * the returned value should be equal to the smallest clustering key occuring in the sstable (across all partitions).
+     *
+     * The lower bound is inclusive: there might be a clustering row with position equal to min_position.
+     */
+    const position_in_partition& min_position() const {
+        return _position_range.start();
+    }
+
+    /* Similar to min_position, but returns an upper-bound.
+     * However, the upper-bound is exclusive: all positions are smaller than max_position.
+     *
+     * If certain conditions are satisfied (the same as for `min_position`, see above),
+     * the returned value should be equal to after_key(ck), where ck is the greatest clustering key
+     * occuring in the sstable (across all partitions).
+     */
+    const position_in_partition& max_position() const {
+        return _position_range.end();
+    }
+
 private:
     size_t sstable_buffer_size;
 
@@ -476,12 +483,10 @@ private:
 
     foreign_ptr<lw_shared_ptr<shareable_components>> _components = make_foreign(make_lw_shared<shareable_components>());
     column_translation _column_translation;
-    bool _shared = true;  // across shards; safe default
     bool _open = false;
-    // NOTE: _collector and _c_stats are used to generation of statistics file
-    // when writing a new sstable.
-    metadata_collector _collector;
-    column_stats _c_stats;
+    // _compaction_ancestors track which sstable generations were used to generate this sstable.
+    // it is then used to generate the ancestors metadata in the statistics or scylla components.
+    std::set<int> _compaction_ancestors;
     file _index_file;
     file _data_file;
     uint64_t _data_file_size;
@@ -489,7 +494,7 @@ private:
     uint64_t _filter_file_size = 0;
     uint64_t _bytes_on_disk = 0;
     db_clock::time_point _data_file_write_time;
-    std::vector<nonwrapping_range<bytes_view>> _clustering_components_ranges;
+    position_range _position_range = position_range::all_clustered_rows();
     std::vector<unsigned> _shards;
     std::optional<dht::decorated_key> _first;
     std::optional<dht::decorated_key> _last;
@@ -498,36 +503,7 @@ private:
 
     lw_shared_ptr<file_input_stream_history> _single_partition_history = make_lw_shared<file_input_stream_history>();
     lw_shared_ptr<file_input_stream_history> _partition_range_history = make_lw_shared<file_input_stream_history>();
-
-    //FIXME: Set by sstable_writer to influence sstable writing behavior.
-    //       Remove when doing #3012
-    bool _correctly_serialize_non_compound_range_tombstones;
-
-    // _pi_write is used temporarily for building the promoted
-    // index (column sample) of one partition when writing a new sstable.
-    struct {
-        // Unfortunately we cannot output the promoted index directly to the
-        // index file because it needs to be prepended by its size.
-        bytes_ostream data;
-        uint32_t numblocks;
-        deletion_time deltime;
-        uint64_t block_start_offset;
-        uint64_t block_next_start_offset;
-        bytes block_first_colname;
-        bytes block_last_colname;
-        std::optional<range_tombstone_accumulator> tombstone_accumulator;
-        const schema* schemap;
-        size_t desired_block_size;
-    } _pi_write;
-
-    void maybe_flush_pi_block(file_writer& out,
-            const composite& clustering_key,
-            const std::vector<bytes_view>& column_names,
-            composite::eoc marker = composite::eoc::none);
-
-    void maybe_flush_pi_block(file_writer& out,
-            const composite& clustering_key,
-            bytes colname);
+    lw_shared_ptr<file_input_stream_history> _index_history = make_lw_shared<file_input_stream_history>();
 
     schema_ptr _schema;
     sstring _dir;
@@ -543,6 +519,7 @@ private:
         none = 0,
         marked = 1
     } _marked_for_deletion = mark_for_deletion::none;
+    bool _active = true;
 
     gc_clock::time_point _now;
 
@@ -554,11 +531,21 @@ private:
 
     sstables_stats _stats;
     tracker_link_type _tracker_link;
+    manager_link_type _manager_link;
 
+    // The _large_data_stats map stores e.g. largest partitions, rows, cells sizes,
+    // and max number of rows in a partition.
+    //
+    // It can be disengaged normally when loading legacy sstables that do not have this
+    // information in their scylla metadata.
+    std::optional<scylla_metadata::large_data_stats> _large_data_stats;
 public:
     const bool has_component(component_type f) const;
+    sstables_manager& manager() { return _manager; }
+    const sstables_manager& manager() const { return _manager; }
 private:
-    future<file> open_file(component_type, open_flags, file_open_options = {});
+    void unused(); // Called when reference count drops to zero
+    future<file> open_file(component_type, open_flags, file_open_options = {}) noexcept;
 
     template <component_type Type, typename T>
     future<> read_simple(T& comp, const io_priority_class& pc);
@@ -571,8 +558,11 @@ private:
     void write_crc(const checksum& c);
     void write_digest(uint32_t full_checksum);
 
-    future<file> rename_new_sstable_component_file(sstring from_file, sstring to_file, file fd);
-    future<file> new_sstable_component_file(const io_error_handler& error_handler, component_type f, open_flags flags, file_open_options options = {});
+    future<> rename_new_sstable_component_file(sstring from_file, sstring to_file);
+    future<file> new_sstable_component_file(const io_error_handler& error_handler, component_type f, open_flags flags, file_open_options options = {}) noexcept;
+
+    future<file_writer> make_component_file_writer(component_type c, file_output_stream_options options,
+            open_flags oflags = open_flags::wo | open_flags::create | open_flags::exclusive) noexcept;
 
     future<> touch_temp_dir();
     future<> remove_temp_dir();
@@ -584,14 +574,15 @@ private:
     future<> read_compression(const io_priority_class& pc);
     void write_compression(const io_priority_class& pc);
 
-    future<> read_scylla_metadata(const io_priority_class& pc);
-    void write_scylla_metadata(const io_priority_class& pc, shard_id shard, sstable_enabled_features features, run_identifier identifier);
+    future<> read_scylla_metadata(const io_priority_class& pc) noexcept;
+    void write_scylla_metadata(const io_priority_class& pc, shard_id shard, sstable_enabled_features features, run_identifier identifier,
+            std::optional<scylla_metadata::large_data_stats> ld_stats);
 
     future<> read_filter(const io_priority_class& pc);
 
     void write_filter(const io_priority_class& pc);
 
-    future<> read_summary(const io_priority_class& pc);
+    future<> read_summary(const io_priority_class& pc) noexcept;
 
     void write_summary(const io_priority_class& pc) {
         write_simple<component_type::Summary>(_components->summary, pc);
@@ -619,13 +610,12 @@ private:
 
     void set_first_and_last_keys();
 
-    // Create one range for each clustering component of this sstable.
-    // Each range stores min and max value for that specific component.
+    // Create a position range based on the min/max_column_names metadata of this sstable.
     // It does nothing if schema defines no clustering key, and it's supposed
     // to be called when loading an existing sstable or after writing a new one.
-    void set_clustering_components_ranges();
+    void set_position_range();
 
-    future<> create_data();
+    future<> create_data() noexcept;
 
     // Return an input_stream which reads exactly the specified byte range
     // from the data file (after uncompression, if the file is compressed).
@@ -644,30 +634,12 @@ private:
     // determined using the index file).
     // This function is intended (and optimized for) random access, not
     // for iteration through all the rows.
-    future<temporary_buffer<char>> data_read(uint64_t pos, size_t len, const io_priority_class& pc);
+    future<temporary_buffer<char>> data_read(uint64_t pos, size_t len, const io_priority_class& pc, reader_permit permit);
 
     future<summary_entry&> read_summary_entry(size_t i);
 
     // FIXME: pending on Bloom filter implementation
     bool filter_has_key(const schema& s, const dht::decorated_key& dk) { return filter_has_key(key::from_partition_key(s, dk._key)); }
-
-    // NOTE: functions used to generate sstable components.
-    void maybe_write_row_marker(file_writer& out, const schema& schema, const row_marker& marker, const composite& clustering_key);
-    void write_clustered_row(file_writer& out, const schema& schema, const clustering_row& clustered_row);
-    void write_static_row(file_writer& out, const schema& schema, const row& static_row);
-    void write_cell(file_writer& out, atomic_cell_view cell, const column_definition& cdef);
-    void write_range_tombstone(file_writer& out, const composite& start, composite::eoc start_marker, const composite& end, composite::eoc end_marker,
-                               std::vector<bytes_view> suffix, const tombstone t, const column_mask = column_mask::range_tombstone);
-    void write_range_tombstone_bound(file_writer& out, const schema& s, const composite& clustering_element, const std::vector<bytes_view>& column_names, composite::eoc marker = composite::eoc::none);
-    void index_tombstone(file_writer& out, const composite& key, range_tombstone&& rt, composite::eoc marker);
-    void write_collection(file_writer& out, const composite& clustering_key, const column_definition& cdef, collection_mutation_view collection);
-    void maybe_write_row_tombstone(file_writer& out, const composite& key, const clustering_row& clustered_row);
-    void write_deletion_time(file_writer& out, const tombstone t);
-
-    void index_and_write_column_name(file_writer& out,
-            const composite& clustering,
-            const std::vector<bytes_view>& column_names,
-            composite::eoc marker = composite::eoc::none);
 
     std::optional<std::pair<uint64_t, uint64_t>> get_sample_indexes_for_range(const dht::token_range& range);
     std::optional<std::pair<uint64_t, uint64_t>> get_index_pages_for_range(const dht::token_range& range);
@@ -686,8 +658,14 @@ private:
         serialization_header& s = *static_cast<serialization_header *>(p.get());
         return s;
     }
+
+    future<> open_or_create_data(open_flags oflags, file_open_options options = {}) noexcept;
+
+    future<> check_create_links_replay(const sstring& dst_dir, int64_t dst_gen, const std::vector<std::pair<sstables::component_type, sstring>>& comps) const;
+    future<> create_links_common(const sstring& dst_dir, int64_t dst_gen, bool mark_for_removal) const;
+    future<> create_links_and_mark_for_removal(const sstring& dst_dir, int64_t dst_gen) const;
 public:
-    future<> read_toc();
+    future<> read_toc() noexcept;
 
     shareable_components& get_shared_components() const {
         return *_components;
@@ -724,7 +702,7 @@ public:
     }
 
     bool has_correct_max_deletion_time() const {
-        return (_version == sstable_version_types::mc) || has_scylla_component();
+        return (_version >= sstable_version_types::mc) || has_scylla_component();
     }
 
     bool filter_has_key(const key& key) const {
@@ -826,8 +804,6 @@ public:
         return _components->summary;
     }
 
-    const std::vector<nonwrapping_range<bytes_view>>& clustering_components_ranges() const;
-
     // Gets ratio of droppable tombstone. A tombstone is considered droppable here
     // for cells expired before gc_before and regular tombstones older than gc_before.
     double estimate_droppable_tombstone_ratio(gc_clock::time_point gc_before) const;
@@ -836,14 +812,27 @@ public:
     // at another shard.
     future<foreign_sstable_open_info> get_open_info() &;
 
-    // returns all info needed for a sstable to be shared with other shards.
-    future<sstable_open_info> load_shared_components();
-
     sstables_stats& get_stats() {
         return _stats;
     }
 
-    void update_stats_on_end_of_stream();
+    bool has_correct_min_max_column_names() const noexcept {
+        return _version >= sstable_version_types::md;
+    }
+
+    // Return true if this sstable possibly stores clustering row(s) specified by ranges.
+    bool may_contain_rows(const query::clustering_row_ranges& ranges) const;
+
+    // false => there are no partition tombstones, true => we don't know
+    bool may_have_partition_tombstones() const {
+        return !has_correct_min_max_column_names()
+            || _position_range.is_all_clustered_rows(*_schema);
+    }
+
+    // Return the large_data_stats_entry identified by large_data_type
+    // iff _large_data_stats is available and the requested entry is in
+    // the map.  Otherwise, return a disengaged optional.
+    std::optional<large_data_stats_entry> get_large_data_stat(large_data_type t) const noexcept;
 
     // Allow the test cases from sstable_test.cc to test private methods. We use
     // a placeholder to avoid cluttering this class too much. The sstable_test class
@@ -851,9 +840,13 @@ public:
     friend class test;
 
     friend class components_writer;
+    friend class sstable_writer;
     friend class sstable_writer_k_l;
     friend class mc::writer;
     friend class index_reader;
+    friend class sstable_writer;
+    friend class compaction;
+    friend class sstables_manager;
     template <typename DataConsumeRowsContext>
     friend data_consume_context<DataConsumeRowsContext>
     data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&, disk_read_range, uint64_t);
@@ -863,34 +856,8 @@ public:
     template <typename DataConsumeRowsContext>
     friend data_consume_context<DataConsumeRowsContext>
     data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext::consumer&);
+    friend void lw_shared_ptr_deleter<sstables::sstable>::dispose(sstable* s);
 };
-
-struct entry_descriptor {
-    sstring sstdir;
-    sstring ks;
-    sstring cf;
-    int64_t generation;
-    sstable::version_types version;
-    sstable::format_types format;
-    component_type component;
-
-    static entry_descriptor make_descriptor(sstring sstdir, sstring fname);
-
-    entry_descriptor(sstring sstdir, sstring ks, sstring cf, int64_t generation,
-                     sstable::version_types version, sstable::format_types format,
-                     component_type component)
-        : sstdir(sstdir), ks(ks), cf(cf), generation(generation), version(version), format(format), component(component) {}
-};
-
-// Waits for all prior tasks started on current shard related to sstable management to finish.
-//
-// There may be asynchronous cleanup started from sstable destructor. Since we can't have blocking
-// destructors in seastar, that cleanup is not waited for. It can be waited for using this function.
-// It is also waited for when seastar exits.
-future<> await_background_jobs();
-
-// Invokes await_background_jobs() on all shards
-future<> await_background_jobs_on_all_shards();
 
 // When we compact sstables, we have to atomically instantiate the new
 // sstable and delete the old ones.  Otherwise, if we compact A+B into C,
@@ -938,31 +905,11 @@ public:
     stop_iteration consume(range_tombstone&& rt);
     stop_iteration consume_end_of_partition();
     void consume_end_of_stream();
-};
 
-// contains data for loading a sstable using components shared by a single shard;
-// can be moved across shards
-struct foreign_sstable_open_info {
-    foreign_ptr<lw_shared_ptr<shareable_components>> components;
-    std::vector<shard_id> owners;
-    seastar::file_handle data;
-    seastar::file_handle index;
-    uint64_t generation;
-    sstable::version_types version;
-    sstable::format_types format;
-};
-
-// can only be used locally
-struct sstable_open_info {
-    lw_shared_ptr<shareable_components> components;
-    std::vector<shard_id> owners;
-    file data;
-    file index;
+    metadata_collector& get_metadata_collector();
 };
 
 future<> init_metrics();
-
-utils::phased_barrier& background_jobs();
 
 class file_io_extension {
 public:

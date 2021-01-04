@@ -22,7 +22,7 @@ static thread_local std::unordered_map<cause, bool> _warnings;
 static logging::logger ulogger("unimplemented");
 
 std::ostream& operator<<(std::ostream& out, cause c) {
-    switch(c) {
+    switch (c) {
         case cause::INDEXES: return out << "INDEXES";
         case cause::LWT: return out << "LWT";
         case cause::PAGING: return out << "PAGING";
@@ -56,8 +56,7 @@ std::ostream& operator<<(std::ostream& out, cause c) {
 }
 
 void warn(cause c) {
-    auto i = _warnings.find(c);
-    if (i == _warnings.end()) {
+    if (!_warnings.contains(c)) {
         _warnings.insert({c, true});
         ulogger.debug("{}", c);
     }

@@ -5,22 +5,12 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "leveled_compaction_strategy.hh"
 #include <algorithm>
+#include <ranges>
 
 namespace sstables {
 
@@ -59,7 +49,7 @@ compaction_descriptor leveled_compaction_strategy::get_sstables_for_compaction(c
         auto& sst = *std::max_element(sstables.begin(), sstables.end(), [&] (auto& i, auto& j) {
             return i->estimate_droppable_tombstone_ratio(gc_before) < j->estimate_droppable_tombstone_ratio(gc_before);
         });
-        return sstables::compaction_descriptor({ sst }, sst->get_sstable_level());
+        return sstables::compaction_descriptor({ sst }, cfs.get_sstable_set(), service::get_local_compaction_priority(), sst->get_sstable_level());
     }
     return {};
 }
@@ -72,40 +62,8 @@ compaction_descriptor leveled_compaction_strategy::get_major_compaction_job(colu
     auto& sst = *std::max_element(candidates.begin(), candidates.end(), [&] (sstables::shared_sstable& sst1, sstables::shared_sstable& sst2) {
         return sst1->get_sstable_level() < sst2->get_sstable_level();
     });
-    return compaction_descriptor(std::move(candidates), sst->get_sstable_level(), _max_sstable_size_in_mb*1024*1024);
-}
-
-std::vector<resharding_descriptor> leveled_compaction_strategy::get_resharding_jobs(column_family& cf, std::vector<shared_sstable> candidates) {
-    leveled_manifest manifest = leveled_manifest::create(cf, candidates, _max_sstable_size_in_mb, _stcs_options);
-
-    std::vector<resharding_descriptor> descriptors;
-    shard_id target_shard = 0;
-    auto get_shard = [&target_shard] { return target_shard++ % smp::count; };
-
-    // Basically, we'll iterate through all levels, and for each, we'll sort the
-    // sstables by first key because there's a need to reshard together adjacent
-    // sstables.
-    // The shard at which the job will run is chosen in a round-robin fashion.
-    for (auto level = 0U; level <= manifest.get_level_count(); level++) {
-        uint64_t max_sstable_size = !level ? std::numeric_limits<uint64_t>::max() : (_max_sstable_size_in_mb*1024*1024);
-        auto& sstables = manifest.get_level(level);
-        boost::sort(sstables, [] (auto& i, auto& j) {
-            return i->compare_by_first_key(*j) < 0;
-        });
-
-        resharding_descriptor current_descriptor = resharding_descriptor{{}, max_sstable_size, get_shard(), level};
-
-        for (auto it = sstables.begin(); it != sstables.end(); it++) {
-            current_descriptor.sstables.push_back(*it);
-
-            auto next = std::next(it);
-            if (current_descriptor.sstables.size() == smp::count || next == sstables.end()) {
-                descriptors.push_back(std::move(current_descriptor));
-                current_descriptor = resharding_descriptor{{}, max_sstable_size, get_shard(), level};
-            }
-        }
-    }
-    return descriptors;
+    return compaction_descriptor(std::move(candidates), cf.get_sstable_set(), service::get_local_compaction_priority(),
+                                 sst->get_sstable_level(), _max_sstable_size_in_mb*1024*1024);
 }
 
 void leveled_compaction_strategy::notify_completion(const std::vector<shared_sstable>& removed, const std::vector<shared_sstable>& added) {
@@ -168,6 +126,81 @@ int64_t leveled_compaction_strategy::estimated_pending_compactions(column_family
     }
     leveled_manifest manifest = leveled_manifest::create(cf, sstables, _max_sstable_size_in_mb, _stcs_options);
     return manifest.get_estimated_tasks();
+}
+
+compaction_descriptor
+leveled_compaction_strategy::get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, const ::io_priority_class& iop, reshape_mode mode) {
+    std::array<std::vector<shared_sstable>, leveled_manifest::MAX_LEVELS> level_info;
+
+    auto is_disjoint = [this, schema] (const std::vector<shared_sstable>& sstables, unsigned tolerance) -> std::tuple<bool, unsigned> {
+        unsigned overlapping_sstables = 0;
+        auto prev_last = dht::ring_position::min();
+        for (auto& sst : sstables) {
+            if (dht::ring_position(sst->get_first_decorated_key()).less_compare(*schema, prev_last)) {
+                overlapping_sstables++;
+            }
+            prev_last = dht::ring_position(sst->get_last_decorated_key());
+        }
+        return { overlapping_sstables <= tolerance, overlapping_sstables };
+    };
+
+    for (auto& sst : input) {
+        auto sst_level = sst->get_sstable_level();
+        if (sst_level > leveled_manifest::MAX_LEVELS - 1) {
+            leveled_manifest::logger.warn("Found SSTable with level {}, higher than the maximum {}. This is unexpected, but will fix", sst_level, leveled_manifest::MAX_LEVELS - 1);
+
+            // This is really unexpected, so we'll just compact it all to fix it
+            compaction_descriptor desc(std::move(input), std::optional<sstables::sstable_set>(), iop, leveled_manifest::MAX_LEVELS - 1, _max_sstable_size_in_mb * 1024 * 1024);
+            desc.options = compaction_options::make_reshape();
+            return desc;
+        }
+        level_info[sst_level].push_back(sst);
+    }
+
+    // Can't use std::ranges::views::drop due to https://bugs.llvm.org/show_bug.cgi?id=47509
+    for (auto i = level_info.begin() + 1; i != level_info.end(); ++i) {
+        auto& level = *i;
+        std::sort(level.begin(), level.end(), [&schema] (const shared_sstable& a, const shared_sstable& b) {
+            return dht::ring_position(a->get_first_decorated_key()).less_compare(*schema, dht::ring_position(b->get_first_decorated_key()));
+        });
+    }
+
+    unsigned max_filled_level = 0;
+
+    size_t offstrategy_threshold = std::max(schema->min_compaction_threshold(), 4);
+    size_t max_sstables = std::max(schema->max_compaction_threshold(), int(offstrategy_threshold));
+    auto tolerance = [mode] (unsigned level) -> unsigned {
+        if (mode == reshape_mode::strict) {
+            return 0;
+        }
+        constexpr unsigned fan_out = leveled_manifest::leveled_fan_out;
+        return std::max(double(fan_out), std::ceil(std::pow(fan_out, level) * 0.1));
+    };
+
+    if (level_info[0].size() > offstrategy_threshold) {
+        level_info[0].resize(std::min(level_info[0].size(), max_sstables));
+        compaction_descriptor desc(std::move(level_info[0]), std::optional<sstables::sstable_set>(), iop);
+        desc.options = compaction_options::make_reshape();
+        return desc;
+    }
+
+    for (unsigned level = leveled_manifest::MAX_LEVELS - 1; level > 0; --level) {
+        if (level_info[level].empty()) {
+            continue;
+        }
+        max_filled_level = std::max(max_filled_level, level);
+
+        auto [disjoint, overlapping_sstables] = is_disjoint(level_info[level], tolerance(level));
+        if (!disjoint) {
+            leveled_manifest::logger.warn("Turns out that level {} is not disjoint, found {} overlapping SSTables, so compacting everything on behalf of {}.{}", level, overlapping_sstables, schema->ks_name(), schema->cf_name());
+            // Unfortunately no good limit to limit input size to max_sstables for LCS major
+            compaction_descriptor desc(std::move(input), std::optional<sstables::sstable_set>(), iop, max_filled_level, _max_sstable_size_in_mb * 1024 * 1024);
+            desc.options = compaction_options::make_reshape();
+            return desc;
+        }
+    }
+
+   return compaction_descriptor();
 }
 
 }

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "cql3/statements/drop_function_statement.hh"
@@ -43,7 +32,7 @@ std::unique_ptr<prepared_statement> drop_function_statement::prepare(database& d
 }
 
 future<shared_ptr<cql_transport::event::schema_change>> drop_function_statement::announce_migration(
-        service::storage_proxy& proxy, bool is_local_only) const {
+        service::storage_proxy& proxy) const {
     if (!_func) {
         return make_ready_future<shared_ptr<cql_transport::event::schema_change>>();
     }
@@ -51,7 +40,7 @@ future<shared_ptr<cql_transport::event::schema_change>> drop_function_statement:
     if (!user_func) {
         throw exceptions::invalid_request_exception(format("'{}' is not a user defined function", _func));
     }
-    return service::get_local_migration_manager().announce_function_drop(user_func, is_local_only).then([this] {
+    return service::get_local_migration_manager().announce_function_drop(user_func).then([this] {
         return create_schema_change(*_func, false);
     });
 }

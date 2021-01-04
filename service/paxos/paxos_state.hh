@@ -26,18 +26,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 #pragma once
 #include "service/paxos/proposal.hh"
@@ -54,6 +43,10 @@ using clock_type = db::timeout_clock;
 
 // The state of a CAS update of a given primary key as persisted in the paxos table.
 class paxos_state {
+public:
+    class guard;
+private:
+
     class key_lock_map {
         using semaphore = basic_semaphore<semaphore_default_exception_factory, clock_type>;
         using map = std::unordered_map<dht::token, semaphore>;
@@ -75,6 +68,8 @@ class paxos_state {
                 release_semaphore_for_key(key);
             });
         }
+
+        friend class guard;
     };
 
     // Locks are local to the shard which owns the corresponding token range.
@@ -100,12 +95,30 @@ class paxos_state {
 
 public:
 
-    // taken by the coordinator code to queue concurrent requests
-    template<typename Func>
-    static
-    futurize_t<std::result_of_t<Func()>> with_cas_lock(const dht::token& key, clock_type::time_point timeout, Func func) {
-        return _coordinator_lock.with_locked_key(key, timeout, std::move(func));
-    }
+    class guard {
+        key_lock_map& _map;
+        dht::token _key;
+        clock_type::time_point _timeout;
+        bool _locked = false;
+    public:
+        future<> lock() {
+            auto f = _map.get_semaphore_for_key(_key).wait(_timeout, 1);
+            _locked = true;
+            return f;
+        }
+        guard(key_lock_map& map, const dht::token& key, clock_type::time_point timeout) : _map(map), _key(key), _timeout(timeout) {};
+        guard(guard&& o) noexcept : _map(o._map), _key(std::move(o._key)), _timeout(o._timeout), _locked(o._locked) {
+            o._locked = false;
+        }
+        ~guard() {
+            if (_locked) {
+                _map.get_semaphore_for_key(_key).signal(1);
+                _map.release_semaphore_for_key(_key);
+            }
+        }
+    };
+
+    static future<guard> get_cas_lock(const dht::token& key, clock_type::time_point timeout);
 
     static logging::logger logger;
 

@@ -30,7 +30,7 @@
 
 namespace encryption {
 
-namespace bfs = boost::filesystem;
+namespace bfs = std::filesystem;
 
 const sstring default_key_file_path = (bfs::path(db::config::get_conf_dir()) / "data_encryption_keys").string();
 
@@ -115,7 +115,7 @@ future<key_ptr>
 local_file_provider::load_or_create(const key_info& info) {
     // if someone uses a system key as a table key, we could still race
     // here. but that is a user error, so ignore
-    if (engine().cpu_id() == 0 || &info == &system_key_info) {
+    if (this_shard_id() == 0 || &info == &system_key_info) {
         return load_or_create_local(info);
     }
 

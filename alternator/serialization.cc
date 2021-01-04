@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "base64.hh"
@@ -31,8 +20,8 @@ static logging::logger slogger("alternator-serialization");
 
 namespace alternator {
 
-type_info type_info_from_string(std::string type) {
-    static thread_local const std::unordered_map<std::string, type_info> type_infos = {
+type_info type_info_from_string(std::string_view type) {
+    static thread_local const std::unordered_map<std::string_view, type_info> type_infos = {
         {"S", {alternator_type::S, utf8_type}},
         {"B", {alternator_type::B, bytes_type}},
         {"BOOL", {alternator_type::BOOL, boolean_type}},
@@ -65,7 +54,7 @@ struct from_json_visitor {
 
     void operator()(const reversed_type_impl& t) const { visit(*t.underlying_type(), from_json_visitor{v, bo}); };
     void operator()(const string_type_impl& t) {
-        bo.write(t.from_string(sstring_view(v.GetString(), v.GetStringLength())));
+        bo.write(t.from_string(rjson::to_string_view(v)));
     }
     void operator()(const bytes_type_impl& t) const {
         bo.write(base64_decode(v));
@@ -74,23 +63,27 @@ struct from_json_visitor {
         bo.write(boolean_type->decompose(v.GetBool()));
     }
     void operator()(const decimal_type_impl& t) const {
-        bo.write(t.from_string(sstring_view(v.GetString(), v.GetStringLength())));
+        try {
+            bo.write(t.from_string(rjson::to_string_view(v)));
+        } catch (const marshal_exception& e) {
+            throw api_error::validation(format("The parameter cannot be converted to a numeric value: {}", v));
+        }
     }
     // default
     void operator()(const abstract_type& t) const {
-        bo.write(from_json_object(t, Json::Value(rjson::print(v)), cql_serialization_format::internal()));
+        bo.write(from_json_object(t, v, cql_serialization_format::internal()));
     }
 };
 
 bytes serialize_item(const rjson::value& item) {
     if (item.IsNull() || item.MemberCount() != 1) {
-        throw api_error("ValidationException", format("An item can contain only one attribute definition: {}", item));
+        throw api_error::validation(format("An item can contain only one attribute definition: {}", item));
     }
     auto it = item.MemberBegin();
-    type_info type_info = type_info_from_string(it->name.GetString()); // JSON keys are guaranteed to be strings
+    type_info type_info = type_info_from_string(rjson::to_string_view(it->name)); // JSON keys are guaranteed to be strings
 
     if (type_info.atype == alternator_type::NOT_SUPPORTED_YET) {
-        slogger.trace("Non-optimal serialization of type {}", it->name.GetString());
+        slogger.trace("Non-optimal serialization of type {}", it->name);
         return bytes{int8_t(type_info.atype)} + to_bytes(rjson::print(item));
     }
 
@@ -128,7 +121,7 @@ struct to_json_visitor {
 rjson::value deserialize_item(bytes_view bv) {
     rjson::value deserialized(rapidjson::kObjectType);
     if (bv.empty()) {
-        throw api_error("ValidationException", "Serialized value empty");
+        throw api_error::validation("Serialized value empty");
     }
 
     alternator_type atype = alternator_type(bv[0]);
@@ -153,7 +146,9 @@ std::string type_to_string(data_type type) {
     };
     auto it = types.find(type);
     if (it == types.end()) {
-        throw std::runtime_error(format("Unknown type {}", type->name()));
+        // fall back to string, in order to be able to present
+        // internal Scylla types in a human-readable way
+        return "S";
     }
     return it->second;
 }
@@ -162,7 +157,7 @@ bytes get_key_column_value(const rjson::value& item, const column_definition& co
     std::string column_name = column.name_as_text();
     const rjson::value* key_typed_value = rjson::find(item, column_name);
     if (!key_typed_value) {
-        throw api_error("ValidationException", format("Key column {} not found", column_name));
+        throw api_error::validation(format("Key column {} not found", column_name));
     }
     return get_key_from_typed_value(*key_typed_value, column);
 }
@@ -173,16 +168,21 @@ bytes get_key_column_value(const rjson::value& item, const column_definition& co
 bytes get_key_from_typed_value(const rjson::value& key_typed_value, const column_definition& column) {
     if (!key_typed_value.IsObject() || key_typed_value.MemberCount() != 1 ||
             !key_typed_value.MemberBegin()->value.IsString()) {
-        throw api_error("ValidationException",
+        throw api_error::validation(
                 format("Malformed value object for key column {}: {}",
                         column.name_as_text(), key_typed_value));
     }
 
     auto it = key_typed_value.MemberBegin();
     if (it->name != type_to_string(column.type)) {
-        throw api_error("ValidationException",
+        throw api_error::validation(
                 format("Type mismatch: expected type {} for key column {}, got type {}",
-                        type_to_string(column.type), column.name_as_text(), it->name.GetString()));
+                        type_to_string(column.type), column.name_as_text(), it->name));
+    }
+    std::string_view value_view = rjson::to_string_view(it->value);
+    if (value_view.empty()) {
+        throw api_error::validation(
+                format("The AttributeValue for a key attribute cannot contain an empty string value. Key: {}", column.name_as_text()));
     }
     if (column.type == bytes_type) {
         return base64_decode(it->value);
@@ -205,8 +205,11 @@ rjson::value json_key_column_value(bytes_view cell, const column_definition& col
         auto s = to_json_string(*decimal_type, bytes(cell));
         return rjson::from_string(s);
     } else {
-        // We shouldn't get here, we shouldn't see such key columns.
-        throw std::runtime_error(format("Unexpected key type: {}", column.type->name()));
+        // Support for arbitrary key types is useful for parsing values of virtual tables,
+        // which can involve any type supported by Scylla.
+        // In order to guarantee that the returned type is parsable by alternator clients,
+        // they are represented simply as strings.
+        return rjson::from_string(column.type->to_string(bytes(cell)));
     }
 }
 
@@ -237,20 +240,24 @@ clustering_key ck_from_json(const rjson::value& item, schema_ptr schema) {
 
 big_decimal unwrap_number(const rjson::value& v, std::string_view diagnostic) {
     if (!v.IsObject() || v.MemberCount() != 1) {
-        throw api_error("ValidationException", format("{}: invalid number object", diagnostic));
+        throw api_error::validation(format("{}: invalid number object", diagnostic));
     }
     auto it = v.MemberBegin();
     if (it->name != "N") {
-        throw api_error("ValidationException", format("{}: expected number, found type '{}'", diagnostic, it->name));
+        throw api_error::validation(format("{}: expected number, found type '{}'", diagnostic, it->name));
     }
-    if (it->value.IsNumber()) {
-         // FIXME(sarna): should use big_decimal constructor with numeric values directly:
-        return big_decimal(rjson::print(it->value));
+    try {
+        if (it->value.IsNumber()) {
+             // FIXME(sarna): should use big_decimal constructor with numeric values directly:
+            return big_decimal(rjson::print(it->value));
+        }
+        if (!it->value.IsString()) {
+            throw api_error::validation(format("{}: improperly formatted number constant", diagnostic));
+        }
+        return big_decimal(rjson::to_string_view(it->value));
+    } catch (const marshal_exception& e) {
+        throw api_error::validation(format("The parameter cannot be converted to a numeric value: {}", it->value));
     }
-    if (!it->value.IsString()) {
-        throw api_error("ValidationException", format("{}: improperly formatted number constant", diagnostic));
-    }
-    return big_decimal(it->value.GetString());
 }
 
 const std::pair<std::string, const rjson::value*> unwrap_set(const rjson::value& v) {
@@ -263,6 +270,95 @@ const std::pair<std::string, const rjson::value*> unwrap_set(const rjson::value&
         return {"", nullptr};
     }
     return std::make_pair(it_key, &(it->value));
+}
+
+const rjson::value* unwrap_list(const rjson::value& v) {
+    if (!v.IsObject() || v.MemberCount() != 1) {
+        return nullptr;
+    }
+    auto it = v.MemberBegin();
+    if (it->name != std::string("L")) {
+        return nullptr;
+    }
+    return &(it->value);
+}
+
+// Take two JSON-encoded numeric values ({"N": "thenumber"}) and return the
+// sum, again as a JSON-encoded number.
+rjson::value number_add(const rjson::value& v1, const rjson::value& v2) {
+    auto n1 = unwrap_number(v1, "UpdateExpression");
+    auto n2 = unwrap_number(v2, "UpdateExpression");
+    rjson::value ret = rjson::empty_object();
+    std::string str_ret = std::string((n1 + n2).to_string());
+    rjson::set(ret, "N", rjson::from_string(str_ret));
+    return ret;
+}
+
+rjson::value number_subtract(const rjson::value& v1, const rjson::value& v2) {
+    auto n1 = unwrap_number(v1, "UpdateExpression");
+    auto n2 = unwrap_number(v2, "UpdateExpression");
+    rjson::value ret = rjson::empty_object();
+    std::string str_ret = std::string((n1 - n2).to_string());
+    rjson::set(ret, "N", rjson::from_string(str_ret));
+    return ret;
+}
+
+// Take two JSON-encoded set values (e.g. {"SS": [...the actual set]}) and
+// return the sum of both sets, again as a set value.
+rjson::value set_sum(const rjson::value& v1, const rjson::value& v2) {
+    auto [set1_type, set1] = unwrap_set(v1);
+    auto [set2_type, set2] = unwrap_set(v2);
+    if (set1_type != set2_type) {
+        throw api_error::validation(format("Mismatched set types: {} and {}", set1_type, set2_type));
+    }
+    if (!set1 || !set2) {
+        throw api_error::validation("UpdateExpression: ADD operation for sets must be given sets as arguments");
+    }
+    rjson::value sum = rjson::copy(*set1);
+    std::set<rjson::value, rjson::single_value_comp> set1_raw;
+    for (auto it = sum.Begin(); it != sum.End(); ++it) {
+        set1_raw.insert(rjson::copy(*it));
+    }
+    for (const auto& a : set2->GetArray()) {
+        if (!set1_raw.contains(a)) {
+            rjson::push_back(sum, rjson::copy(a));
+        }
+    }
+    rjson::value ret = rjson::empty_object();
+    rjson::set_with_string_name(ret, set1_type, std::move(sum));
+    return ret;
+}
+
+// Take two JSON-encoded set values (e.g. {"SS": [...the actual list]}) and
+// return the difference of s1 - s2, again as a set value.
+// DynamoDB does not allow empty sets, so if resulting set is empty, return
+// an unset optional instead.
+std::optional<rjson::value> set_diff(const rjson::value& v1, const rjson::value& v2) {
+    auto [set1_type, set1] = unwrap_set(v1);
+    auto [set2_type, set2] = unwrap_set(v2);
+    if (set1_type != set2_type) {
+        throw api_error::validation(format("Mismatched set types: {} and {}", set1_type, set2_type));
+    }
+    if (!set1 || !set2) {
+        throw api_error::validation("UpdateExpression: DELETE operation can only be performed on a set");
+    }
+    std::set<rjson::value, rjson::single_value_comp> set1_raw;
+    for (auto it = set1->Begin(); it != set1->End(); ++it) {
+        set1_raw.insert(rjson::copy(*it));
+    }
+    for (const auto& a : set2->GetArray()) {
+        set1_raw.erase(a);
+    }
+    if (set1_raw.empty()) {
+        return std::nullopt;
+    }
+    rjson::value ret = rjson::empty_object();
+    rjson::set_with_string_name(ret, set1_type, rjson::empty_array());
+    rjson::value& result_set = ret[set1_type];
+    for (const auto& a : set1_raw) {
+        rjson::push_back(result_set, rjson::copy(a));
+    }
+    return ret;
 }
 
 }

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <boost/type.hpp>
@@ -59,14 +48,57 @@ static void copy_int_to_bytes(int64_t i, size_t offset, bytes& b) {
     std::copy_n(reinterpret_cast<int8_t*>(&i), sizeof(int64_t), b.begin() + offset);
 }
 
-stream_id::stream_id(int64_t first, int64_t second)
+static constexpr auto stream_id_version_bits = 4;
+static constexpr auto stream_id_random_bits = 38;
+static constexpr auto stream_id_index_bits = sizeof(uint64_t)*8 - stream_id_version_bits - stream_id_random_bits;
+
+static constexpr auto stream_id_version_shift = 0;
+static constexpr auto stream_id_index_shift = stream_id_version_shift + stream_id_version_bits;
+static constexpr auto stream_id_random_shift = stream_id_index_shift + stream_id_index_bits;
+
+/**
+ * Responsibilty for encoding stream_id moved from factory method to
+ * this constructor, to keep knowledge of composition in a single place.
+ * Note this is private and friended to topology_description_generator,
+ * because he is the one who defined the "order" we view vnodes etc.
+ */
+stream_id::stream_id(dht::token token, size_t vnode_index)
     : _value(bytes::initialized_later(), 2 * sizeof(int64_t))
 {
-    copy_int_to_bytes(first, 0, _value);
-    copy_int_to_bytes(second, sizeof(int64_t), _value);
+    static thread_local std::mt19937_64 rand_gen(std::random_device{}());
+    static thread_local std::uniform_int_distribution<uint64_t> rand_dist;
+
+    auto rand = rand_dist(rand_gen);
+    auto mask_shift = [](uint64_t val, size_t bits, size_t shift) {
+        return (val & ((1ull << bits) - 1u)) << shift;
+    };
+    /**
+     *  Low qword:
+     * 0-4: version
+     * 5-26: vnode index as when created (see generation below). This excludes shards
+     * 27-64: random value (maybe to be replaced with timestamp)
+     */
+    auto low_qword = mask_shift(version_1, stream_id_version_bits, stream_id_version_shift)
+        | mask_shift(vnode_index, stream_id_index_bits, stream_id_index_shift)
+        | mask_shift(rand, stream_id_random_bits, stream_id_random_shift)
+        ;
+
+    copy_int_to_bytes(dht::token::to_int64(token), 0, _value);
+    copy_int_to_bytes(low_qword, sizeof(int64_t), _value);
+    // not a hot code path. make sure we did not mess up the shifts and masks.
+    assert(version() == version_1);
+    assert(index() == vnode_index);
 }
 
-stream_id::stream_id(bytes b) : _value(std::move(b)) { }
+stream_id::stream_id(bytes b)
+    : _value(std::move(b))
+{
+    // this is not a very solid check. Id:s previous to GA/versioned id:s
+    // have fully random bits in low qword, so this could go either way...
+    if (version() > version_1) {
+        throw std::invalid_argument("Unknown CDC stream id version");
+    }
+}
 
 bool stream_id::is_set() const {
     return !_value.empty();
@@ -76,23 +108,39 @@ bool stream_id::operator==(const stream_id& o) const {
     return _value == o._value;
 }
 
+bool stream_id::operator!=(const stream_id& o) const {
+    return !(*this == o);
+}
+
 bool stream_id::operator<(const stream_id& o) const {
     return _value < o._value;
 }
 
-static int64_t bytes_to_int64(const bytes& b, size_t offset) {
+static int64_t bytes_to_int64(bytes_view b, size_t offset) {
     assert(b.size() >= offset + sizeof(int64_t));
     int64_t res;
     std::copy_n(b.begin() + offset, sizeof(int64_t), reinterpret_cast<int8_t *>(&res));
     return net::ntoh(res);
 }
 
-int64_t stream_id::first() const {
-    return bytes_to_int64(_value, 0);
+dht::token stream_id::token() const {
+    return dht::token::from_int64(token_from_bytes(_value));
 }
 
-int64_t stream_id::second() const {
-    return bytes_to_int64(_value, sizeof(int64_t));
+int64_t stream_id::token_from_bytes(bytes_view b) {
+    return bytes_to_int64(b, 0);
+}
+
+static uint64_t unpack_value(bytes_view b, size_t off, size_t shift, size_t bits) {
+    return (uint64_t(bytes_to_int64(b, off)) >> shift) & ((1ull << bits) - 1u);
+}
+
+uint8_t stream_id::version() const {
+    return unpack_value(_value, sizeof(int64_t), stream_id_version_shift, stream_id_version_bits);
+}
+
+size_t stream_id::index() const {
+    return unpack_value(_value, sizeof(int64_t), stream_id_index_shift, stream_id_index_bits);
 }
 
 const bytes& stream_id::to_bytes() const {
@@ -119,176 +167,101 @@ const std::vector<token_range_description>& topology_description::entries() cons
     return _entries;
 }
 
-static stream_id make_random_stream_id() {
-    static thread_local std::mt19937_64 rand_gen(std::random_device().operator()());
-    static thread_local std::uniform_int_distribution<int64_t> rand_dist(std::numeric_limits<int64_t>::min());
+class topology_description_generator final {
+    const db::config& _cfg;
+    const std::unordered_set<dht::token>& _bootstrap_tokens;
+    const locator::token_metadata_ptr _tmptr;
+    const gms::gossiper& _gossiper;
 
-    return {rand_dist(rand_gen), rand_dist(rand_gen)};
-}
-
-/* Given:
- * 1. a set of tokens which split the token ring into token ranges (vnodes),
- * 2. information on how each token range is distributed among its owning node's shards
- * this function tries to generate a set of CDC stream identifiers such that for each
- * shard and vnode pair there exists a stream whose token falls into this
- * vnode and is owned by this shard.
- *
- * It then builds a cdc::topology_description which maps tokens to these
- * found stream identifiers, such that if token T is owned by shard S in vnode V,
- * it gets mapped to the stream identifier generated for (S, V).
- */
-// Run in seastar::async context.
-topology_description generate_topology_description(
-        const db::config& cfg,
-        const std::unordered_set<dht::token>& bootstrap_tokens,
-        const locator::token_metadata& token_metadata,
-        const gms::gossiper& gossiper) {
-    if (bootstrap_tokens.empty()) {
-        throw std::runtime_error(
-                "cdc: bootstrap tokens is empty in generate_topology_description");
+    // Compute a set of tokens that split the token ring into vnodes
+    auto get_tokens() const {
+        auto tokens = _tmptr->sorted_tokens();
+        auto it = tokens.insert(
+                tokens.end(), _bootstrap_tokens.begin(), _bootstrap_tokens.end());
+        std::sort(it, tokens.end());
+        std::inplace_merge(tokens.begin(), it, tokens.end());
+        tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+        return tokens;
     }
 
-    auto tokens = token_metadata.sorted_tokens();
-    tokens.insert(tokens.end(), bootstrap_tokens.begin(), bootstrap_tokens.end());
-    std::sort(tokens.begin(), tokens.end());
-    tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
-
-    std::vector<token_range_description> entries(tokens.size());
-    int spots_to_fill = 0;
-
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        auto& entry = entries[i];
-        entry.token_range_end = tokens[i];
-
-        if (bootstrap_tokens.count(entry.token_range_end) > 0) {
-            entry.streams.resize(smp::count);
-            entry.sharding_ignore_msb = cfg.murmur3_partitioner_ignore_msb_bits();
+    // Fetch sharding parameters for a node that owns vnode ending with this.end
+    // Returns <shard_count, ignore_msb> pair.
+    std::pair<size_t, uint8_t> get_sharding_info(dht::token end) const {
+        if (_bootstrap_tokens.contains(end)) {
+            return {smp::count, _cfg.murmur3_partitioner_ignore_msb_bits()};
         } else {
-            auto endpoint = token_metadata.get_endpoint(entry.token_range_end);
+            auto endpoint = _tmptr->get_endpoint(end);
             if (!endpoint) {
-                throw std::runtime_error(format("Can't find endpoint for token {}", entry.token_range_end));
+                throw std::runtime_error(
+                        format("Can't find endpoint for token {}", end));
             }
-            auto sc = get_shard_count(*endpoint, gossiper);
-            entry.streams.resize(sc > 0 ? sc : 1);
-            entry.sharding_ignore_msb = get_sharding_ignore_msb(*endpoint, gossiper);
-        }
-
-        spots_to_fill += entry.streams.size();
-    }
-
-    auto schema = schema_builder("fake_ks", "fake_table")
-        .with_column("stream_id", bytes_type, column_kind::partition_key)
-        .build();
-
-    auto quota = std::chrono::seconds(spots_to_fill / 2000 + 1);
-    auto start_time = std::chrono::system_clock::now();
-
-    // For each pair (i, j), 0 <= i < streams.size(), 0 <= j < streams[i].size(),
-    // try to find a stream (stream[i][j]) such that the token of this stream will get mapped to this stream
-    // (refer to the comments above topology_description's definition to understand how it describes the mapping).
-    // We find the streams by randomly generating them and checking into which pairs they get mapped.
-    // NOTE: this algorithm is temporary and will be replaced after per-table-partitioner feature gets merged in.
-    repeat([&] {
-        for (int i = 0; i < 500; ++i) {
-            auto stream_id = make_random_stream_id();
-            auto token = dht::get_token(*schema, stream_id.to_partition_key(*schema));
-
-            // Find the token range into which our stream_id's token landed.
-            auto it = std::lower_bound(tokens.begin(), tokens.end(), token);
-            auto& entry = entries[it != tokens.end() ? std::distance(tokens.begin(), it) : 0];
-
-            auto shard_id = dht::shard_of(entry.streams.size(), entry.sharding_ignore_msb, token);
-            assert(shard_id < entry.streams.size());
-
-            if (!entry.streams[shard_id].is_set()) {
-                --spots_to_fill;
-                entry.streams[shard_id] = stream_id;
-            }
-        }
-
-        if (!spots_to_fill) {
-            return stop_iteration::yes;
-        }
-
-        auto now = std::chrono::system_clock::now();
-        auto passed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
-        if (passed > quota) {
-            return stop_iteration::yes;
-        }
-
-        return stop_iteration::no;
-    }).get();
-
-    if (spots_to_fill) {
-        // We were not able to generate stream ids for each (token range, shard) pair.
-
-        // For each range that has a stream, for each shard for this range that doesn't have a stream,
-        // use the stream id of the next shard for this range.
-
-        // For each range that doesn't have any stream,
-        // use streams of the first range to the left which does have a stream.
-
-        cdc_log.warn("Generation of CDC streams failed to create streams for some (vnode, shard) pair."
-                     " This can lead to worse performance.");
-
-        stream_id some_stream;
-        size_t idx = 0;
-        for (; idx < entries.size(); ++idx) {
-            for (auto s: entries[idx].streams) {
-                if (s.is_set()) {
-                    some_stream = s;
-                    break;
-                }
-            }
-            if (some_stream.is_set()) {
-                break;
-            }
-        }
-
-        assert(idx != entries.size() && some_stream.is_set());
-
-        // Iterate over all ranges in the clockwise direction, starting with the one we found a stream for.
-        for (size_t off = 0; off < entries.size(); ++off) {
-            auto& ss = entries[(idx + off) % entries.size()].streams;
-
-            int last_set_stream_idx = ss.size() - 1;
-            while (last_set_stream_idx > -1 && !ss[last_set_stream_idx].is_set()) {
-                --last_set_stream_idx;
-            }
-
-            if (last_set_stream_idx == -1) {
-                cdc_log.warn(
-                        "CDC wasn't able to generate any stream for vnode ({}, {}]. We'll use another vnode's streams"
-                        " instead. This might lead to inconsistencies.",
-                        tokens[(idx + off + entries.size() - 1) % entries.size()], tokens[(idx + off) % entries.size()]);
-
-                ss[0] = some_stream;
-                last_set_stream_idx = 0;
-            }
-
-            some_stream = ss[last_set_stream_idx];
-
-            // Replace 'unset' stream ids with indexes below last_set_stream_idx
-            for (int s_idx = last_set_stream_idx - 1; s_idx > -1; --s_idx) {
-                if (ss[s_idx].is_set()) {
-                    some_stream = ss[s_idx];
-                } else {
-                    ss[s_idx] = some_stream;
-                }
-            }
-            // Replace 'unset' stream ids with indexes above last_set_stream_idx
-            for (int s_idx = ss.size() - 1; s_idx > last_set_stream_idx; --s_idx) {
-                if (ss[s_idx].is_set()) {
-                    some_stream = ss[s_idx];
-                } else {
-                    ss[s_idx] = some_stream;
-                }
-            }
+            auto sc = get_shard_count(*endpoint, _gossiper);
+            return {sc > 0 ? sc : 1, get_sharding_ignore_msb(*endpoint, _gossiper)};
         }
     }
 
-    return {std::move(entries)};
-}
+    token_range_description create_description(size_t index, dht::token start, dht::token end) const {
+        token_range_description desc;
+
+        desc.token_range_end = end;
+
+        auto [shard_count, ignore_msb] = get_sharding_info(end);
+        desc.streams.reserve(shard_count);
+        desc.sharding_ignore_msb = ignore_msb;
+
+        dht::sharder sharder(shard_count, ignore_msb);
+        for (size_t shard_idx = 0; shard_idx < shard_count; ++shard_idx) {
+            auto t = dht::find_first_token_for_shard(sharder, start, end, shard_idx);
+            // compose the id from token and the "index" of the range end owning vnode
+            // as defined by token sort order. Basically grouping within this
+            // shard set.
+            desc.streams.emplace_back(stream_id(t, index));
+        }
+
+        return desc;
+    }
+public:
+    topology_description_generator(
+            const db::config& cfg,
+            const std::unordered_set<dht::token>& bootstrap_tokens,
+            const locator::token_metadata_ptr tmptr,
+            const gms::gossiper& gossiper)
+        : _cfg(cfg)
+        , _bootstrap_tokens(bootstrap_tokens)
+        , _tmptr(std::move(tmptr))
+        , _gossiper(gossiper)
+    {}
+
+    /*
+     * Generate a set of CDC stream identifiers such that for each shard
+     * and vnode pair there exists a stream whose token falls into this vnode
+     * and is owned by this shard. It is sometimes not possible to generate
+     * a CDC stream identifier for some (vnode, shard) pair because not all
+     * shards have to own tokens in a vnode. Small vnode can be totally owned
+     * by a single shard. In such case, a stream identifier that maps to
+     * end of the vnode is generated.
+     *
+     * Then build a cdc::topology_description which maps tokens to generated
+     * stream identifiers, such that if token T is owned by shard S in vnode V,
+     * it gets mapped to the stream identifier generated for (S, V).
+     */
+    // Run in seastar::async context.
+    topology_description generate() const {
+        const auto tokens = get_tokens();
+
+        std::vector<token_range_description> vnode_descriptions;
+        vnode_descriptions.reserve(tokens.size());
+
+        vnode_descriptions.push_back(
+                create_description(0, tokens.back(), tokens.front()));
+        for (size_t idx = 1; idx < tokens.size(); ++idx) {
+            vnode_descriptions.push_back(
+                    create_description(idx, tokens[idx - 1], tokens[idx]));
+        }
+
+        return {std::move(vnode_descriptions)};
+    }
+};
 
 bool should_propose_first_generation(const gms::inet_address& me, const gms::gossiper& g) {
     auto my_host_id = g.get_host_id(me);
@@ -314,20 +287,19 @@ future<db_clock::time_point> get_local_streams_timestamp() {
 db_clock::time_point make_new_cdc_generation(
         const db::config& cfg,
         const std::unordered_set<dht::token>& bootstrap_tokens,
-        const locator::token_metadata& tm,
+        const locator::token_metadata_ptr tmptr,
         const gms::gossiper& g,
         db::system_distributed_keyspace& sys_dist_ks,
         std::chrono::milliseconds ring_delay,
-        bool for_testing) {
-    assert(!bootstrap_tokens.empty());
-
-    auto gen = generate_topology_description(cfg, bootstrap_tokens, tm, g);
+        bool add_delay) {
+    using namespace std::chrono;
+    auto gen = topology_description_generator(cfg, bootstrap_tokens, tmptr, g).generate();
 
     // Begin the race.
     auto ts = db_clock::now() + (
-            for_testing ? std::chrono::milliseconds(0) : (
-                2 * ring_delay + std::chrono::duration_cast<std::chrono::milliseconds>(generation_leeway)));
-    sys_dist_ks.insert_cdc_topology_description(ts, std::move(gen), { tm.count_normal_token_owners() }).get();
+            (!add_delay || ring_delay == milliseconds(0)) ? milliseconds(0) : (
+                2 * ring_delay + duration_cast<milliseconds>(generation_leeway)));
+    sys_dist_ks.insert_cdc_topology_description(ts, std::move(gen), { tmptr->count_normal_token_owners() }).get();
 
     return ts;
 }
@@ -335,12 +307,7 @@ db_clock::time_point make_new_cdc_generation(
 std::optional<db_clock::time_point> get_streams_timestamp_for(const gms::inet_address& endpoint, const gms::gossiper& g) {
     auto streams_ts_string = g.get_application_state_value(endpoint, gms::application_state::CDC_STREAMS_TIMESTAMP);
     cdc_log.trace("endpoint={}, streams_ts_string={}", endpoint, streams_ts_string);
-
-    if (streams_ts_string.empty()) {
-        return {};
-    }
-
-    return db_clock::time_point(db_clock::duration(std::stoll(streams_ts_string)));
+    return gms::versioned_value::cdc_streams_timestamp_from_string(streams_ts_string);
 }
 
 // Run inside seastar::async context.

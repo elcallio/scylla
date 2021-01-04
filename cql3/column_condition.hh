@@ -32,7 +32,7 @@
 
 #include "cql3/term.hh"
 #include "cql3/abstract_marker.hh"
-#include "cql3/operator.hh"
+#include "cql3/expr/expression.hh"
 #include "utils/like_matcher.hh"
 
 namespace cql3 {
@@ -56,11 +56,11 @@ private:
     // List of terminals for "a IN (value, value, ...)"
     std::vector<::shared_ptr<term>> _in_values;
     const std::unique_ptr<like_matcher> _matcher;
-    const operator_type& _op;
+    expr::oper_t _op;
 public:
     column_condition(const column_definition& column, ::shared_ptr<term> collection_element,
         ::shared_ptr<term> value, std::vector<::shared_ptr<term>> in_values,
-        std::unique_ptr<like_matcher> matcher, const operator_type& op)
+        std::unique_ptr<like_matcher> matcher, expr::oper_t op)
             : column(column)
             , _collection_element(std::move(collection_element))
             , _value(std::move(value))
@@ -68,7 +68,7 @@ public:
             , _matcher(std::move(matcher))
             , _op(op)
     {
-        if (op != operator_type::IN) {
+        if (op != expr::oper_t::IN) {
             assert(_in_values.empty());
         }
     }
@@ -79,8 +79,6 @@ public:
      * bind variables of this term in.
      */
     void collect_marker_specificaton(variable_specifications& bound_names) const;
-
-    bool uses_function(const sstring& ks_name, const sstring& function_name) const;
 
     // Retrieve parameter marker values, if any, find the appropriate collection
     // element if the cell is a collection and an element access is used in the expression,
@@ -93,17 +91,17 @@ public:
      * "IF col = 'foo'"
      * "IF col LIKE <pattern>"
      */
-    static ::shared_ptr<column_condition> condition(const column_definition& def, ::shared_ptr<term> collection_element,
-            ::shared_ptr<term> value, std::unique_ptr<like_matcher> matcher, const operator_type& op) {
-        return ::make_shared<column_condition>(def, std::move(collection_element), std::move(value),
+    static lw_shared_ptr<column_condition> condition(const column_definition& def, ::shared_ptr<term> collection_element,
+            ::shared_ptr<term> value, std::unique_ptr<like_matcher> matcher, expr::oper_t op) {
+        return make_lw_shared<column_condition>(def, std::move(collection_element), std::move(value),
             std::vector<::shared_ptr<term>>{}, std::move(matcher), op);
     }
 
     // Helper constructor wrapper for  "IF col IN ... and IF col['key'] IN ... */
-    static ::shared_ptr<column_condition> in_condition(const column_definition& def, ::shared_ptr<term> collection_element,
+    static lw_shared_ptr<column_condition> in_condition(const column_definition& def, ::shared_ptr<term> collection_element,
             ::shared_ptr<term> in_marker, std::vector<::shared_ptr<term>> in_values) {
-        return ::make_shared<column_condition>(def, std::move(collection_element), std::move(in_marker),
-            std::move(in_values), nullptr, operator_type::IN);
+        return make_lw_shared<column_condition>(def, std::move(collection_element), std::move(in_marker),
+            std::move(in_values), nullptr, expr::oper_t::IN);
     }
 
     class raw final {
@@ -114,13 +112,13 @@ public:
 
         // Can be nullptr, used with the syntax "IF m[e] = ..." (in which case it's 'e')
         ::shared_ptr<term::raw> _collection_element;
-        const operator_type& _op;
+        expr::oper_t _op;
     public:
         raw(::shared_ptr<term::raw> value,
             std::vector<::shared_ptr<term::raw>> in_values,
             ::shared_ptr<abstract_marker::in_raw> in_marker,
             ::shared_ptr<term::raw> collection_element,
-            const operator_type& op)
+            expr::oper_t op)
                 : _value(std::move(value))
                 , _in_values(std::move(in_values))
                 , _in_marker(std::move(in_marker))
@@ -135,9 +133,9 @@ public:
          * "IF col = 'foo'"
          * "IF col LIKE 'foo%'"
          */
-        static ::shared_ptr<raw> simple_condition(::shared_ptr<term::raw> value, ::shared_ptr<term::raw> collection_element,
-                const operator_type& op) {
-            return ::make_shared<raw>(std::move(value), std::vector<::shared_ptr<term::raw>>{},
+        static lw_shared_ptr<raw> simple_condition(::shared_ptr<term::raw> value, ::shared_ptr<term::raw> collection_element,
+                expr::oper_t op) {
+            return make_lw_shared<raw>(std::move(value), std::vector<::shared_ptr<term::raw>>{},
                     ::shared_ptr<abstract_marker::in_raw>{}, std::move(collection_element), op);
         }
 
@@ -149,13 +147,13 @@ public:
          * "IF col['key'] IN * ('foo', 'bar', ...)"
          * "IF col['key'] IN ?"
          */
-        static ::shared_ptr<raw> in_condition(::shared_ptr<term::raw> collection_element,
+        static lw_shared_ptr<raw> in_condition(::shared_ptr<term::raw> collection_element,
                 ::shared_ptr<abstract_marker::in_raw> in_marker, std::vector<::shared_ptr<term::raw>> in_values) {
-            return ::make_shared<raw>(::shared_ptr<term::raw>{}, std::move(in_values), std::move(in_marker),
-                    std::move(collection_element), operator_type::IN);
+            return make_lw_shared<raw>(::shared_ptr<term::raw>{}, std::move(in_values), std::move(in_marker),
+                    std::move(collection_element), expr::oper_t::IN);
         }
 
-        ::shared_ptr<column_condition> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const;
+        lw_shared_ptr<column_condition> prepare(database& db, const sstring& keyspace, const column_definition& receiver) const;
     };
 };
 

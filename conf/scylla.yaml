@@ -100,7 +100,12 @@ listen_address: localhost
 
 # port for the CQL native transport to listen for clients on
 # For security reasons, you should not expose this port to the internet.  Firewall it if needed.
+# To disable the CQL native transport, set this option to 0.
 native_transport_port: 9042
+
+# Like native_transport_port, but clients are forwarded to specific shards, based on the
+# client-side port numbers.
+native_shard_aware_transport_port: 19042
 
 # Enabling native transport encryption in client_encryption_options allows you to either use
 # encryption for the standard port or to use a dedicated, additional port along with the unencrypted
@@ -110,6 +115,10 @@ native_transport_port: 9042
 # from native_transport_port will use encryption for native_transport_port_ssl while
 # keeping native_transport_port unencrypted.
 #native_transport_port_ssl: 9142
+
+# Like native_transport_port_ssl, but clients are forwarded to specific shards, based on the
+# client-side port numbers.
+#native_shard_aware_transport_port_ssl: 19142
 
 # How long the coordinator should wait for read operations to complete
 read_request_timeout_in_ms: 5000
@@ -221,7 +230,14 @@ batch_size_fail_threshold_in_kb: 50
 # - PasswordAuthenticator relies on username/password pairs to authenticate
 #   users. It keeps usernames and hashed passwords in system_auth.credentials table.
 #   Please increase system_auth keyspace replication factor if you use this authenticator.
+# - com.scylladb.auth.TransitionalAuthenticator requires username/password pair
+#   to authenticate in the same manner as PasswordAuthenticator, but improper credentials
+#   result in being logged in as an anonymous user. Use for upgrading clusters' auth.
+# - com.scylladb.auth.SaslauthdAuthenticator outsources authentication to a running saslauthd
+#   daemon. When using this authenticator, you must set the saslauthd_socket_path property to the
+#   Unix domain socket on which saslauthd is listening.
 # authenticator: AllowAllAuthenticator
+# saslauthd_socket_path: /var/state/saslauthd/mux
 
 # Authorization backend, implementing IAuthorizer; used to limit access/provide permissions
 # Out of the box, Scylla provides org.apache.cassandra.auth.{AllowAllAuthorizer,
@@ -230,6 +246,9 @@ batch_size_fail_threshold_in_kb: 50
 # - AllowAllAuthorizer allows any action to any user - set it to disable authorization.
 # - CassandraAuthorizer stores permissions in system_auth.permissions table. Please
 #   increase system_auth keyspace replication factor if you use this authorizer.
+# - com.scylladb.auth.TransitionalAuthorizer wraps around the CassandraAuthorizer, using it for
+#   authorizing permission management. Otherwise, it allows all. Use for upgrading
+#   clusters' auth.
 # authorizer: AllowAllAuthorizer
 
 # initial_token allows you to specify tokens manually.  While you can use # it with
@@ -493,7 +512,6 @@ commitlog_total_space_in_mb: -1
 # List of keyspaces that should be fully audited.
 # All tables in those keyspaces will be audited
 # audit_keyspaces: "<keyspace_name>,<keyspace_name>"
-# audit-keyspaces: "<keyspace_name>,<keyspace_name>"
 
 # Distribution of data among cores (shards) within a node
 #

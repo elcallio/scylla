@@ -6,18 +6,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <algorithm>
@@ -38,6 +27,7 @@
 #include "service/priority_manager.hh"
 #include "database.hh"
 #include "service_permit.hh"
+#include "utils/directories.hh"
 
 using namespace std::literals::chrono_literals;
 
@@ -50,9 +40,9 @@ const std::string manager::FILENAME_PREFIX("HintsLog" + commitlog::descriptor::S
 const std::chrono::seconds manager::hint_file_write_timeout = std::chrono::seconds(2);
 const std::chrono::seconds manager::hints_flush_period = std::chrono::seconds(10);
 
-manager::manager(sstring hints_directory, std::vector<sstring> hinted_dcs, int64_t max_hint_window_ms, resource_manager& res_manager, distributed<database>& db)
+manager::manager(sstring hints_directory, host_filter filter, int64_t max_hint_window_ms, resource_manager& res_manager, distributed<database>& db)
     : _hints_dir(fs::path(hints_directory) / format("{:d}", this_shard_id()))
-    , _hinted_dcs(hinted_dcs.begin(), hinted_dcs.end())
+    , _host_filter(std::move(filter))
     , _local_snitch_ptr(locator::i_endpoint_snitch::get_local_snitch_ptr())
     , _max_hint_window_us(max_hint_window_ms * 1000)
     , _local_db(db.local())
@@ -87,6 +77,14 @@ void manager::register_metrics(const sstring& group_name) {
 
         sm::make_derive("corrupted_files", _stats.corrupted_files,
                         sm::description("Number of hints files that were discarded during sending because the file was corrupted.")),
+
+        sm::make_gauge("pending_drains", 
+                        sm::description("Number of tasks waiting in the queue for draining hints"),
+                        [this] { return _drain_lock.waiters(); }),
+
+        sm::make_gauge("pending_sends",
+                        sm::description("Number of tasks waiting in the queue for sending a hint"),
+                        [this] { return _resource_manager.sending_queue_length(); })
     });
 }
 
@@ -224,7 +222,9 @@ future<> manager::end_point_hints_manager::stop(drain should_drain) noexcept {
         with_lock(file_update_mutex(), [this] {
             if (_hints_store_anchor) {
                 hints_store_ptr tmp = std::exchange(_hints_store_anchor, nullptr);
-                return tmp->shutdown().finally([tmp] {});
+                return tmp->shutdown().finally([tmp] {
+                    return tmp->release();
+                }).finally([tmp] {});
             }
             return make_ready_future<>();
         }).handle_exception([&eptr] (auto e) { eptr = std::move(e); }).get();
@@ -290,7 +290,7 @@ inline bool manager::have_ep_manager(ep_key_type ep) const noexcept {
 }
 
 bool manager::store_hint(ep_key_type ep, schema_ptr s, lw_shared_ptr<const frozen_mutation> fm, tracing::trace_state_ptr tr_state) noexcept {
-    if (stopping() || !started() || !can_hint_for(ep)) {
+    if (stopping() || draining_all() || !started() || !can_hint_for(ep)) {
         manager_logger.trace("Can't store a hint to {}", ep);
         ++_stats.dropped;
         return false;
@@ -326,6 +326,10 @@ future<db::commitlog> manager::end_point_hints_manager::add_store() noexcept {
             // HH doesn't utilize the flow that benefits from reusing segments.
             // Therefore let's simply disable it to avoid any possible confusion.
             cfg.reuse_segments = false;
+            // HH leaves segments on disk after commitlog shutdown, and later reads
+            // them when commitlog is re-created. This is expected to happen regularly
+            // during standard HH workload, so no need to print a warning about it.
+            cfg.warn_about_segments_left_on_disk_after_shutdown = false;
 
             return commitlog::create_commitlog(std::move(cfg)).then([this] (commitlog l) {
                 // add_store() is triggered every time hint files are forcefully flushed to I/O (every hints_flush_period).
@@ -352,7 +356,9 @@ future<> manager::end_point_hints_manager::flush_current_hints() noexcept {
         return futurize_invoke([this] {
             return with_lock(file_update_mutex(), [this]() -> future<> {
                 return get_or_load().then([] (hints_store_ptr cptr) {
-                    return cptr->shutdown();
+                    return cptr->shutdown().finally([cptr] {
+                        return cptr->release();
+                    }).finally([cptr] {});
                 }).then([this] {
                     // Un-hold the commitlog object. Since we are under the exclusive _file_update_mutex lock there are no
                     // other hints_store_ptr copies and this would destroy the commitlog shared value.
@@ -516,12 +522,56 @@ bool manager::can_hint_for(ep_key_type ep) const noexcept {
     return true;
 }
 
+future<> manager::change_host_filter(host_filter filter) {
+    if (!started()) {
+        return make_exception_future<>(std::logic_error("change_host_filter: called before the hints_manager was started"));
+    }
+
+    return with_gate(_draining_eps_gate, [this, filter = std::move(filter)] () mutable {
+        return with_semaphore(drain_lock(), 1, [this, filter = std::move(filter)] () mutable {
+            if (draining_all()) {
+                return make_exception_future<>(std::logic_error("change_host_filter: cannot change the configuration because hints all hints were drained"));
+            }
+
+            manager_logger.debug("change_host_filter: changing from {} to {}", _host_filter, filter);
+
+            // Change the host_filter now and save the old one so that we can
+            // roll back in case of failure
+            std::swap(_host_filter, filter);
+
+            // Iterate over existing hint directories and see if we can enable an endpoint manager
+            // for some of them
+            return lister::scan_dir(_hints_dir, { directory_entry_type::directory }, [this] (fs::path datadir, directory_entry de) {
+                const ep_key_type ep = ep_key_type(de.name);
+                if (_ep_managers.contains(ep) || !_host_filter.can_hint_for(_local_snitch_ptr, ep)) {
+                    return make_ready_future<>();
+                }
+                return get_ep_manager(ep).populate_segments_to_replay();
+            }).handle_exception([this, filter = std::move(filter)] (auto ep) mutable {
+                // Bring back the old filter. The finally() block will cause us to stop
+                // the additional ep_hint_managers that we started
+                _host_filter = std::move(filter);
+            }).finally([this] {
+                // Remove endpoint managers which are rejected by the filter
+                return parallel_for_each(_ep_managers, [this] (auto& pair) {
+                    if (_host_filter.can_hint_for(_local_snitch_ptr, pair.first)) {
+                        return make_ready_future<>();
+                    }
+                    return pair.second.stop(drain::no).finally([this, ep = pair.first] {
+                        _ep_managers.erase(ep);
+                    });
+                });
+            });
+        });
+    });
+}
+
 bool manager::check_dc_for(ep_key_type ep) const noexcept {
     try {
         // If target's DC is not a "hintable" DCs - don't hint.
         // If there is an end point manager then DC has already been checked and found to be ok.
-        return _hinted_dcs.empty() || have_ep_manager(ep) ||
-               _hinted_dcs.find(_local_snitch_ptr->get_datacenter(ep)) != _hinted_dcs.end();
+        return _host_filter.is_enabled_for_all() || have_ep_manager(ep) ||
+               _host_filter.can_hint_for(_local_snitch_ptr, ep);
     } catch (...) {
         // if we failed to check the DC - block this hint
         return false;
@@ -529,7 +579,7 @@ bool manager::check_dc_for(ep_key_type ep) const noexcept {
 }
 
 void manager::drain_for(gms::inet_address endpoint) {
-    if (stopping()) {
+    if (stopping() || draining_all()) {
         return;
     }
 
@@ -540,6 +590,7 @@ void manager::drain_for(gms::inet_address endpoint) {
         return with_semaphore(drain_lock(), 1, [this, endpoint] {
             return futurize_invoke([this, endpoint] () {
                 if (utils::fb_utilities::is_me(endpoint)) {
+                    set_draining_all();
                     return parallel_for_each(_ep_managers, [] (auto& pair) {
                         return pair.second.stop(drain::yes).finally([&pair] {
                             return with_file_update_mutex(pair.second, [&pair] {
@@ -682,19 +733,11 @@ future<> manager::end_point_hints_manager::sender::send_one_mutation(frozen_muta
 }
 
 future<> manager::end_point_hints_manager::sender::send_one_hint(lw_shared_ptr<send_one_file_ctx> ctx_ptr, fragmented_temporary_buffer buf, db::replay_position rp, gc_clock::duration secs_since_file_mod, const sstring& fname) {
+    ctx_ptr->last_attempted_rp = rp;
     return _resource_manager.get_send_units_for(buf.size_bytes()).then([this, secs_since_file_mod, &fname, buf = std::move(buf), rp, ctx_ptr] (auto units) mutable {
         // Future is waited on indirectly in `send_one_file()` (via `ctx_ptr->file_send_gate`).
         (void)with_gate(ctx_ptr->file_send_gate, [this, secs_since_file_mod, &fname, buf = std::move(buf), rp, ctx_ptr] () mutable {
             try {
-                try {
-                    ctx_ptr->rps_set.emplace(rp);
-                } catch (...) {
-                    // if we failed to insert the rp into the set then its contents can't be trusted and we have to re-send the current file from the beginning
-                    ctx_ptr->state.set(send_state::restart_segment);
-                    ctx_ptr->state.set(send_state::segment_replay_failed);
-                    return make_ready_future<>();
-                }
-
                 auto m = this->get_mutation(ctx_ptr, buf);
                 gc_clock::duration gc_grace_sec = m.s->gc_grace_seconds();
 
@@ -707,11 +750,10 @@ future<> manager::end_point_hints_manager::sender::send_one_hint(lw_shared_ptr<s
                 }
 
                 return this->send_one_mutation(std::move(m)).then([this, rp, ctx_ptr] {
-                    ctx_ptr->rps_set.erase(rp);
                     ++this->shard_stats().sent;
-                }).handle_exception([this, ctx_ptr] (auto eptr) {
+                }).handle_exception([this, ctx_ptr, rp] (auto eptr) {
                     manager_logger.trace("send_one_hint(): failed to send to {}: {}", end_point_key(), eptr);
-                    ctx_ptr->state.set(send_state::segment_replay_failed);
+                    ctx_ptr->on_hint_send_failure(rp);
                 });
 
             // ignore these errors and move on - probably this hint is too old and the KS/CF has been deleted...
@@ -724,13 +766,23 @@ future<> manager::end_point_hints_manager::sender::send_one_hint(lw_shared_ptr<s
             } catch (no_column_mapping& e) {
                 manager_logger.debug("send_hints(): {} at {}: {}", fname, rp, e.what());
                 ++this->shard_stats().discarded;
+            } catch (...) {
+                manager_logger.debug("send_hints(): unexpected error in file {} at {}: {}", fname, rp, std::current_exception());
+                ctx_ptr->on_hint_send_failure(rp);
             }
             return make_ready_future<>();
         }).finally([units = std::move(units), ctx_ptr] {});
-    }).handle_exception([this, ctx_ptr] (auto eptr) {
+    }).handle_exception([this, ctx_ptr, rp] (auto eptr) {
         manager_logger.trace("send_one_file(): Hmmm. Something bad had happend: {}", eptr);
-        ctx_ptr->state.set(send_state::segment_replay_failed);
+        ctx_ptr->on_hint_send_failure(rp);
     });
+}
+
+void manager::end_point_hints_manager::sender::send_one_file_ctx::on_hint_send_failure(db::replay_position rp) noexcept {
+    segment_replay_failed = true;
+    if (!first_failed_rp || rp < *first_failed_rp) {
+        first_failed_rp = rp;
+    }
 }
 
 // runs in a seastar::async context
@@ -740,17 +792,18 @@ bool manager::end_point_hints_manager::sender::send_one_file(const sstring& fnam
     lw_shared_ptr<send_one_file_ctx> ctx_ptr = make_lw_shared<send_one_file_ctx>(_last_schema_ver_to_column_mapping);
 
     try {
-        commitlog::read_log_file(fname, manager::FILENAME_PREFIX, service::get_local_streaming_read_priority(), [this, secs_since_file_mod, &fname, ctx_ptr] (commitlog::buffer_and_replay_position buf_rp) mutable {
-            auto&& [buf, rp] = buf_rp;
+        commitlog::read_log_file(fname, manager::FILENAME_PREFIX, service::get_local_streaming_priority(), [this, secs_since_file_mod, &fname, ctx_ptr] (commitlog::buffer_and_replay_position buf_rp) mutable {
+            auto& buf = buf_rp.buffer;
+            auto& rp = buf_rp.position;
             // Check that we can still send the next hint. Don't try to send it if the destination host
             // is DOWN or if we have already failed to send some of the previous hints.
-            if (!draining() && ctx_ptr->state.contains(send_state::segment_replay_failed)) {
+            if (!draining() && ctx_ptr->segment_replay_failed) {
                 return make_ready_future<>();
             }
 
             // Break early if stop() was called or the destination node went down.
             if (!can_send()) {
-                ctx_ptr->state.set(send_state::segment_replay_failed);
+                ctx_ptr->segment_replay_failed = true;
                 return make_ready_future<>();
             }
 
@@ -760,31 +813,28 @@ bool manager::end_point_hints_manager::sender::send_one_file(const sstring& fnam
         }, _last_not_complete_rp.pos, &_db.extensions()).get();
     } catch (db::commitlog::segment_error& ex) {
         manager_logger.error("{}: {}. Dropping...", fname, ex.what());
-        ctx_ptr->state.remove(send_state::segment_replay_failed);
+        ctx_ptr->segment_replay_failed = false;
         ++this->shard_stats().corrupted_files;
     } catch (...) {
         manager_logger.trace("sending of {} failed: {}", fname, std::current_exception());
-        ctx_ptr->state.set(send_state::segment_replay_failed);
+        ctx_ptr->segment_replay_failed = true;
     }
 
     // wait till all background hints sending is complete
     ctx_ptr->file_send_gate.close().get();
 
     // If we are draining ignore failures and drop the segment even if we failed to send it.
-    if (draining() && ctx_ptr->state.contains(send_state::segment_replay_failed)) {
+    if (draining() && ctx_ptr->segment_replay_failed) {
         manager_logger.trace("send_one_file(): we are draining so we are going to delete the segment anyway");
-        ctx_ptr->state.remove(send_state::segment_replay_failed);
+        ctx_ptr->segment_replay_failed = false;
     }
 
     // update the next iteration replay position if needed
-    if (ctx_ptr->state.contains(send_state::segment_replay_failed)) {
-        if (ctx_ptr->state.contains(send_state::restart_segment)) {
-            // if _rps_set contents is inconsistent simply re-start the current file from the beginning
-            _last_not_complete_rp = replay_position();
-        } else if (!ctx_ptr->rps_set.empty()) {
-            _last_not_complete_rp = *std::min_element(ctx_ptr->rps_set.begin(), ctx_ptr->rps_set.end());
-        }
-
+    if (ctx_ptr->segment_replay_failed) {
+        // If some hints failed to be sent, first_failed_rp will tell the position of first such hint.
+        // If there was an error thrown by read_log_file function itself, we will retry sending from
+        // the last entry that was successfully read from commitlog (last_attempted_rp).
+        _last_not_complete_rp = ctx_ptr->first_failed_rp.value_or(ctx_ptr->last_attempted_rp.value_or(_last_not_complete_rp));
         manager_logger.trace("send_one_file(): error while sending hints from {}, last RP is {}", fname, _last_not_complete_rp);
         return false;
     }
@@ -810,7 +860,7 @@ void manager::end_point_hints_manager::sender::send_hints_maybe() noexcept {
     int replayed_segments_count = 0;
 
     try {
-        while (replay_allowed() && have_segments()) {
+        while (replay_allowed() && have_segments() && can_send()) {
             if (!send_one_file(*_segments_to_replay.begin())) {
                 break;
             }
@@ -837,12 +887,14 @@ void manager::end_point_hints_manager::sender::send_hints_maybe() noexcept {
 
 static future<> scan_for_hints_dirs(const sstring& hints_directory, std::function<future<> (fs::path dir, directory_entry de, unsigned shard_id)> f) {
     return lister::scan_dir(hints_directory, { directory_entry_type::directory }, [f = std::move(f)] (fs::path dir, directory_entry de) mutable {
+        unsigned shard_id;
         try {
-            return f(std::move(dir), std::move(de), std::stoi(de.name.c_str()));
+            shard_id = std::stoi(de.name.c_str());
         } catch (std::invalid_argument& ex) {
             manager_logger.debug("Ignore invalid directory {}", de.name);
             return make_ready_future<>();
         }
+        return f(std::move(dir), std::move(de), shard_id);
     });
 }
 
@@ -1000,6 +1052,93 @@ void manager::update_backlog(size_t backlog, size_t max_backlog) {
     } else {
         forbid_hints_for_eps_with_pending_hints();
     }
+}
+
+class directory_initializer::impl {
+    enum class state {
+        uninitialized = 0,
+        created_and_validated = 1,
+        rebalanced = 2,
+    };
+
+    utils::directories& _dirs;
+    sstring _hints_directory;
+    state _state = state::uninitialized;
+    seastar::named_semaphore _lock = {1, named_semaphore_exception_factory{"hints directory initialization lock"}};
+
+public:
+    impl(utils::directories& dirs, sstring hints_directory)
+            : _dirs(dirs)
+            , _hints_directory(std::move(hints_directory))
+    { }
+
+    future<> ensure_created_and_verified() {
+        if (_state > state::uninitialized) {
+            return make_ready_future<>();
+        }
+
+        return with_semaphore(_lock, 1, [this] () {
+            utils::directories::set dir_set;
+            dir_set.add_sharded(_hints_directory);
+            return _dirs.create_and_verify(std::move(dir_set)).then([this] {
+                manager_logger.debug("Creating and validating hint directories: {}", _hints_directory);
+                _state = state::created_and_validated;
+            });
+        });
+    }
+
+    future<> ensure_rebalanced() {
+        if (_state < state::created_and_validated) {
+            return make_exception_future<>(std::logic_error("hints directory needs to be created and validated before rebalancing"));
+        }
+
+        if (_state > state::created_and_validated) {
+            return make_ready_future<>();
+        }
+
+        return with_semaphore(_lock, 1, [this] () {
+            manager_logger.debug("Rebalancing hints in {}", _hints_directory);
+            return manager::rebalance(_hints_directory).then([this] {
+                _state = state::rebalanced;
+            });
+        });
+    }
+};
+
+directory_initializer::directory_initializer(std::shared_ptr<directory_initializer::impl> impl)
+        : _impl(std::move(impl))
+{ }
+
+directory_initializer::~directory_initializer()
+{ }
+
+directory_initializer directory_initializer::make_dummy() {
+    return directory_initializer{nullptr};
+}
+
+future<directory_initializer> directory_initializer::make(utils::directories& dirs, sstring hints_directory) {
+    return smp::submit_to(0, [&dirs, hints_directory = std::move(hints_directory)] () mutable {
+        auto impl = std::make_shared<directory_initializer::impl>(dirs, std::move(hints_directory));
+        return make_ready_future<directory_initializer>(directory_initializer(std::move(impl)));
+    });
+}
+
+future<> directory_initializer::ensure_created_and_verified() {
+    if (!_impl) {
+        return make_ready_future<>();
+    }
+    return smp::submit_to(0, [impl = this->_impl] () mutable {
+        return impl->ensure_created_and_verified().then([impl] {});
+    });
+}
+
+future<> directory_initializer::ensure_rebalanced() {
+    if (!_impl) {
+        return make_ready_future<>();
+    }
+    return smp::submit_to(0, [impl = this->_impl] () mutable {
+        return impl->ensure_rebalanced().then([impl] {});
+    });
 }
 
 }

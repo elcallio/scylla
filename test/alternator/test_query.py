@@ -3,20 +3,14 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 # Tests for the Query operation
+# Some of the Query features are tested in separate files:
+#   * test_key_conditions.py: the KeyConditions paramter.
+#   * test_key_condition_expression.py: the KeyConditionExpression parameter.
+#   * test_filter_expression.py: the FilterExpression parameter.
+#   * test_query_filter.py: the QueryFilter parameter.
 
 import random
 import pytest
@@ -25,81 +19,6 @@ from decimal import Decimal
 from util import random_string, random_bytes, full_query, multiset
 from boto3.dynamodb.conditions import Key, Attr
 
-# Test that scanning works fine with in-stock paginator
-def test_query_basic_restrictions(dynamodb, filled_test_table):
-    test_table, items = filled_test_table
-    paginator = dynamodb.meta.client.get_paginator('query')
-
-    # EQ
-    got_items = []
-    for page in paginator.paginate(TableName=test_table.name, KeyConditions={
-            'p' : {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'}
-        }):
-        got_items += page['Items']
-    print(got_items)
-    assert multiset([item for item in items if item['p'] == 'long']) == multiset(got_items)
-
-    # LT
-    got_items = []
-    for page in paginator.paginate(TableName=test_table.name, KeyConditions={
-            'p' : {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'},
-            'c' : {'AttributeValueList': ['12'], 'ComparisonOperator': 'LT'}
-        }):
-        got_items += page['Items']
-    print(got_items)
-    assert multiset([item for item in items if item['p'] == 'long' and item['c'] < '12']) == multiset(got_items)
-
-    # LE
-    got_items = []
-    for page in paginator.paginate(TableName=test_table.name, KeyConditions={
-            'p' : {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'},
-            'c' : {'AttributeValueList': ['14'], 'ComparisonOperator': 'LE'}
-        }):
-        got_items += page['Items']
-    print(got_items)
-    assert multiset([item for item in items if item['p'] == 'long' and item['c'] <= '14']) == multiset(got_items)
-
-    # GT
-    got_items = []
-    for page in paginator.paginate(TableName=test_table.name, KeyConditions={
-            'p' : {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'},
-            'c' : {'AttributeValueList': ['15'], 'ComparisonOperator': 'GT'}
-        }):
-        got_items += page['Items']
-    print(got_items)
-    assert multiset([item for item in items if item['p'] == 'long' and item['c'] > '15']) == multiset(got_items)
-
-    # GE
-    got_items = []
-    for page in paginator.paginate(TableName=test_table.name, KeyConditions={
-            'p' : {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'},
-            'c' : {'AttributeValueList': ['14'], 'ComparisonOperator': 'GE'}
-        }):
-        got_items += page['Items']
-    print(got_items)
-    assert multiset([item for item in items if item['p'] == 'long' and item['c'] >= '14']) == multiset(got_items)
-
-    # BETWEEN
-    got_items = []
-    for page in paginator.paginate(TableName=test_table.name, KeyConditions={
-            'p' : {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'},
-            'c' : {'AttributeValueList': ['155', '164'], 'ComparisonOperator': 'BETWEEN'}
-        }):
-        got_items += page['Items']
-    print(got_items)
-    assert multiset([item for item in items if item['p'] == 'long' and item['c'] >= '155' and item['c'] <= '164']) == multiset(got_items)
-
-    # BEGINS_WITH
-    got_items = []
-    for page in paginator.paginate(TableName=test_table.name, KeyConditions={
-            'p' : {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'},
-            'c' : {'AttributeValueList': ['11'], 'ComparisonOperator': 'BEGINS_WITH'}
-        }):
-        print([item for item in items if item['p'] == 'long' and item['c'].startswith('11')])
-        got_items += page['Items']
-    print(got_items)
-    assert multiset([item for item in items if item['p'] == 'long' and item['c'].startswith('11')]) == multiset(got_items)
-
 def test_query_nonexistent_table(dynamodb):
     client = dynamodb.meta.client
     with pytest.raises(ClientError, match="ResourceNotFoundException"):
@@ -107,41 +26,6 @@ def test_query_nonexistent_table(dynamodb):
             'p' : {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'},
             'c' : {'AttributeValueList': ['11'], 'ComparisonOperator': 'BEGINS_WITH'}
         })
-
-def test_begins_with(dynamodb, test_table):
-    paginator = dynamodb.meta.client.get_paginator('query')
-    items = [{'p': 'unorthodox_chars', 'c': sort_key, 'str': 'a'} for sort_key in [u'ÿÿÿ', u'cÿbÿ', u'cÿbÿÿabg'] ]
-    with test_table.batch_writer() as batch:
-        for item in items:
-            batch.put_item(item)
-
-    # TODO(sarna): Once bytes type is supported, /xFF character should be tested
-    got_items = []
-    for page in paginator.paginate(TableName=test_table.name, KeyConditions={
-            'p' : {'AttributeValueList': ['unorthodox_chars'], 'ComparisonOperator': 'EQ'},
-            'c' : {'AttributeValueList': [u'ÿÿ'], 'ComparisonOperator': 'BEGINS_WITH'}
-        }):
-        got_items += page['Items']
-    print(got_items)
-    assert sorted([d['c'] for d in got_items]) == sorted([d['c'] for d in items if d['c'].startswith(u'ÿÿ')])
-
-    got_items = []
-    for page in paginator.paginate(TableName=test_table.name, KeyConditions={
-            'p' : {'AttributeValueList': ['unorthodox_chars'], 'ComparisonOperator': 'EQ'},
-            'c' : {'AttributeValueList': [u'cÿbÿ'], 'ComparisonOperator': 'BEGINS_WITH'}
-        }):
-        got_items += page['Items']
-    print(got_items)
-    assert sorted([d['c'] for d in got_items]) == sorted([d['c'] for d in items if d['c'].startswith(u'cÿbÿ')])
-
-def test_begins_with_wrong_type(dynamodb, test_table_sn):
-    paginator = dynamodb.meta.client.get_paginator('query')
-    with pytest.raises(ClientError, match='ValidationException'):
-        for page in paginator.paginate(TableName=test_table_sn.name, KeyConditions={
-                'p' : {'AttributeValueList': ['unorthodox_chars'], 'ComparisonOperator': 'EQ'},
-                'c' : {'AttributeValueList': [17], 'ComparisonOperator': 'BEGINS_WITH'}
-                }):
-            pass
 
 # Items returned by Query should be sorted by the sort key. The following
 # tests verify that this is indeed the case, for the three allowed key types:
@@ -212,6 +96,8 @@ def test_query_sort_order_number(test_table_sn):
     got_sort_keys = [x['c'] for x in got_items]
     assert got_sort_keys == numbers
 
+# Note: this is a very partial check for the QueryFilter feature. See
+# test_query_filter.py for much more exhaustive tests for this feature.
 def test_query_filtering_attributes_equality(filled_test_table):
     test_table, items = filled_test_table
 
@@ -241,7 +127,6 @@ def test_query_filtering_attributes_equality(filled_test_table):
     assert multiset([item for item in items if item['p'] == 'long' and item['attribute'] == 'xxxx' and item['another'] == 'yy']) == multiset(got_items)
 
 # Test that FilterExpression works as expected
-@pytest.mark.xfail(reason="FilterExpression not supported yet")
 def test_query_filter_expression(filled_test_table):
     test_table, items = filled_test_table
 
@@ -253,33 +138,6 @@ def test_query_filter_expression(filled_test_table):
     print(got_items)
     assert multiset([item for item in items if item['p'] == 'long' and item['attribute'] == 'xxxx' and item['another'] == 'yy']) == multiset(got_items)
 
-# QueryFilter can only contain non-key attributes in order to be compatible
-def test_query_filtering_key_equality(filled_test_table):
-    test_table, items = filled_test_table
-
-    with pytest.raises(ClientError, match='ValidationException'):
-        query_filter = {
-            "c" : {
-                "AttributeValueList" : [ "5" ],
-                "ComparisonOperator": "EQ"
-            }
-        }
-        got_items = full_query(test_table, KeyConditions={'p': {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'}}, QueryFilter=query_filter)
-        print(got_items)
-
-    with pytest.raises(ClientError, match='ValidationException'):
-        query_filter = {
-            "attribute" : {
-                "AttributeValueList" : [ "x" ],
-                "ComparisonOperator": "EQ"
-            },
-            "p" : {
-                "AttributeValueList" : [ "5" ],
-                "ComparisonOperator": "EQ"
-            }
-        }
-        got_items = full_query(test_table, KeyConditions={'p': {'AttributeValueList': ['long'], 'ComparisonOperator': 'EQ'}}, QueryFilter=query_filter)
-        print(got_items)
 
 # Test Query with the AttributesToGet parameter. Result should include the
 # selected attributes only - if one wants the key attributes as well, one
@@ -369,14 +227,14 @@ def test_query_select(test_table_sn):
             batch.put_item(item)
     # Verify that we get back the numbers in their sorted order. By default,
     # query returns all attributes:
-    got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})['Items']
+    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})['Items']
     got_sort_keys = [x['c'] for x in got_items]
     assert got_sort_keys == numbers
     got_x_attributes = [x['x'] for x in got_items]
     assert got_x_attributes == numbers
     # Select=ALL_ATTRIBUTES does exactly the same as the default - return
     # all attributes:
-    got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='ALL_ATTRIBUTES')['Items']
+    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='ALL_ATTRIBUTES')['Items']
     got_sort_keys = [x['c'] for x in got_items]
     assert got_sort_keys == numbers
     got_x_attributes = [x['x'] for x in got_items]
@@ -384,28 +242,28 @@ def test_query_select(test_table_sn):
     # Select=ALL_PROJECTED_ATTRIBUTES is not allowed on a base table (it
     # is just for indexes, when IndexName is specified)
     with pytest.raises(ClientError, match='ValidationException'):
-        test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='ALL_PROJECTED_ATTRIBUTES')
+        test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='ALL_PROJECTED_ATTRIBUTES')
     # Select=SPECIFIC_ATTRIBUTES requires that either a AttributesToGet
     # or ProjectionExpression appears, but then really does nothing:
     with pytest.raises(ClientError, match='ValidationException'):
-        test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='SPECIFIC_ATTRIBUTES')
-    got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='SPECIFIC_ATTRIBUTES', AttributesToGet=['x'])['Items']
+        test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='SPECIFIC_ATTRIBUTES')
+    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='SPECIFIC_ATTRIBUTES', AttributesToGet=['x'])['Items']
     expected_items = [{'x': i} for i in numbers]
     assert got_items == expected_items
-    got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='SPECIFIC_ATTRIBUTES', ProjectionExpression='x')['Items']
+    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='SPECIFIC_ATTRIBUTES', ProjectionExpression='x')['Items']
     assert got_items == expected_items
     # Select=COUNT just returns a count - not any items
-    got = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='COUNT')
+    got = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='COUNT')
     assert got['Count'] == len(numbers)
     assert not 'Items' in got
     # Check again that we also get a count - not just with Select=COUNT,
     # but without Select=COUNT we also get the items:
-    got = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})
+    got = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})
     assert got['Count'] == len(numbers)
     assert 'Items' in got
     # Select with some unknown string generates a validation exception:
     with pytest.raises(ClientError, match='ValidationException'):
-        test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='UNKNOWN')
+        test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='UNKNOWN')
 
 # Test that the "Limit" parameter can be used to return only some of the
 # items in a single partition. The items returned are the first in the
@@ -421,20 +279,20 @@ def test_query_limit(test_table_sn):
     # Verify that we get back the numbers in their sorted order.
     # First, no Limit so we should get all numbers (we have few of them, so
     # it all fits in the default 1MB limitation)
-    got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})['Items']
+    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})['Items']
     got_sort_keys = [x['c'] for x in got_items]
     assert got_sort_keys == numbers
     # Now try a few different Limit values, and verify that the query
     # returns exactly the first Limit sorted numbers.
     for limit in [1, 2, 3, 7, 10, 17, 100, 10000]:
-        got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit)['Items']
+        got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit)['Items']
         assert len(got_items) == min(limit, len(numbers))
         got_sort_keys = [x['c'] for x in got_items]
         assert got_sort_keys == numbers[0:limit]
     # Unfortunately, the boto3 library forbids a Limit of 0 on its own,
     # before even sending a request, so we can't test how the server responds.
     with pytest.raises(ParamValidationError):
-        test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=0)
+        test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=0)
 
 # In test_query_limit we tested just that Limit allows to stop the result
 # after right right number of items. Here we test that such a stopped result
@@ -459,7 +317,6 @@ def test_query_limit_paging(test_table_sn):
 # return items sorted in reverse order. Combining this with Limit can
 # be used to return the last items instead of the first items of the
 # partition.
-@pytest.mark.xfail(reason="ScanIndexForward not supported yet")
 def test_query_reverse(test_table_sn):
     numbers = [Decimal(i) for i in range(20)]
     # Insert these numbers, in random order, into one partition:
@@ -473,28 +330,27 @@ def test_query_reverse(test_table_sn):
     # First, no Limit so we should get all numbers (we have few of them, so
     # it all fits in the default 1MB limitation)
     reversed_numbers = list(reversed(numbers))
-    got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=True)['Items']
+    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=True)['Items']
     got_sort_keys = [x['c'] for x in got_items]
     assert got_sort_keys == numbers
-    got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=False)['Items']
+    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=False)['Items']
     got_sort_keys = [x['c'] for x in got_items]
     assert got_sort_keys == reversed_numbers
     # Now try a few different Limit values, and verify that the query
     # returns exactly the first Limit sorted numbers - in regular or
     # reverse order, depending on ScanIndexForward.
     for limit in [1, 2, 3, 7, 10, 17, 100, 10000]:
-        got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit, ScanIndexForward=True)['Items']
+        got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit, ScanIndexForward=True)['Items']
         assert len(got_items) == min(limit, len(numbers))
         got_sort_keys = [x['c'] for x in got_items]
         assert got_sort_keys == numbers[0:limit]
-        got_items = test_table_sn.query(KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit, ScanIndexForward=False)['Items']
+        got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit, ScanIndexForward=False)['Items']
         assert len(got_items) == min(limit, len(numbers))
         got_sort_keys = [x['c'] for x in got_items]
         assert got_sort_keys == reversed_numbers[0:limit]
 
 # Test that paging also works properly with reverse order
 # (ScanIndexForward=false), i.e., reverse-order queries can be resumed
-@pytest.mark.xfail(reason="ScanIndexForward not supported yet")
 def test_query_reverse_paging(test_table_sn):
     numbers = [Decimal(i) for i in range(20)]
     # Insert these numbers, in random order, into one partition:
@@ -519,3 +375,38 @@ def test_query_missing_key(test_table):
         full_query(test_table, KeyConditions={})
     with pytest.raises(ClientError, match='ValidationException'):
         full_query(test_table)
+
+# The paging tests above used a numeric sort key. Let's now also test paging
+# with a bytes sort key. We already have above a test that bytes sort keys
+# work and are sorted correctly (test_query_sort_order_bytes), but the
+# following test adds a check that *paging* works correctly for such keys.
+# We used to have a bug in this (issue #7768) - the returned LastEvaluatedKey
+# was incorrectly formatted, breaking the boto3's parsing of the response.
+# Note we only check the case of bytes *sort* keys in this test. For bytes
+# *partition* keys, see test_scan_paging_bytes().
+def test_query_paging_bytes(test_table_sb):
+    p = random_string()
+    items = [{'p': p, 'c': random_bytes()} for i in range(10)]
+    with test_table_sb.batch_writer() as batch:
+        for item in items:
+            batch.put_item(item)
+    # Deliberately pass Limit=1 to enforce paging even though we have
+    # just 10 items in the partition.
+    got_items = full_query(test_table_sb, Limit=1,
+        KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})
+    got_sort_keys = [x['c'] for x in got_items]
+    expected_sort_keys = sorted(x['c'] for x in items)
+    assert got_sort_keys == expected_sort_keys
+
+# Similar for test for string clustering keys
+def test_query_paging_string(test_table_ss):
+    p = random_string()
+    items = [{'p': p, 'c': random_string()} for i in range(10)]
+    with test_table_ss.batch_writer() as batch:
+        for item in items:
+            batch.put_item(item)
+    got_items = full_query(test_table_ss, Limit=1,
+        KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})
+    got_sort_keys = [x['c'] for x in got_items]
+    expected_sort_keys = sorted(x['c'] for x in items)
+    assert got_sort_keys == expected_sort_keys

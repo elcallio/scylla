@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "vint-serialization.hh"
@@ -56,6 +45,38 @@ future<uint64_t> read_unsigned_vint(random_access_reader& in) {
 
 future<int64_t> read_signed_vint(random_access_reader& in) {
     return read_vint_impl<int64_t>(in);
+}
+
+std::ostream& operator<<(std::ostream& out, sstables::bound_kind_m kind) {
+    switch (kind) {
+    case sstables::bound_kind_m::excl_end:
+        out << "excl_end";
+        break;
+    case sstables::bound_kind_m::incl_start:
+        out << "incl_start";
+        break;
+    case sstables::bound_kind_m::excl_end_incl_start:
+        out << "excl_end_incl_start";
+        break;
+    case sstables::bound_kind_m::static_clustering:
+        out << "static_clustering";
+        break;
+    case sstables::bound_kind_m::clustering:
+        out << "clustering";
+        break;
+    case sstables::bound_kind_m::incl_end_excl_start:
+        out << "incl_end_excl_start";
+        break;
+    case sstables::bound_kind_m::incl_end:
+        out << "incl_end";
+        break;
+    case sstables::bound_kind_m::excl_start:
+        out << "excl_start";
+        break;
+    default:
+        out << static_cast<unsigned>(kind);
+    }
+    return out;
 }
 
 }  // namespace sstables

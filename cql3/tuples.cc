@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <seastar/core/shared_ptr.hh>
@@ -26,9 +15,9 @@
 
 namespace cql3 {
 
-shared_ptr<column_specification>
+lw_shared_ptr<column_specification>
 tuples::component_spec_of(const column_specification& column, size_t component) {
-    return ::make_shared<column_specification>(
+    return make_lw_shared<column_specification>(
             column.ks_name,
             column.cf_name,
             ::make_shared<column_identifier>(format("{}[{:d}]", column.name, component), true),
@@ -36,7 +25,7 @@ tuples::component_spec_of(const column_specification& column, size_t component) 
 }
 
 shared_ptr<term>
-tuples::literal::prepare(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) const {
+tuples::literal::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const {
     validate_assignable_to(db, keyspace, *receiver);
     std::vector<shared_ptr<term>> values;
     bool all_terminal = true;
@@ -51,12 +40,12 @@ tuples::literal::prepare(database& db, const sstring& keyspace, shared_ptr<colum
     if (all_terminal) {
         return value.bind(query_options::DEFAULT);
     } else {
-        return make_shared(std::move(value));
+        return make_shared<delayed_value>(std::move(value));
     }
 }
 
 shared_ptr<term>
-tuples::literal::prepare(database& db, const sstring& keyspace, const std::vector<shared_ptr<column_specification>>& receivers) const {
+tuples::literal::prepare(database& db, const sstring& keyspace, const std::vector<lw_shared_ptr<column_specification>>& receivers) const {
     if (_elements.size() != receivers.size()) {
         throw exceptions::invalid_request_exception(format("Expected {:d} elements in value tuple, but got {:d}: {}", receivers.size(), _elements.size(), *this));
     }
@@ -76,7 +65,7 @@ tuples::literal::prepare(database& db, const sstring& keyspace, const std::vecto
     if (all_terminal) {
         return value.bind(query_options::DEFAULT);
     } else {
-        return make_shared(std::move(value));
+        return make_shared<delayed_value>(std::move(value));
     }
 }
 
@@ -85,8 +74,7 @@ tuples::in_value::from_serialized(const fragmented_temporary_buffer::view& value
     try {
         // Collections have this small hack that validate cannot be called on a serialized object,
         // but the deserialization does the validation (so we're fine).
-      return with_linearized(value_view, [&] (bytes_view value) {
-        auto l = value_cast<list_type_impl::native_type>(type.deserialize(value, options.get_cql_serialization_format()));
+        auto l = value_cast<list_type_impl::native_type>(type.deserialize(value_view, options.get_cql_serialization_format()));
         auto ttype = dynamic_pointer_cast<const tuple_type_impl>(type.get_elements_type());
         assert(ttype);
 
@@ -96,14 +84,13 @@ tuples::in_value::from_serialized(const fragmented_temporary_buffer::view& value
             elements.emplace_back(to_bytes_opt_vec(ttype->split(ttype->decompose(e))));
         }
         return tuples::in_value(elements);
-      });
     } catch (marshal_exception& e) {
         throw exceptions::invalid_request_exception(e.what());
     }
 }
 
-::shared_ptr<column_specification>
-tuples::in_raw::make_in_receiver(const std::vector<shared_ptr<column_specification>>& receivers) {
+lw_shared_ptr<column_specification>
+tuples::in_raw::make_in_receiver(const std::vector<lw_shared_ptr<column_specification>>& receivers) {
     std::vector<data_type> types;
     types.reserve(receivers.size());
     sstring in_name = "in(";
@@ -123,10 +110,10 @@ tuples::in_raw::make_in_receiver(const std::vector<shared_ptr<column_specificati
 
     auto identifier = ::make_shared<column_identifier>(in_name, true);
     auto type = tuple_type_impl::get_instance(types);
-    return ::make_shared<column_specification>(receivers.front()->ks_name, receivers.front()->cf_name, identifier, list_type_impl::get_instance(type, false));
+    return make_lw_shared<column_specification>(receivers.front()->ks_name, receivers.front()->cf_name, identifier, list_type_impl::get_instance(type, false));
 }
 
-tuples::in_marker::in_marker(int32_t bind_index, ::shared_ptr<column_specification> receiver)
+tuples::in_marker::in_marker(int32_t bind_index, lw_shared_ptr<column_specification> receiver)
     : abstract_marker(bind_index, std::move(receiver))
 {
     assert(dynamic_pointer_cast<const list_type_impl>(_receiver->type));
@@ -142,18 +129,16 @@ shared_ptr<terminal> tuples::in_marker::bind(const query_options& options) {
         auto& type = static_cast<const list_type_impl&>(*_receiver->type);
         auto& elem_type = static_cast<const tuple_type_impl&>(*type.get_elements_type());
         try {
-            with_linearized(*value, [&] (bytes_view v) {
-                type.validate(v, options.get_cql_serialization_format());
-                auto l = value_cast<list_type_impl::native_type>(type.deserialize(v, options.get_cql_serialization_format()));
+            type.validate(*value, options.get_cql_serialization_format());
+            auto l = value_cast<list_type_impl::native_type>(type.deserialize(*value, options.get_cql_serialization_format()));
 
-                for (auto&& element : l) {
-                    elem_type.validate(elem_type.decompose(element), options.get_cql_serialization_format());
-                }
-            });
+            for (auto&& element : l) {
+                elem_type.validate(elem_type.decompose(element), options.get_cql_serialization_format());
+            }
         } catch (marshal_exception& e) {
             throw exceptions::invalid_request_exception(e.what());
         }
-        return make_shared(tuples::in_value::from_serialized(*value, type, options));
+        return make_shared<tuples::in_value>(tuples::in_value::from_serialized(*value, type, options));
     }
 }
 

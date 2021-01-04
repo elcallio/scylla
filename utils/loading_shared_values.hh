@@ -42,12 +42,12 @@ template<typename Key,
          typename EqualPred = std::equal_to<Key>,
          typename Stats = do_nothing_loading_shared_values_stats,
          size_t InitialBucketsCount = 16>
-GCC6_CONCEPT( requires requires () {
+requires requires () {
     Stats::inc_hits();
     Stats::inc_misses();
     Stats::inc_blocks();
     Stats::inc_evictions();
-})
+}
 class loading_shared_values {
 public:
     using key_type = Key;

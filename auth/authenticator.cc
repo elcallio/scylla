@@ -38,3 +38,5 @@
 
 const sstring auth::authenticator::USERNAME_KEY("username");
 const sstring auth::authenticator::PASSWORD_KEY("password");
+const sstring auth::authenticator::SERVICE_KEY("service");
+const sstring auth::authenticator::REALM_KEY("realm");

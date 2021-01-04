@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -25,6 +14,7 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/util/later.hh>
 
 // An async action wrapper which ensures that at most one action
 // is running at any time.
@@ -37,15 +27,9 @@ private:
     seastar::shared_future<> _pending;
     seastar::semaphore _sem;
 private:
-    future<> do_trigger(seastar::shared_promise<> pr) {
+    future<> do_trigger() {
         _pending = {};
-        return futurize_invoke(_func).then_wrapped([pr = std::move(pr)] (auto&& f) mutable {
-            if (f.failed()) {
-                pr.set_exception(f.get_exception());
-            } else {
-                pr.set_value();
-            }
-        });
+        return futurize_invoke(_func);
     }
 public:
     serialized_action(std::function<future<>()> func)
@@ -68,13 +52,24 @@ public:
         }
         seastar::shared_promise<> pr;
         _pending = pr.get_shared_future();
-        return with_semaphore(_sem, 1, [this, pr = std::move(pr), later] () mutable {
+        future<> ret = _pending;
+        // run in background, synchronize using `ret`
+        (void)_sem.wait().then([this, later] () mutable {
             if (later) {
-                return seastar::later().then([this, pr = std::move(pr)] () mutable {
-                    return do_trigger(std::move(pr));
+                return seastar::later().then([this] () mutable {
+                    return do_trigger();
                 });
             }
-            return do_trigger(std::move(pr));
+            return do_trigger();
+        }).then_wrapped([pr = std::move(pr)] (auto&& f) mutable {
+            if (f.failed()) {
+                pr.set_exception(f.get_exception());
+            } else {
+                pr.set_value();
+            }
+        });
+        return ret.finally([this] {
+            _sem.signal();
         });
     }
 

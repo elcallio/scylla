@@ -26,6 +26,8 @@
 #include "concrete_types.hh"
 #include "as_json_function.hh"
 
+#include "error_injection_fcts.hh"
+
 namespace std {
 std::ostream& operator<<(std::ostream& os, const std::vector<data_type>& arg_types) {
     for (size_t i = 0; i < arg_types.size(); ++i) {
@@ -49,12 +51,22 @@ bool as_json_function::requires_thread() const { return false; }
 
 thread_local std::unordered_multimap<function_name, shared_ptr<function>> functions::_declared = init();
 
-void functions::clear_functions() {
+void functions::clear_functions() noexcept {
     functions::_declared = init();
 }
 
 std::unordered_multimap<function_name, shared_ptr<function>>
-functions::init() {
+functions::init() noexcept {
+    // It is possible that this function will fail with a
+    // std::bad_alloc causing std::unexpected to be called. Since
+    // this is used during initialization, we would have to abort
+    // somehow. We could add a try/catch to print a better error
+    // message before aborting, but that would produce a core file
+    // that has less information in it. Given how unlikely it is that
+    // we will run out of memory this early, having a better core dump
+    // if we do seems like a good trade-off.
+    memory::scoped_critical_alloc_section dfg;
+
     std::unordered_multimap<function_name, shared_ptr<function>> ret;
     auto declare = [&ret] (shared_ptr<function> f) { ret.emplace(f->name(), f); };
     declare(aggregate_fcts::make_count_rows_function());
@@ -96,6 +108,10 @@ functions::init() {
     declare(make_blob_as_varchar_fct());
     add_agg_functions(ret);
 
+    declare(error_injection::make_enable_injection_function());
+    declare(error_injection::make_disable_injection_function());
+    declare(error_injection::make_enabled_injections_function());
+
     // also needed for smp:
 #if 0
     MigrationManager.instance.register(new FunctionsMigrationListener());
@@ -130,20 +146,15 @@ void functions::remove_function(const function_name& name, const std::vector<dat
     with_udf_iter(name, arg_types, [] (functions::declared_t::iterator i) { _declared.erase(i); });
 }
 
-shared_ptr<column_specification>
+lw_shared_ptr<column_specification>
 functions::make_arg_spec(const sstring& receiver_ks, const sstring& receiver_cf,
         const function& fun, size_t i) {
     auto&& name = boost::lexical_cast<std::string>(fun.name());
     std::transform(name.begin(), name.end(), name.begin(), ::tolower);
-    return ::make_shared<column_specification>(receiver_ks,
+    return make_lw_shared<column_specification>(receiver_ks,
                                    receiver_cf,
                                    ::make_shared<column_identifier>(format("arg{:d}({})", i, name), true),
                                    fun.arg_types()[i]);
-}
-
-int
-functions::get_overload_count(const function_name& name) {
-    return _declared.count(name);
 }
 
 inline
@@ -160,9 +171,9 @@ shared_ptr<function>
 make_from_json_function(database& db, const sstring& keyspace, data_type t) {
     return make_native_scalar_function<true>("fromjson", t, {utf8_type},
             [&db, &keyspace, t](cql_serialization_format sf, const std::vector<bytes_opt>& parameters) -> bytes_opt {
-        Json::Value json_value = json::to_json_value(utf8_type->to_string(parameters[0].value()));
+        rjson::value json_value = rjson::parse(utf8_type->to_string(parameters[0].value()));
         bytes_opt parsed_json_value;
-        if (!json_value.isNull()) {
+        if (!json_value.IsNull()) {
             parsed_json_value.emplace(from_json_object(*t, json_value, sf));
         }
         return parsed_json_value;
@@ -176,7 +187,7 @@ functions::get(database& db,
         const std::vector<shared_ptr<assignment_testable>>& provided_args,
         const sstring& receiver_ks,
         const sstring& receiver_cf,
-        shared_ptr<column_specification> receiver) {
+        const column_specification* receiver) {
 
     static const function_name TOKEN_FUNCTION_NAME = function_name::native_function("token");
     static const function_name TO_JSON_FUNCTION_NAME = function_name::native_function("tojson");
@@ -359,7 +370,7 @@ functions::validate_types(database& db,
         }
 
         auto&& expected = make_arg_spec(receiver_ks, receiver_cf, *fun, i);
-        if (!is_assignable(provided->test_assignment(db, keyspace, expected))) {
+        if (!is_assignable(provided->test_assignment(db, keyspace, *expected))) {
             throw exceptions::invalid_request_exception(
                     format("Type error: {} cannot be passed as argument {:d} of function {} of type {}",
                             provided, i, fun->name(), expected->type->as_cql3_type()));
@@ -386,7 +397,7 @@ functions::match_arguments(database& db, const sstring& keyspace,
             continue;
         }
         auto&& expected = make_arg_spec(receiver_ks, receiver_cf, *fun, i);
-        auto arg_res = provided->test_assignment(db, keyspace, expected);
+        auto arg_res = provided->test_assignment(db, keyspace, *expected);
         if (arg_res == assignment_testable::test_result::NOT_ASSIGNABLE) {
             return assignment_testable::test_result::NOT_ASSIGNABLE;
         }
@@ -400,11 +411,6 @@ functions::match_arguments(database& db, const sstring& keyspace,
 bool
 functions::type_equals(const std::vector<data_type>& t1, const std::vector<data_type>& t2) {
     return t1 == t2;
-}
-
-bool
-function_call::uses_function(const sstring& ks_name, const sstring& function_name) const {
-    return _fun->uses_function(ks_name, function_name);
 }
 
 void
@@ -433,7 +439,7 @@ function_call::bind_and_get(const query_options& options) {
         buffers.push_back(std::move(to_bytes_opt(val)));
     }
     auto result = execute_internal(options.get_cql_serialization_format(), *_fun, std::move(buffers));
-    return options.make_temporary(cql3::raw_value::make_value(result));
+    return cql3::raw_value_view::make_temporary(cql3::raw_value::make_value(result));
 }
 
 bytes_opt
@@ -474,17 +480,17 @@ function_call::make_terminal(shared_ptr<function> fun, cql3::raw_value result, c
 
     return visit(*fun->return_type(), make_visitor(
     [&] (const list_type_impl& ltype) -> shared_ptr<terminal> {
-        return make_shared(lists::value::from_serialized(to_buffer(result), ltype, sf));
+        return make_shared<lists::value>(lists::value::from_serialized(to_buffer(result), ltype, sf));
     },
     [&] (const set_type_impl& stype) -> shared_ptr<terminal> {
-        return make_shared(sets::value::from_serialized(to_buffer(result), stype, sf));
+        return make_shared<sets::value>(sets::value::from_serialized(to_buffer(result), stype, sf));
     },
     [&] (const map_type_impl& mtype) -> shared_ptr<terminal> {
-        return make_shared(maps::value::from_serialized(to_buffer(result), mtype, sf));
+        return make_shared<maps::value>(maps::value::from_serialized(to_buffer(result), mtype, sf));
     },
     [&] (const user_type_impl& utype) -> shared_ptr<terminal> {
         // TODO (kbraun): write a test for this case when User Defined Functions are implemented
-        return make_shared(user_types::value::from_serialized(to_buffer(result), utype));
+        return make_shared<user_types::value>(user_types::value::from_serialized(to_buffer(result), utype));
     },
     [&] (const abstract_type& type) -> shared_ptr<terminal> {
         if (type.is_collection()) {
@@ -496,14 +502,14 @@ function_call::make_terminal(shared_ptr<function> fun, cql3::raw_value result, c
 }
 
 ::shared_ptr<term>
-function_call::raw::prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) const {
+function_call::raw::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const {
     std::vector<shared_ptr<assignment_testable>> args;
     args.reserve(_terms.size());
     std::transform(_terms.begin(), _terms.end(), std::back_inserter(args),
             [] (auto&& x) -> shared_ptr<assignment_testable> {
         return x;
     });
-    auto&& fun = functions::functions::get(db, keyspace, _name, args, receiver->ks_name, receiver->cf_name, receiver);
+    auto&& fun = functions::functions::get(db, keyspace, _name, args, receiver->ks_name, receiver->cf_name, receiver.get());
     if (!fun) {
         throw exceptions::invalid_request_exception(format("Unknown function {} called", _name));
     }
@@ -561,16 +567,16 @@ function_call::raw::execute(scalar_function& fun, std::vector<shared_ptr<term>> 
 }
 
 assignment_testable::test_result
-function_call::raw::test_assignment(database& db, const sstring& keyspace, shared_ptr<column_specification> receiver) const {
+function_call::raw::test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const {
     // Note: Functions.get() will return null if the function doesn't exist, or throw is no function matching
     // the arguments can be found. We may get one of those if an undefined/wrong function is used as argument
     // of another, existing, function. In that case, we return true here because we'll throw a proper exception
     // later with a more helpful error message that if we were to return false here.
     try {
-        auto&& fun = functions::get(db, keyspace, _name, _terms, receiver->ks_name, receiver->cf_name, receiver);
-        if (fun && receiver->type == fun->return_type()) {
+        auto&& fun = functions::get(db, keyspace, _name, _terms, receiver.ks_name, receiver.cf_name, &receiver);
+        if (fun && receiver.type == fun->return_type()) {
             return assignment_testable::test_result::EXACT_MATCH;
-        } else if (!fun || receiver->type->is_value_compatible_with(*fun->return_type())) {
+        } else if (!fun || receiver.type->is_value_compatible_with(*fun->return_type())) {
             return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
         } else {
             return assignment_testable::test_result::NOT_ASSIGNABLE;

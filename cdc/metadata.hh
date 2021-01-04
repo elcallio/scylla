@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -57,6 +46,10 @@ public:
     /* Is a generation with the given timestamp already known or superseded by a newer generation? */
     bool known_or_obsolete(db_clock::time_point) const;
 
+    /* Are there streams available. I.e. valid for time == now. If this is false, any writes to 
+     * CDC logs will fail fast.
+     */
+    bool streams_available() const;
     /* Return the stream for the base partition whose token is `tok` to which a corresponding log write should go
      * according to the generation used at time `ts` (i.e, the latest generation whose timestamp is less or equal to `ts`).
      *

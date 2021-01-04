@@ -26,18 +26,7 @@
 -- 
 -- This file is part of Scylla.
 -- 
--- Scylla is free software: you can redistribute it and/or modify
--- it under the terms of the GNU Affero General Public License as published by
--- the Free Software Foundation, either version 3 of the License, or
--- (at your option) any later version.
--- 
--- Scylla is distributed in the hope that it will be useful,
--- but WITHOUT ANY WARRANTY; without even the implied warranty of
--- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
--- GNU General Public License for more details.
--- 
--- You should have received a copy of the GNU General Public License
--- along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+--See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 -- setup
 CREATE KEYSPACE ks1 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}
@@ -1107,6 +1096,9 @@ APPLY BATCH;
 	[
 		{
 			"[applied]" : "true"
+		},
+		{
+			"[applied]" : "true"
 		}
 	]
 }
@@ -1130,6 +1122,9 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "true"
+		},
 		{
 			"[applied]" : "true"
 		}
@@ -1536,6 +1531,11 @@ APPLY BATCH;
 			"[applied]" : "true",
 			"a" : "2",
 			"b" : "2"
+		},
+		{
+			"[applied]" : "true",
+			"a" : "2",
+			"b" : "2"
 		}
 	]
 }
@@ -1560,6 +1560,11 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "true",
+			"a" : "4",
+			"b" : "4"
+		},
 		{
 			"[applied]" : "true",
 			"a" : "4",
@@ -1592,6 +1597,11 @@ APPLY BATCH;
 			"[applied]" : "true",
 			"a" : "5",
 			"b" : "5"
+		},
+		{
+			"[applied]" : "true",
+			"a" : "5",
+			"b" : "5"
 		}
 	]
 }
@@ -1616,6 +1626,9 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "true"
+		},
 		{
 			"[applied]" : "true"
 		}
@@ -1646,6 +1659,11 @@ APPLY BATCH;
 			"[applied]" : "false",
 			"a" : "3",
 			"b" : "3"
+		},
+		{
+			"[applied]" : "false",
+			"a" : "3",
+			"b" : "3"
 		}
 	]
 }
@@ -1656,6 +1674,11 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "false",
+			"a" : "3",
+			"b" : "3"
+		},
 		{
 			"[applied]" : "false",
 			"a" : "3",
@@ -1674,6 +1697,11 @@ APPLY BATCH;
 			"[applied]" : "false",
 			"a" : "3",
 			"b" : "3"
+		},
+		{
+			"[applied]" : "false",
+			"a" : "3",
+			"b" : "3"
 		}
 	]
 }
@@ -1688,6 +1716,11 @@ APPLY BATCH;
 			"[applied]" : "false",
 			"a" : "3",
 			"b" : "3"
+		},
+		{
+			"[applied]" : "false",
+			"a" : "3",
+			"b" : "3"
 		}
 	]
 }
@@ -1698,6 +1731,11 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "false",
+			"a" : "3",
+			"b" : "3"
+		},
 		{
 			"[applied]" : "false",
 			"a" : "3",
@@ -1724,6 +1762,11 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "false",
+			"a" : "6",
+			"b" : "6"
+		},
 		{
 			"[applied]" : "false",
 			"a" : "6",
@@ -1972,6 +2015,9 @@ APPLY BATCH;
 	[
 		{
 			"[applied]" : "true"
+		},
+		{
+			"[applied]" : "true"
 		}
 	]
 }
@@ -1997,6 +2043,9 @@ APPLY BATCH;
 	[
 		{
 			"[applied]" : "false"
+		},
+		{
+			"[applied]" : "false"
 		}
 	]
 }
@@ -2011,6 +2060,9 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "false"
+		},
 		{
 			"[applied]" : "false"
 		}
@@ -2029,6 +2081,9 @@ APPLY BATCH;
 	[
 		{
 			"[applied]" : "false"
+		},
+		{
+			"[applied]" : "false"
 		}
 	]
 }
@@ -2045,6 +2100,9 @@ APPLY BATCH;
 	[
 		{
 			"[applied]" : "false"
+		},
+		{
+			"[applied]" : "false"
 		}
 	]
 }
@@ -2059,6 +2117,9 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "false"
+		},
 		{
 			"[applied]" : "false"
 		}
@@ -2079,6 +2140,9 @@ APPLY BATCH;
 	[
 		{
 			"[applied]" : "false"
+		},
+		{
+			"[applied]" : "false"
 		}
 	]
 }
@@ -2093,6 +2157,9 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "true"
+		},
 		{
 			"[applied]" : "true"
 		}
@@ -2119,6 +2186,9 @@ APPLY BATCH;
 	[
 		{
 			"[applied]" : "true"
+		},
+		{
+			"[applied]" : "true"
 		}
 	]
 }
@@ -2141,6 +2211,9 @@ APPLY BATCH;
 {
 	"rows" : 
 	[
+		{
+			"[applied]" : "true"
+		},
 		{
 			"[applied]" : "true"
 		}

@@ -40,22 +40,22 @@
 
 namespace cql3 {
 
-shared_ptr<column_specification>
+lw_shared_ptr<column_specification>
 maps::key_spec_of(const column_specification& column) {
-    return ::make_shared<column_specification>(column.ks_name, column.cf_name,
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
                 ::make_shared<column_identifier>(format("key({})", *column.name), true),
                  dynamic_pointer_cast<const map_type_impl>(column.type)->get_keys_type());
 }
 
-shared_ptr<column_specification>
+lw_shared_ptr<column_specification>
 maps::value_spec_of(const column_specification& column) {
-    return ::make_shared<column_specification>(column.ks_name, column.cf_name,
+    return make_lw_shared<column_specification>(column.ks_name, column.cf_name,
                 ::make_shared<column_identifier>(format("value({})", *column.name), true),
                  dynamic_pointer_cast<const map_type_impl>(column.type)->get_values_type());
 }
 
 ::shared_ptr<term>
-maps::literal::prepare(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) const {
+maps::literal::prepare(database& db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver) const {
     validate_assignable_to(db, keyspace, *receiver);
 
     auto key_spec = maps::key_spec_of(*receiver);
@@ -81,7 +81,7 @@ maps::literal::prepare(database& db, const sstring& keyspace, ::shared_ptr<colum
     if (all_terminal) {
         return value.bind(query_options::DEFAULT);
     } else {
-        return make_shared(std::move(value));
+        return make_shared<delayed_value>(std::move(value));
     }
 }
 
@@ -93,31 +93,31 @@ maps::literal::validate_assignable_to(database& db, const sstring& keyspace, con
     auto&& key_spec = maps::key_spec_of(receiver);
     auto&& value_spec = maps::value_spec_of(receiver);
     for (auto&& entry : entries) {
-        if (!is_assignable(entry.first->test_assignment(db, keyspace, key_spec))) {
+        if (!is_assignable(entry.first->test_assignment(db, keyspace, *key_spec))) {
             throw exceptions::invalid_request_exception(format("Invalid map literal for {}: key {} is not of type {}", *receiver.name, *entry.first, key_spec->type->as_cql3_type()));
         }
-        if (!is_assignable(entry.second->test_assignment(db, keyspace, value_spec))) {
+        if (!is_assignable(entry.second->test_assignment(db, keyspace, *value_spec))) {
             throw exceptions::invalid_request_exception(format("Invalid map literal for {}: value {} is not of type {}", *receiver.name, *entry.second, value_spec->type->as_cql3_type()));
         }
     }
 }
 
 assignment_testable::test_result
-maps::literal::test_assignment(database& db, const sstring& keyspace, ::shared_ptr<column_specification> receiver) const {
-    if (!dynamic_pointer_cast<const map_type_impl>(receiver->type)) {
+maps::literal::test_assignment(database& db, const sstring& keyspace, const column_specification& receiver) const {
+    if (!dynamic_pointer_cast<const map_type_impl>(receiver.type)) {
         return assignment_testable::test_result::NOT_ASSIGNABLE;
     }
     // If there is no elements, we can't say it's an exact match (an empty map if fundamentally polymorphic).
     if (entries.empty()) {
         return assignment_testable::test_result::WEAKLY_ASSIGNABLE;
     }
-    auto key_spec = maps::key_spec_of(*receiver);
-    auto value_spec = maps::value_spec_of(*receiver);
+    auto key_spec = maps::key_spec_of(receiver);
+    auto value_spec = maps::value_spec_of(receiver);
     // It's an exact match if all are exact match, but is not assignable as soon as any is non assignable.
     auto res = assignment_testable::test_result::EXACT_MATCH;
     for (auto entry : entries) {
-        auto t1 = entry.first->test_assignment(db, keyspace, key_spec);
-        auto t2 = entry.second->test_assignment(db, keyspace, value_spec);
+        auto t1 = entry.first->test_assignment(db, keyspace, *key_spec);
+        auto t2 = entry.second->test_assignment(db, keyspace, *value_spec);
         if (t1 == assignment_testable::test_result::NOT_ASSIGNABLE || t2 == assignment_testable::test_result::NOT_ASSIGNABLE)
             return assignment_testable::test_result::NOT_ASSIGNABLE;
         if (t1 != assignment_testable::test_result::EXACT_MATCH || t2 != assignment_testable::test_result::EXACT_MATCH)
@@ -147,15 +147,13 @@ maps::value::from_serialized(const fragmented_temporary_buffer::view& fragmented
         // Collections have this small hack that validate cannot be called on a serialized object,
         // but compose does the validation (so we're fine).
         // FIXME: deserialize_for_native_protocol?!
-      return with_linearized(fragmented_value, [&] (bytes_view value) {
-        auto m = value_cast<map_type_impl::native_type>(type.deserialize(value, sf));
+        auto m = value_cast<map_type_impl::native_type>(type.deserialize(fragmented_value, sf));
         std::map<bytes, bytes, serialized_compare> map(type.get_keys_type()->as_less_comparator());
         for (auto&& e : m) {
             map.emplace(type.get_keys_type()->decompose(e.first),
                         type.get_values_type()->decompose(e.second));
         }
         return maps::value { std::move(map) };
-      });
     } catch (marshal_exception& e) {
         throw exceptions::invalid_request_exception(e.what());
     }
@@ -252,13 +250,12 @@ maps::marker::bind(const query_options& options) {
         return constants::UNSET_VALUE;
     }
     try {
-        with_linearized(*val, [&] (bytes_view value) {
-            _receiver->type->validate(value, options.get_cql_serialization_format());
-        });
+        _receiver->type->validate(*val, options.get_cql_serialization_format());
     } catch (marshal_exception& e) {
-        throw exceptions::invalid_request_exception(e.what());
+        throw exceptions::invalid_request_exception(
+                format("Exception while binding column {:s}: {:s}", _receiver->name->to_cql_string(), e.what()));
     }
-    return ::make_shared(maps::value::from_serialized(*val, static_cast<const map_type_impl&>(*_receiver->type), options.get_cql_serialization_format()));
+    return ::make_shared<maps::value>(maps::value::from_serialized(*val, static_cast<const map_type_impl&>(*_receiver->type), options.get_cql_serialization_format()));
 }
 
 void

@@ -8,94 +8,24 @@
  * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
-#include <chrono>
 #include <seastar/core/distributed.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/thread.hh>
-#include <seastar/core/weak_ptr.hh>
 #include <seastar/core/reactor.hh>
 
 #include "utils/managed_bytes.hh"
-#include "utils/extremum_tracking.hh"
 #include "utils/logalloc.hh"
 #include "row_cache.hh"
 #include "log.hh"
 #include "schema_builder.hh"
 #include "memtable.hh"
 #include "test/perf/perf.hh"
+#include "test/lib/reader_permit.hh"
 
 static const int update_iterations = 16;
 static const int cell_size = 128;
 static bool cancelled = false;
-
-template<typename Func>
-auto duration_in_seconds(Func&& f) {
-    using clk = std::chrono::steady_clock;
-    auto start = clk::now();
-    f();
-    auto end = clk::now();
-    return std::chrono::duration_cast<std::chrono::duration<float>>(end - start);
-}
-
-class scheduling_latency_measurer : public weakly_referencable<scheduling_latency_measurer> {
-    using clk = std::chrono::steady_clock;
-    clk::time_point _last = clk::now();
-    utils::estimated_histogram _hist{300};
-    min_max_tracker<clk::duration> _minmax;
-    bool _stop = false;
-private:
-    void schedule_tick();
-    void tick() {
-        auto old = _last;
-        _last = clk::now();
-        auto latency = _last - old;
-        _minmax.update(latency);
-        _hist.add(latency.count());
-        if (!_stop) {
-            schedule_tick();
-        }
-    }
-public:
-    void start() {
-        schedule_tick();
-    }
-    void stop() {
-        _stop = true;
-        later().get(); // so that the last scheduled tick is counted
-    }
-    const utils::estimated_histogram& histogram() const {
-        return _hist;
-    }
-    clk::duration min() const { return _minmax.min(); }
-    clk::duration max() const { return _minmax.max(); }
-};
-
-void scheduling_latency_measurer::schedule_tick() {
-    seastar::schedule(make_task(default_scheduling_group(), [self = weak_from_this()] () mutable {
-        if (self) {
-            self->tick();
-        }
-    }));
-}
-
-std::ostream& operator<<(std::ostream& out, const scheduling_latency_measurer& slm) {
-    auto to_ms = [] (int64_t nanos) {
-        return float(nanos) / 1e6;
-    };
-    return out << sprint("{count: %d, "
-                         //"min: %.6f [ms], "
-                         //"50%%: %.6f [ms], "
-                         //"90%%: %.6f [ms], "
-                         "99%%: %.6f [ms], "
-                         "max: %.6f [ms]}",
-        slm.histogram().count(),
-        //to_ms(slm.min().count()),
-        //to_ms(slm.histogram().percentile(0.5)),
-        //to_ms(slm.histogram().percentile(0.9)),
-        to_ms(slm.histogram().percentile(0.99)),
-        to_ms(slm.max().count()));
-}
 
 template<typename MutationGenerator>
 void run_test(const sstring& name, schema_ptr s, MutationGenerator&& gen) {
@@ -141,14 +71,14 @@ void run_test(const sstring& name, schema_ptr s, MutationGenerator&& gen) {
         // Create a reader which tests the case of memtable snapshots
         // going away after memtable was merged to cache.
         auto rd = std::make_unique<flat_mutation_reader>(
-            make_combined_reader(s, cache.make_reader(s), mt->make_flat_reader(s)));
+            make_combined_reader(s, tests::make_permit(), cache.make_reader(s, tests::make_permit()), mt->make_flat_reader(s, tests::make_permit())));
         rd->set_max_buffer_size(1);
         rd->fill_buffer(db::no_timeout).get();
 
         scheduling_latency_measurer slm;
         slm.start();
         auto d = duration_in_seconds([&] {
-            cache.update([] {}, *mt).get();
+            cache.update(row_cache::external_updater([] {}), *mt).get();
         });
 
         rd->set_max_buffer_size(1024*1024);
@@ -178,7 +108,7 @@ void run_test(const sstring& name, schema_ptr s, MutationGenerator&& gen) {
     scheduling_latency_measurer invalidate_slm;
     invalidate_slm.start();
     auto d = duration_in_seconds([&] {
-        cache.invalidate([] {}).get();
+        cache.invalidate(row_cache::external_updater([] {})).get();
     });
     invalidate_slm.stop();
 

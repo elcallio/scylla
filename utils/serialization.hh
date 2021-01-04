@@ -7,18 +7,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 // The following is a redesigned subset of Java's DataOutput,
@@ -40,7 +29,6 @@
 
 #include <stdint.h>
 
-#include <seastar/util/gcc6-concepts.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/net/byteorder.hh>
 #include "bytes.hh"
@@ -60,9 +48,9 @@ static constexpr size_t serialize_int64_size = 8;
 namespace internal_impl {
 
 template <typename ExplicitIntegerType, typename CharOutputIterator, typename IntegerType>
-GCC6_CONCEPT(requires std::is_integral<ExplicitIntegerType>::value && std::is_integral<IntegerType>::value && requires (CharOutputIterator it) {
+requires std::is_integral<ExplicitIntegerType>::value && std::is_integral<IntegerType>::value && requires (CharOutputIterator it) {
     *it++ = 'a';
-})
+}
 inline
 void serialize_int(CharOutputIterator& out, IntegerType val) {
     ExplicitIntegerType nval = net::hton(ExplicitIntegerType(val));
@@ -109,9 +97,9 @@ void serialize_bool(CharOutputIterator& out, bool val) {
 // For now we'll just assume those aren't in the string...
 // TODO: fix the compatibility with Java even in this case.
 template <typename CharOutputIterator>
-GCC6_CONCEPT(requires requires (CharOutputIterator it) {
+requires requires (CharOutputIterator it) {
     *it++ = 'a';
-})
+}
 inline
 void serialize_string(CharOutputIterator& out, const sstring& s) {
     // Java specifies that nulls in the string need to be replaced by the
@@ -132,9 +120,9 @@ void serialize_string(CharOutputIterator& out, const sstring& s) {
 }
 
 template <typename CharOutputIterator>
-GCC6_CONCEPT(requires requires (CharOutputIterator it) {
+requires requires (CharOutputIterator it) {
     *it++ = 'a';
-})
+}
 inline
 void serialize_string(CharOutputIterator& out, const char* s) {
     // TODO: like above, need to change UTF-8 when above 16-bit.

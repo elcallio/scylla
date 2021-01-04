@@ -91,6 +91,8 @@ private:
      */
     bool _is_key_range = false;
 
+    bool _has_queriable_regular_index = false, _has_queriable_pk_index = false, _has_queriable_ck_index = false;
+
 public:
     /**
      * Creates a new empty <code>StatementRestrictions</code>.
@@ -113,8 +115,6 @@ public:
     void add_restriction(::shared_ptr<restriction> restriction, bool for_view, bool allow_filtering);
     void add_single_column_restriction(::shared_ptr<single_column_restriction> restriction, bool for_view, bool allow_filtering);
 public:
-    bool uses_function(const sstring& ks_name, const sstring& function_name) const;
-
     const std::vector<::shared_ptr<restrictions>>& index_restrictions() const;
 
     /**
@@ -124,7 +124,7 @@ public:
      * otherwise.
      */
     bool key_is_in_relation() const {
-        return _partition_key_restrictions->is_IN();
+        return find(_partition_key_restrictions->expression, expr::oper_t::IN);
     }
 
     /**
@@ -134,7 +134,7 @@ public:
      * otherwise.
      */
     bool clustering_key_restrictions_has_IN() const {
-        return _clustering_columns_restrictions->is_IN();
+        return find(_clustering_columns_restrictions->expression, expr::oper_t::IN);
     }
 
     bool clustering_key_restrictions_has_only_eq() const {
@@ -200,13 +200,7 @@ public:
      */
     bool has_unrestricted_clustering_columns() const;
 private:
-    void process_partition_key_restrictions(bool has_queriable_index, bool for_view, bool allow_filtering);
-
-    /**
-     * Returns the partition key components that are not restricted.
-     * @return the partition key components that are not restricted.
-     */
-    std::vector<::shared_ptr<column_identifier>> get_partition_key_unrestricted_components() const;
+    void process_partition_key_restrictions(bool for_view, bool allow_filtering);
 
     /**
      * Processes the clustering column restrictions.
@@ -215,7 +209,7 @@ private:
      * @param select_a_collection <code>true</code> if the query should return a collection column
      * @throws InvalidRequestException if the request is invalid
      */
-    void process_clustering_columns_restrictions(bool has_queriable_index, bool select_a_collection, bool for_view, bool allow_filtering);
+    void process_clustering_columns_restrictions(bool select_a_collection, bool for_view, bool allow_filtering);
 
     /**
      * Returns the <code>Restrictions</code> for the specified type of columns.
@@ -418,7 +412,7 @@ public:
      * @return true if column is restricted by some restriction, false otherwise
      */
     bool is_restricted(const column_definition* cdef) const {
-        if (_not_null_columns.find(cdef) != _not_null_columns.end()) {
+        if (_not_null_columns.contains(cdef)) {
             return true;
         }
 

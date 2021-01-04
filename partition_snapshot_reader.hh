@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -55,6 +44,7 @@ class partition_snapshot_flat_reader : public flat_mutation_reader::impl, public
     // allocation section retry (_clustering_rows).
     class lsa_partition_reader {
         const schema& _schema;
+        reader_permit _permit;
         rows_entry::compare _cmp;
         position_in_partition::equal_compare _eq;
         heap_compare _heap_cmp;
@@ -85,7 +75,7 @@ class partition_snapshot_flat_reader : public flat_mutation_reader::impl, public
             if (!last_row) {
                 // New range. Collect all relevant range tombstone.
                 for (auto&& v : _snapshot->versions()) {
-                    range_tombstones.apply(v.partition().row_tombstones(), ck_range, true);
+                    range_tombstones.apply(v.partition().row_tombstones(), ck_range);
                 }
             }
 
@@ -127,10 +117,11 @@ class partition_snapshot_flat_reader : public flat_mutation_reader::impl, public
             return !_clustering_rows.empty();
         }
     public:
-        explicit lsa_partition_reader(const schema& s, partition_snapshot_ptr snp,
+        explicit lsa_partition_reader(const schema& s, reader_permit permit, partition_snapshot_ptr snp,
                                       logalloc::region& region, logalloc::allocating_section& read_section,
                                       bool digest_requested)
             : _schema(s)
+            , _permit(std::move(permit))
             , _cmp(s)
             , _eq(s)
             , _heap_cmp(s)
@@ -180,13 +171,15 @@ class partition_snapshot_flat_reader : public flat_mutation_reader::impl, public
                     if (_digest_requested) {
                         e.row().cells().prepare_hash(_schema, column_kind::regular_column);
                     }
-                    auto result = mutation_fragment(mutation_fragment::clustering_row_tag_t(), _schema, e);
+                    auto result = mutation_fragment(mutation_fragment::clustering_row_tag_t(), _schema, _permit, _schema, e);
                     while (has_more_rows() && _eq(peek_row().position(), result.as_clustering_row().position())) {
                         const rows_entry& e = pop_clustering_row();
                         if (_digest_requested) {
                             e.row().cells().prepare_hash(_schema, column_kind::regular_column);
                         }
-                        result.as_mutable_clustering_row().apply(_schema, e);
+                        result.mutate_as_clustering_row(_schema, [&] (clustering_row& cr) mutable {
+                            cr.apply(_schema, e);
+                        });
                     }
                     return result;
                 }
@@ -208,6 +201,7 @@ private:
     range_tombstone_stream _range_tombstones;
 
     lsa_partition_reader _reader;
+    bool _static_row_done = false;
     bool _no_more_rows_in_current_range = false;
 
     MemoryAccounter& mem_accounter() {
@@ -217,7 +211,7 @@ private:
     void push_static_row() {
         auto sr = _reader.get_static_row();
         if (!sr.empty()) {
-            emplace_mutation_fragment(mutation_fragment(std::move(sr)));
+            emplace_mutation_fragment(mutation_fragment(*_schema, _permit, std::move(sr)));
         }
     }
 
@@ -247,7 +241,7 @@ private:
     void on_new_range() {
         if (_current_ck_range == _ck_range_end) {
             _end_of_stream = true;
-            push_mutation_fragment(partition_end());
+            push_mutation_fragment(mutation_fragment(*_schema, _permit, partition_end()));
         }
         _no_more_rows_in_current_range = false;
     }
@@ -266,29 +260,31 @@ private:
     }
 public:
     template <typename... Args>
-    partition_snapshot_flat_reader(schema_ptr s, dht::decorated_key dk, partition_snapshot_ptr snp,
+    partition_snapshot_flat_reader(schema_ptr s, reader_permit permit, dht::decorated_key dk, partition_snapshot_ptr snp,
                               query::clustering_key_filter_ranges crr, bool digest_requested,
                               logalloc::region& region, logalloc::allocating_section& read_section,
                               boost::any pointer_to_container, Args&&... args)
-        : impl(std::move(s))
+        : impl(std::move(s), std::move(permit))
         , MemoryAccounter(std::forward<Args>(args)...)
         , _container_guard(std::move(pointer_to_container))
         , _ck_ranges(std::move(crr))
         , _current_ck_range(_ck_ranges.begin())
         , _ck_range_end(_ck_ranges.end())
-        , _range_tombstones(*_schema)
-        , _reader(*_schema, std::move(snp), region, read_section, digest_requested)
+        , _range_tombstones(*_schema, _permit)
+        , _reader(*_schema, _permit, std::move(snp), region, read_section, digest_requested)
     {
         _reader.with_reserve([&] {
-            push_mutation_fragment(partition_start(std::move(dk), _reader.partition_tombstone()));
-            push_static_row();
-            on_new_range();
-            do_fill_buffer(db::no_timeout);
+            push_mutation_fragment(*_schema, _permit, partition_start(std::move(dk), _reader.partition_tombstone()));
         });
     }
 
     virtual future<> fill_buffer(db::timeout_clock::time_point timeout) override {
         _reader.with_reserve([&] {
+            if (!_static_row_done) {
+                push_static_row();
+                on_new_range();
+                _static_row_done = true;
+            }
             do_fill_buffer(timeout);
         });
         return make_ready_future<>();
@@ -310,6 +306,7 @@ public:
 template <typename MemoryAccounter, typename... Args>
 inline flat_mutation_reader
 make_partition_snapshot_flat_reader(schema_ptr s,
+                                    reader_permit permit,
                                     dht::decorated_key dk,
                                     query::clustering_key_filter_ranges crr,
                                     partition_snapshot_ptr snp,
@@ -320,7 +317,7 @@ make_partition_snapshot_flat_reader(schema_ptr s,
                                     streamed_mutation::forwarding fwd,
                                     Args&&... args)
 {
-    auto res = make_flat_mutation_reader<partition_snapshot_flat_reader<MemoryAccounter>>(std::move(s), std::move(dk),
+    auto res = make_flat_mutation_reader<partition_snapshot_flat_reader<MemoryAccounter>>(std::move(s), std::move(permit), std::move(dk),
             snp, std::move(crr), digest_requested, region, read_section, std::move(pointer_to_container), std::forward<Args>(args)...);
     if (fwd) {
         return make_forwardable(std::move(res)); // FIXME: optimize
@@ -331,6 +328,7 @@ make_partition_snapshot_flat_reader(schema_ptr s,
 
 inline flat_mutation_reader
 make_partition_snapshot_flat_reader(schema_ptr s,
+                                    reader_permit permit,
                                     dht::decorated_key dk,
                                     query::clustering_key_filter_ranges crr,
                                     partition_snapshot_ptr snp,
@@ -340,6 +338,6 @@ make_partition_snapshot_flat_reader(schema_ptr s,
                                     boost::any pointer_to_container,
                                     streamed_mutation::forwarding fwd)
 {
-    return make_partition_snapshot_flat_reader<partition_snapshot_reader_dummy_accounter>(std::move(s),
+    return make_partition_snapshot_flat_reader<partition_snapshot_reader_dummy_accounter>(std::move(s), std::move(permit),
             std::move(dk), std::move(crr), std::move(snp), digest_requested, region, read_section, std::move(pointer_to_container), fwd);
 }

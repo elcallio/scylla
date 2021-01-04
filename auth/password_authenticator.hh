@@ -41,7 +41,7 @@ class migration_manager;
 
 namespace auth {
 
-const sstring& password_authenticator_name();
+extern const std::string_view password_authenticator_name;
 
 class password_authenticator : public authenticator {
     cql3::query_processor& _qp;

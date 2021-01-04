@@ -78,6 +78,8 @@ public:
         return _raw._gc_grace_seconds;
     }
 
+    schema_builder& set_paxos_grace_seconds(int32_t seconds);
+
     schema_builder& set_dc_local_read_repair_chance(double chance) {
         _raw._dc_local_read_repair_chance = chance;
         return *this;
@@ -183,6 +185,10 @@ public:
         _raw._extensions = std::move(exts);
         return *this;
     }
+    schema_builder& add_extension(const sstring& name, ::shared_ptr<schema_extension> ext) {
+        _raw._extensions[name] = std::move(ext);
+        return *this;
+    }
     const schema::extensions_map& get_extensions() const {
         return _raw._extensions;
     }
@@ -191,10 +197,7 @@ public:
         return *this;
     }
 
-    schema_builder& set_compaction_strategy_options(std::map<sstring, sstring> options) {
-        _raw._compaction_strategy_options = std::move(options);
-        return *this;
-    }
+    schema_builder& set_compaction_strategy_options(std::map<sstring, sstring>&& options);
 
     schema_builder& set_caching_options(caching_options c) {
         _raw._caching_options = std::move(c);
@@ -248,9 +251,9 @@ public:
     };
 
     column_definition& find_column(const cql3::column_identifier&);
-    schema_builder& with_column(const column_definition& c);
+    bool has_column(const cql3::column_identifier&);
+    schema_builder& with_column_ordered(const column_definition& c);
     schema_builder& with_column(bytes name, data_type type, column_kind kind = column_kind::regular_column, column_view_virtual view_virtual = column_view_virtual::no);
-    schema_builder& with_column(bytes name, data_type type, column_kind kind, column_id component_index, column_view_virtual view_virtual = column_view_virtual::no, column_computation_ptr computation = nullptr);
     schema_builder& with_computed_column(bytes name, data_type type, column_kind kind, column_computation_ptr computation);
     schema_builder& remove_column(bytes name);
     schema_builder& without_column(sstring name, api::timestamp_type timestamp);
@@ -276,6 +279,8 @@ public:
     schema_builder& without_index(const sstring& name);
     schema_builder& without_indexes();
 
+    schema_builder& with_cdc_options(const cdc::options&);
+    
     default_names get_default_names() const {
         return default_names(_raw);
     }
@@ -287,4 +292,6 @@ public:
 private:
     friend class default_names;
     void prepare_dense_schema(schema::raw_schema& raw);
+
+    schema_builder& with_column(bytes name, data_type type, column_kind kind, column_id component_index, column_view_virtual view_virtual = column_view_virtual::no, column_computation_ptr computation = nullptr);
 };

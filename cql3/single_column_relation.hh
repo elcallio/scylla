@@ -39,7 +39,9 @@
 
 #include "cql3/relation.hh"
 #include "cql3/column_identifier.hh"
+#include "cql3/expr/expression.hh"
 #include "cql3/term.hh"
+#include "types/collection.hh"
 
 namespace cql3 {
 
@@ -54,16 +56,16 @@ private:
     ::shared_ptr<term::raw> _map_key;
     ::shared_ptr<term::raw> _value;
     std::vector<::shared_ptr<term::raw>> _in_values;
-private:
+public:
     single_column_relation(::shared_ptr<column_identifier::raw> entity, ::shared_ptr<term::raw> map_key,
-        const operator_type& type, ::shared_ptr<term::raw> value, std::vector<::shared_ptr<term::raw>> in_values)
+        expr::oper_t type, ::shared_ptr<term::raw> value, std::vector<::shared_ptr<term::raw>> in_values)
             : relation(type)
             , _entity(std::move(entity))
             , _map_key(std::move(map_key))
             , _value(std::move(value))
             , _in_values(std::move(in_values))
     { }
-public:
+
     /**
      * Creates a new relation.
      *
@@ -73,7 +75,7 @@ public:
      * @param value the value being compared.
      */
     single_column_relation(::shared_ptr<column_identifier::raw> entity, ::shared_ptr<term::raw> map_key,
-        const operator_type& type, ::shared_ptr<term::raw> value)
+        expr::oper_t type, ::shared_ptr<term::raw> value)
             : single_column_relation(std::move(entity), std::move(map_key), type, std::move(value), {})
     { }
 
@@ -84,21 +86,17 @@ public:
      * @param type the type that describes how this entity relates to the value.
      * @param value the value being compared.
      */
-    single_column_relation(::shared_ptr<column_identifier::raw> entity, const operator_type& type, ::shared_ptr<term::raw> value)
+    single_column_relation(::shared_ptr<column_identifier::raw> entity, expr::oper_t type, ::shared_ptr<term::raw> value)
         : single_column_relation(std::move(entity), {}, type, std::move(value))
     { }
 
     static ::shared_ptr<single_column_relation> create_in_relation(::shared_ptr<column_identifier::raw> entity,
                                                                    std::vector<::shared_ptr<term::raw>> in_values) {
-        return ::make_shared(single_column_relation(std::move(entity), {}, operator_type::IN, {}, std::move(in_values)));
+        return ::make_shared<single_column_relation>(std::move(entity), nullptr, expr::oper_t::IN, nullptr, std::move(in_values));
     }
 
     ::shared_ptr<column_identifier::raw> get_entity() {
         return _entity;
-    }
-
-    ::shared_ptr<term::raw> get_map_key() {
-        return _map_key;
     }
 
     ::shared_ptr<term::raw> get_value() {
@@ -106,7 +104,7 @@ public:
     }
 
 protected:
-    virtual ::shared_ptr<term> to_term(const std::vector<::shared_ptr<column_specification>>& receivers,
+    virtual ::shared_ptr<term> to_term(const std::vector<lw_shared_ptr<column_specification>>& receivers,
                           const term::raw& raw, database& db, const sstring& keyspace,
                           variable_specifications& bound_names) const override;
 
@@ -115,8 +113,8 @@ protected:
     {
         switch (relationType)
         {
-            case GT: return new SingleColumnRelation(entity, operator_type.GTE, value);
-            case LT: return new SingleColumnRelation(entity, operator_type.LTE, value);
+            case GT: return new SingleColumnRelation(entity, expr::oper_t.GTE, value);
+            case LT: return new SingleColumnRelation(entity, expr::oper_t.LTE, value);
             default: return this;
         }
     }
@@ -161,7 +159,9 @@ protected:
         }
 
         auto term = to_term(to_receivers(*schema, column_def), *_value, db, schema->ks_name(), bound_names);
-        return ::make_shared<restrictions::single_column_restriction::slice>(column_def, bound, inclusive, std::move(term));
+        auto r = ::make_shared<restrictions::single_column_restriction>(column_def);
+        r->expression = expr::binary_operator{&column_def, _relation_type, std::move(term)};
+        return r;
     }
 
     virtual shared_ptr<restrictions::restriction> new_contains_restriction(database& db, schema_ptr schema,
@@ -169,7 +169,10 @@ protected:
                                                  bool is_key) override {
         auto&& column_def = to_column_definition(*schema, *_entity);
         auto term = to_term(to_receivers(*schema, column_def), *_value, db, schema->ks_name(), bound_names);
-        return ::make_shared<restrictions::single_column_restriction::contains>(column_def, std::move(term), is_key);
+        auto r = ::make_shared<restrictions::single_column_restriction>(column_def);
+        r->expression = expr::binary_operator{
+                &column_def, is_key ? expr::oper_t::CONTAINS_KEY : expr::oper_t::CONTAINS, std::move(term)};
+        return r;
     }
 
     virtual ::shared_ptr<restrictions::restriction> new_LIKE_restriction(
@@ -177,8 +180,8 @@ protected:
 
     virtual ::shared_ptr<relation> maybe_rename_identifier(const column_identifier::raw& from, column_identifier::raw to) override {
         return *_entity == from
-            ? ::make_shared(single_column_relation(
-                  ::make_shared<column_identifier::raw>(std::move(to)), _map_key, _relation_type, _value, _in_values))
+            ? ::make_shared<single_column_relation>(
+                  ::make_shared<column_identifier::raw>(std::move(to)), _map_key, _relation_type, _value, _in_values)
             : static_pointer_cast<single_column_relation>(shared_from_this());
     }
 
@@ -191,9 +194,9 @@ private:
      * @return the receivers for the specified relation.
      * @throws exceptions::invalid_request_exception if the relation is invalid
      */
-    std::vector<::shared_ptr<column_specification>> to_receivers(const schema& schema, const column_definition& column_def) const;
+    std::vector<lw_shared_ptr<column_specification>> to_receivers(const schema& schema, const column_definition& column_def) const;
 
-    static shared_ptr<column_specification> make_collection_receiver(shared_ptr<column_specification> receiver, bool for_key) {
+    static lw_shared_ptr<column_specification> make_collection_receiver(lw_shared_ptr<column_specification> receiver, bool for_key) {
         return static_cast<const collection_type_impl*>(receiver->type.get())->make_collection_receiver(*receiver, for_key);
     }
 

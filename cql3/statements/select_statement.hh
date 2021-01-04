@@ -85,6 +85,7 @@ protected:
     const ks_selector _ks_sel;
     bool _range_scan = false;
     bool _range_scan_no_bypass_cache = false;
+    std::unique_ptr<cql3::attributes> _attrs;
 protected :
     virtual future<::shared_ptr<cql_transport::messages::result_message>> do_execute(service::storage_proxy& proxy,
         service::query_state& state, const query_options& options) const;
@@ -100,9 +101,8 @@ public:
             ordering_comparator_type ordering_comparator,
             ::shared_ptr<term> limit,
             ::shared_ptr<term> per_partition_limit,
-            cql_stats& stats);
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override;
+            cql_stats& stats,
+            std::unique_ptr<cql3::attributes> attrs);
 
     virtual ::shared_ptr<const cql3::metadata> get_result_metadata() const override;
     virtual uint32_t get_bound_terms() const override;
@@ -136,13 +136,15 @@ public:
 
     bool has_group_by() const { return _group_by_cell_indices && !_group_by_cell_indices->empty(); }
 
+    db::timeout_clock::duration get_timeout(const query_options& options) const;
+
 protected:
-    uint32_t do_get_limit(const query_options& options, ::shared_ptr<term> limit) const;
-    uint32_t get_limit(const query_options& options) const {
-        return do_get_limit(options, _limit);
+    uint64_t do_get_limit(const query_options& options, ::shared_ptr<term> limit, uint64_t default_limit) const;
+    uint64_t get_limit(const query_options& options) const {
+        return do_get_limit(options, _limit, query::max_rows);
     }
-    uint32_t get_per_partition_limit(const query_options& options) const {
-        return do_get_limit(options, _per_partition_limit);
+    uint64_t get_per_partition_limit(const query_options& options) const {
+        return do_get_limit(options, _per_partition_limit, query::partition_max_rows);
     }
     bool needs_post_query_ordering() const;
     virtual void update_stats_rows_read(int64_t rows_read) const {
@@ -162,7 +164,8 @@ public:
                      ordering_comparator_type ordering_comparator,
                      ::shared_ptr<term> limit,
                      ::shared_ptr<term> per_partition_limit,
-                     cql_stats &stats);
+                     cql_stats &stats,
+                     std::unique_ptr<cql3::attributes> attrs);
 };
 
 class indexed_table_select_statement : public select_statement {
@@ -183,7 +186,8 @@ public:
                                                                     ordering_comparator_type ordering_comparator,
                                                                     ::shared_ptr<term> limit,
                                                                      ::shared_ptr<term> per_partition_limit,
-                                                                    cql_stats &stats);
+                                                                    cql_stats &stats,
+                                                                    std::unique_ptr<cql3::attributes> attrs);
 
     indexed_table_select_statement(schema_ptr schema,
                                    uint32_t bound_terms,
@@ -198,7 +202,8 @@ public:
                                    cql_stats &stats,
                                    const secondary_index::index& index,
                                    ::shared_ptr<restrictions::restrictions> used_index_restrictions,
-                                   schema_ptr view_schema);
+                                   schema_ptr view_schema,
+                                   std::unique_ptr<cql3::attributes> attrs);
 
 private:
     virtual future<::shared_ptr<cql_transport::messages::result_message>> do_execute(service::storage_proxy& proxy,
@@ -207,11 +212,11 @@ private:
     lw_shared_ptr<const service::pager::paging_state> generate_view_paging_state_from_base_query_results(lw_shared_ptr<const service::pager::paging_state> paging_state,
             const foreign_ptr<lw_shared_ptr<query::result>>& results, service::storage_proxy& proxy, service::query_state& state, const query_options& options) const;
 
-    future<dht::partition_range_vector, lw_shared_ptr<const service::pager::paging_state>> find_index_partition_ranges(service::storage_proxy& proxy,
+    future<std::tuple<dht::partition_range_vector, lw_shared_ptr<const service::pager::paging_state>>> find_index_partition_ranges(service::storage_proxy& proxy,
                                                                     service::query_state& state,
                                                                     const query_options& options) const;
 
-    future<std::vector<primary_key>, lw_shared_ptr<const service::pager::paging_state>> find_index_clustering_rows(service::storage_proxy& proxy,
+    future<std::tuple<std::vector<primary_key>, lw_shared_ptr<const service::pager::paging_state>>> find_index_clustering_rows(service::storage_proxy& proxy,
                                                                 service::query_state& state,
                                                                 const query_options& options) const;
 
@@ -226,9 +231,10 @@ private:
             lw_shared_ptr<const service::pager::paging_state> paging_state) const;
 
     lw_shared_ptr<query::read_command>
-    prepare_command_for_base_query(const query_options& options, service::query_state& state, gc_clock::time_point now, bool use_paging) const;
+    prepare_command_for_base_query(service::storage_proxy& proxy, const query_options& options, service::query_state& state, gc_clock::time_point now,
+            bool use_paging) const;
 
-    future<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>
+    future<std::tuple<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>>
     do_execute_base_query(
             service::storage_proxy& proxy,
             dht::partition_range_vector&& partition_ranges,
@@ -254,7 +260,7 @@ private:
     // but to implement the general case (multiple rows from multiple partitions)
     // efficiently, we will need more support from other layers.
     // Keys are ordered in token order (see #3423)
-    future<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>
+    future<std::tuple<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>>
     do_execute_base_query(
             service::storage_proxy& proxy,
             std::vector<primary_key>&& primary_keys,
@@ -279,7 +285,7 @@ private:
     future<::shared_ptr<cql_transport::messages::result_message::rows>>read_posting_list(
             service::storage_proxy& proxy,
             const query_options& options,
-            int32_t limit,
+            uint64_t limit,
             service::query_state& state,
             gc_clock::time_point now,
             db::timeout_clock::time_point timeout,
@@ -290,6 +296,8 @@ private:
 
     query::partition_slice get_partition_slice_for_local_index_posting_list(const query_options& options) const;
     query::partition_slice get_partition_slice_for_global_index_posting_list(const query_options& options) const;
+
+    bytes compute_idx_token(const partition_key& key) const;
 };
 
 }

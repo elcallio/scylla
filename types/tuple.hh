@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -27,7 +16,14 @@
 
 #include "types.hh"
 
-struct tuple_deserializing_iterator : public std::iterator<std::input_iterator_tag, const bytes_view_opt> {
+struct tuple_deserializing_iterator {
+public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = const bytes_view_opt;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const bytes_view_opt*;
+    using reference = const bytes_view_opt&;
+private:
     bytes_view _v;
     bytes_view_opt _current;
 public:
@@ -85,6 +81,15 @@ private:
         _v.remove_prefix(4 + (_current ? _current->size() : 0));
     }
 };
+
+template <FragmentedView View>
+std::optional<View> read_tuple_element(View& v) {
+    auto s = read_simple<int32_t>(v);
+    if (s < 0) {
+        return std::nullopt;
+    }
+    return read_simple_bytes(v, s);
+}
 
 class tuple_type_impl : public concrete_type<std::vector<data_value>> {
     using intern = type_interning_helper<tuple_type_impl, std::vector<data_type>>;

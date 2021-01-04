@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <boost/test/unit_test.hpp>
@@ -1428,7 +1417,7 @@ SEASTAR_TEST_CASE(test_3362_with_ttls) {
 enum class collection_kind { set, list, map };
 void do_test_3362_no_ttls_with_collections(cql_test_env& e, collection_kind t) {
     sstring type, pref, suf;
-    switch(t) {
+    switch (t) {
     case collection_kind::set:
         type = "set<int>";
         pref = "{";
@@ -1501,7 +1490,7 @@ SEASTAR_TEST_CASE(test_3362_no_ttls_with_map) {
 
 void do_test_3362_with_ttls_with_collections(cql_test_env& e, collection_kind t) {
     sstring type, pref, suf;
-    switch(t) {
+    switch (t) {
     case collection_kind::set:
         type = "set<int>";
         pref = "{";

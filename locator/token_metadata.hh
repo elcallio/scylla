@@ -38,6 +38,8 @@
 #include <boost/range/iterator_range.hpp>
 #include <boost/icl/interval.hpp>
 #include "range.hh"
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/semaphore.hh>
 
 // forward declaration since database.hh includes this file
 class keyspace;
@@ -60,7 +62,7 @@ public:
     topology() {}
     topology(const topology& other);
 
-    void clear();
+    future<> clear_gently() noexcept;
 
     /**
      * Stores current DC/rack assignment for ep
@@ -102,6 +104,13 @@ public:
         return _dc_racks;
     }
 
+    const std::unordered_map<sstring,
+                       std::unordered_map<sstring,
+                                          std::unordered_set<inet_address>>>&
+    get_datacenter_racks() const {
+        return _dc_racks;
+    }
+
     const endpoint_dc_rack& get_location(const inet_address& ep) const;
 private:
     /** multi-map: DC -> endpoints in that DC */
@@ -128,7 +137,14 @@ public:
     using UUID = utils::UUID;
     using inet_address = gms::inet_address;
 private:
-    class tokens_iterator : public std::iterator<std::input_iterator_tag, token> {
+    class tokens_iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = token;
+        using difference_type = std::ptrdiff_t;
+        using pointer = token*;
+        using reference = token&;
+    private:
         using impl_type = tokens_iterator_impl;
         std::unique_ptr<impl_type> _impl;
     public:
@@ -153,9 +169,11 @@ public:
     token_metadata& operator=(token_metadata&&) noexcept;
     ~token_metadata();
     const std::vector<token>& sorted_tokens() const;
-    void update_normal_token(token token, inet_address endpoint);
-    void update_normal_tokens(std::unordered_set<token> tokens, inet_address endpoint);
-    void update_normal_tokens(const std::unordered_map<inet_address, std::unordered_set<token>>& endpoint_tokens);
+    future<> update_normal_token(token token, inet_address endpoint);
+    future<> update_normal_tokens(std::unordered_set<token> tokens, inet_address endpoint);
+    future<> update_normal_tokens(const std::unordered_map<inet_address, std::unordered_set<token>>& endpoint_tokens);
+    void update_normal_tokens_sync(std::unordered_set<token> tokens, inet_address endpoint);
+    void update_normal_tokens_sync(const std::unordered_map<inet_address, std::unordered_set<token>>& endpoint_tokens);
     const token& first_token(const token& start) const;
     size_t first_token_index(const token& start) const;
     std::optional<inet_address> get_endpoint(const token& token) const;
@@ -179,7 +197,7 @@ public:
 
     topology& get_topology();
     const topology& get_topology() const;
-    void debug_show();
+    void debug_show() const;
 
     /**
      * Store an end-point to host ID mapping.  Each ID must be unique, and
@@ -209,42 +227,67 @@ public:
     void remove_bootstrap_tokens(std::unordered_set<token> tokens);
 
     void add_leaving_endpoint(inet_address endpoint);
+    void del_leaving_endpoint(inet_address endpoint);
 
     void remove_endpoint(inet_address endpoint);
 
-    bool is_member(inet_address endpoint);
+    bool is_member(inet_address endpoint) const;
 
-    bool is_leaving(inet_address endpoint);
+    bool is_leaving(inet_address endpoint) const;
+
+    // Is this node being replaced by another node
+    bool is_being_replaced(inet_address endpoint) const;
+
+    // Is any node being replaced by another node
+    bool is_any_node_being_replaced() const;
+
+    void add_replacing_endpoint(inet_address existing_node, inet_address replacing_node);
+
+    void del_replacing_endpoint(inet_address existing_node);
+
+    /**
+     * Create a full copy of token_metadata using asynchronous continuations.
+     * The caller must ensure that the cloned object will not change if
+     * the function yields.
+     */
+    future<token_metadata> clone_async() const noexcept;
 
     /**
      * Create a copy of TokenMetadata with only tokenToEndpointMap. That is, pending ranges,
      * bootstrap tokens and leaving endpoints are not included in the copy.
      */
-    token_metadata clone_only_token_map();
+    token_metadata clone_only_token_map_sync() const;
+
+    /**
+     * Create a copy of TokenMetadata with only tokenToEndpointMap. That is, pending ranges,
+     * bootstrap tokens and leaving endpoints are not included in the copy.
+     * The caller must ensure that the cloned object will not change if
+     * the function yields.
+     */
+    future<token_metadata> clone_only_token_map() const noexcept;
     /**
      * Create a copy of TokenMetadata with tokenToEndpointMap reflecting situation after all
      * current leave operations have finished.
+     * The caller must ensure that the cloned object will not change if
+     * the function yields.
      *
-     * @return new token metadata
+     * @return a future holding a new token metadata
      */
-    token_metadata clone_after_all_left();
-    /**
-     * Create a copy of TokenMetadata with tokenToEndpointMap reflecting situation after all
-     * current leave, and move operations have finished.
-     *
-     * @return new token metadata
-     */
-    token_metadata clone_after_all_settled();
-    dht::token_range_vector get_primary_ranges_for(std::unordered_set<token> tokens);
+    future<token_metadata> clone_after_all_left() const noexcept;
 
-    dht::token_range_vector get_primary_ranges_for(token right);
+    /**
+     * Gently clear the token_metadata members.
+     * Yield if needed to prevent reactor stalls.
+     */
+    future<> clear_gently() noexcept;
+
+    dht::token_range_vector get_primary_ranges_for(std::unordered_set<token> tokens) const;
+
+    dht::token_range_vector get_primary_ranges_for(token right) const;
     static boost::icl::interval<token>::interval_type range_to_interval(range<dht::token> r);
     static range<dht::token> interval_to_range(boost::icl::interval<token>::interval_type i);
 
-    /** a mutable map may be returned but caller should not modify it */
-    const std::unordered_map<range<token>, std::unordered_set<inet_address>>& get_pending_ranges(sstring keyspace_name);
-
-    std::vector<range<token>> get_pending_ranges(sstring keyspace_name, inet_address endpoint);
+    bool has_pending_ranges(sstring keyspace_name, inet_address endpoint) const;
      /**
      * Calculate pending ranges according to bootsrapping and leaving nodes. Reasoning is:
      *
@@ -268,17 +311,9 @@ public:
      * NOTE: This is heavy and ineffective operation. This will be done only once when a node
      * changes state in the cluster, so it should be manageable.
      */
-    future<> calculate_pending_ranges(abstract_replication_strategy& strategy, const sstring& keyspace_name);
-    future<> calculate_pending_ranges_for_leaving(
-        abstract_replication_strategy& strategy,
-        lw_shared_ptr<std::unordered_multimap<range<token>, inet_address>> new_pending_ranges,
-        lw_shared_ptr<token_metadata> all_left_metadata);
-    void calculate_pending_ranges_for_bootstrap(
-        abstract_replication_strategy& strategy,
-        lw_shared_ptr<std::unordered_multimap<range<token>, inet_address>> new_pending_ranges,
-        lw_shared_ptr<token_metadata> all_left_metadata);
+    future<> update_pending_ranges(const abstract_replication_strategy& strategy, const sstring& keyspace_name);
 
-    token get_predecessor(token t);
+    token get_predecessor(token t) const;
 
     std::vector<inet_address> get_all_endpoints() const;
     size_t get_all_endpoints_count() const;
@@ -287,22 +322,63 @@ public:
      * Bootstrapping tokens are not taken into account. */
     size_t count_normal_token_owners() const;
 
-
-    sstring print_pending_ranges();
-    std::vector<gms::inet_address> pending_endpoints_for(const token& token, const sstring& keyspace_name);
+    // returns empty vector if keyspace_name not found.
+    std::vector<gms::inet_address> pending_endpoints_for(const token& token, const sstring& keyspace_name) const;
 
     /** @return an endpoint to token multimap representation of tokenToEndpointMap (a copy) */
-    std::multimap<inet_address, token> get_endpoint_to_token_map_for_reading();
+    std::multimap<inet_address, token> get_endpoint_to_token_map_for_reading() const;
     /**
      * @return a (stable copy, won't be modified) Token to Endpoint map for all the normal and bootstrapping nodes
      *         in the cluster.
      */
-    std::map<token, inet_address> get_normal_and_bootstrapping_token_to_endpoint_map();
+    std::map<token, inet_address> get_normal_and_bootstrapping_token_to_endpoint_map() const;
 
     long get_ring_version() const;
     void invalidate_cached_rings();
 
     friend class token_metadata_impl;
+};
+
+using token_metadata_ptr = lw_shared_ptr<const token_metadata>;
+using mutable_token_metadata_ptr = lw_shared_ptr<token_metadata>;
+using token_metadata_lock = semaphore_units<semaphore_default_exception_factory>;
+
+template <typename... Args>
+mutable_token_metadata_ptr make_token_metadata_ptr(Args... args) {
+    return make_lw_shared<token_metadata>(std::forward<Args>(args)...);
+}
+
+class shared_token_metadata {
+    mutable_token_metadata_ptr _shared;
+    semaphore _sem = { 1 };
+public:
+    // used to construct the shared object as a sharded<> instance
+    shared_token_metadata()
+        : _shared(make_token_metadata_ptr())
+    { }
+
+    shared_token_metadata(const shared_token_metadata& x) = default;
+    shared_token_metadata(shared_token_metadata&& x) = default;
+
+    token_metadata_ptr get() const noexcept {
+        return _shared;
+    }
+
+    void set(mutable_token_metadata_ptr tmptr) noexcept {
+        _shared = std::move(tmptr);
+    }
+
+    future<token_metadata_lock> get_lock() noexcept;
+
+    // mutate_token_metadata acquires the shared_token_metadata lock,
+    // clones the token_metadata (using clone_async)
+    // and calls an asynchronous functor on
+    // the cloned copy of the token_metadata to mutate it.
+    //
+    // If the functor is successful, the mutated clone
+    // is set back to to the shared_token_metadata,
+    // otherwise, the clone is destroyed.
+    future<> mutate_token_metadata(seastar::noncopyable_function<future<> (token_metadata&)> func);
 };
 
 }

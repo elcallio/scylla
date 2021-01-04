@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -46,7 +35,11 @@ public:
 
     // This must be called on a thread. The callback function must not
     // call remove.
-    void for_each(seastar::noncopyable_function<void(T&)> func) {
+    //
+    // We would take callbacks that take a T&, but we had bugs in the
+    // past with some of those callbacks holding that reference past a
+    // preemption.
+    void for_each(seastar::noncopyable_function<void(T)> func) {
         _vec_lock.for_read().lock().get();
         auto unlock = seastar::defer([this] {
             _vec_lock.for_read().unlock();

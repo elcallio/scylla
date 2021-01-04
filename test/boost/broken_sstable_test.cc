@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <seastar/testing/test_case.hh>
@@ -40,37 +29,39 @@ struct my_consumer {
 
 static void broken_sst(sstring dir, unsigned long generation, schema_ptr s, sstring msg,
     sstable_version_types version = la) {
+  sstables::test_env::do_with_async([&] (sstables::test_env& env) {
     try {
-        sstables::test_env env;
-        sstable_ptr sstp = std::get<0>(env.reusable_sst(s, dir, generation, version).get());
-        auto r = sstp->read_rows_flat(s, no_reader_permit());
+        sstable_ptr sstp = env.reusable_sst(s, dir, generation, version).get0();
+        auto r = sstp->read_rows_flat(s, tests::make_permit());
         r.consume(my_consumer{}, db::no_timeout).get();
         BOOST_FAIL("expecting exception");
     } catch (malformed_sstable_exception& e) {
         BOOST_REQUIRE_EQUAL(sstring(e.what()), msg);
     }
+  }).get();
 }
 
 static void broken_sst(sstring dir, unsigned long generation, sstring msg) {
     // Using an empty schema for this function, which is only about loading
     // a malformed component and checking that it fails.
-    auto s = make_lw_shared(schema({}, "ks", "cf", {}, {}, {}, {}, utf8_type));
+    auto s = make_shared_schema({}, "ks", "cf", {}, {}, {}, {}, utf8_type);
     return broken_sst(dir, generation, s, msg);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_empty_index) {
+  sstables::test_env::do_with_async([&] (sstables::test_env& env) {
     auto s = schema_builder("test_ks", "test_table")
                  .with_column("pk", int32_type, column_kind::partition_key)
                  .with_column("ck", int32_type, column_kind::clustering_key)
                  .with_column("val", int32_type)
                  .set_compressor_params(compression_parameters::no_compression())
                  .build();
-    sstables::test_env env;
-    sstable_ptr sstp = std::get<0>(env.reusable_sst(s, "test/resource/sstables/empty_index", 36, sstable_version_types::mc).get());
+    sstable_ptr sstp = env.reusable_sst(s, "test/resource/sstables/empty_index", 36, sstable_version_types::mc).get0();
     sstp->load().get();
     auto fut = sstables::test(sstp).read_indexes();
     BOOST_REQUIRE_EXCEPTION(fut.get(), malformed_sstable_exception, exception_predicate::message_equals(
         "missing index entry in sstable test/resource/sstables/empty_index/mc-36-big-Index.db"));
+  }).get();
 }
 
 SEASTAR_THREAD_TEST_CASE(missing_column_in_schema) {

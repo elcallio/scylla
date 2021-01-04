@@ -24,30 +24,17 @@ class tmpdir {
     fs::path _path;
 
 private:
-    void remove() {
-        if (!_path.empty()) {
-            fs::remove_all(_path);
-        }
-    }
+    void remove() noexcept;
 
 public:
-    tmpdir()
-     : _path(fs::temp_directory_path() /
-             fs::path(fmt::format(FMT_STRING("scylla-{}"), utils::make_random_uuid()))) {
-        fs::create_directories(_path);
-    }
+    tmpdir();
 
-    tmpdir(tmpdir&& other) noexcept : _path(std::exchange(other._path, {})) { }
+    tmpdir(tmpdir&& other) noexcept;
     tmpdir(const tmpdir&) = delete;
-    void operator=(tmpdir&& other) noexcept {
-        remove();
-        _path = std::exchange(other._path, {});
-    }
+    void operator=(tmpdir&& other) noexcept;
     void operator=(const tmpdir&) = delete;
 
-    ~tmpdir() {
-        remove();
-    }
+    ~tmpdir();
 
     const fs::path& path() const noexcept { return _path; }
 };

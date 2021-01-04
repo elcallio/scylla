@@ -6,18 +6,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 #
 
 if [ ! -d /run/systemd/system ]; then
@@ -45,7 +34,7 @@ if [ $SYSTEMD_VER -ge 229 ] || [[ $SYSTEMD_VER -eq 219 && $SYSTEMD_REL -ge 33 ]]
         mkdir -p /etc/systemd/system/scylla-server.service.d/
         cat << EOS > /etc/systemd/system/scylla-server.service.d/capabilities.conf
 [Service]
-AmbientCapabilities=CAP_SYS_NICE
+AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
 EOS
     fi
 fi
@@ -62,6 +51,17 @@ if [ $MEMTOTAL_BYTES -lt 23008753371 ]; then
 MemoryHigh=1200M
 MemoryMax=1400M
 MemoryLimit=1400M
+EOS
+
+# On CentOS7, systemd does not support percentage-based parameter.
+# To apply memory parameter on CentOS7, we need to override the parameter
+# in bytes, instead of percentage.
+elif [ "$RHEL" -a "$VERSION_ID" = "7" ]; then
+    MEMORY_LIMIT=$((MEMTOTAL_BYTES / 100 * 5))
+    mkdir -p /etc/systemd/system/scylla-helper.slice.d/
+    cat << EOS > /etc/systemd/system/scylla-helper.slice.d/memory.conf
+[Slice]
+MemoryLimit=$MEMORY_LIMIT
 EOS
 fi
 

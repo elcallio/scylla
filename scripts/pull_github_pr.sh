@@ -9,6 +9,11 @@
 
 set -e
 
+if [[ -z "$GITHUB_LOGIN" || -z "$GITHUB_TOKEN" ]]; then
+    echo 'Please set $GITHUB_LOGIN and $GITHUB_TOKEN'
+    exit 1
+fi
+
 if [[ $# != 1 ]]; then
 	echo Please provide a github pull request number
 	exit 1
@@ -21,19 +26,44 @@ for required in jq curl; do
 	fi
 done
 
+curl() {
+    command curl --request POST --user "${GITHUB_LOGIN}:${GITHUB_TOKEN}" "$@"
+}
+
+NL=$'\n'
+
 PR_NUM=$1
-PR_PREFIX=https://api.github.com/repos/scylladb/scylla/pulls
+PR_PREFIX=https://api.github.com/repos/scylladb/scylla-enterprise/pulls
 
+echo "Fetching info on PR #$PR_NUM... "
 PR_DATA=$(curl -s $PR_PREFIX/$PR_NUM)
+MESSAGE=$(jq -r .message <<< $PR_DATA)
+if [ "$MESSAGE" != null ]
+then
+    # Error message, probably "Not Found".
+    echo "$MESSAGE"
+    exit 1
+fi
 PR_TITLE=$(jq -r .title <<< $PR_DATA)
+echo "    $PR_TITLE"
 PR_DESCR=$(jq -r .body <<< $PR_DATA)
-PR_REF=$(jq -r .head.ref <<< $PR_DATA)
 PR_LOGIN=$(jq -r .head.user.login <<< $PR_DATA)
-PR_REPO=$(jq -r .head.repo.html_url <<< $PR_DATA)
-PR_LOCAL_BRANCH=$PR_LOGIN-$PR_REF
+echo -n "Fetching full name of author $PR_LOGIN... "
+USER_NAME=$(curl -s "https://api.github.com/users/$PR_LOGIN" | jq -r .name)
+echo "$USER_NAME"
 
-git fetch origin pull/$PR_NUM/head:$PR_LOCAL_BRANCH
+git fetch enterprise pull/$PR_NUM/head
 
-git merge --no-ff --log $PR_LOCAL_BRANCH -m "Merge '$PR_TITLE' from $PR_LOGIN" -m "$PR_DESCR"
+nr_commits=$(git log --pretty=oneline HEAD..FETCH_HEAD | wc -l)
+
+closes="${NL}${NL}Closes #${PR_NUM}${NL}"
+
+if [[ $nr_commits == 1 ]]; then
+	commit=$(git log --pretty=oneline HEAD..FETCH_HEAD | awk '{print $1}')
+	message="$(git log -1 "$commit" --format="format:%s%n%n%b")"
+	git cherry-pick $commit
+	git commit --amend -m "${message}${closes}"
+else
+	git merge --no-ff --log=1000 FETCH_HEAD -m "Merge '$PR_TITLE' from $USER_NAME" -m "${PR_DESCR}${closes}"
+fi
 git commit --amend # for a manual double-check
-

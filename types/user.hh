@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -45,9 +34,7 @@ public:
             , _is_multi_cell(is_multi_cell) {
     }
     static shared_ptr<const user_type_impl> get_instance(sstring keyspace, bytes name,
-            std::vector<bytes> field_names, std::vector<data_type> field_types, bool multi_cell) {
-        return intern::get_instance(std::move(keyspace), std::move(name), std::move(field_names), std::move(field_types), multi_cell);
-    }
+            std::vector<bytes> field_names, std::vector<data_type> field_types, bool multi_cell);
     data_type field_type(size_t i) const { return type(i); }
     const std::vector<data_type>& field_types() const { return _types; }
     bytes_view field_name(size_t i) const { return _field_names[i]; }

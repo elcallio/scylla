@@ -7,23 +7,16 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 import os
 import sys
 import shlex
+import distro
 from scylla_util import *
+
+def is_amzn2():
+    return ('amzn' in distro.id()) and ('2' in distro.version())
 
 if __name__ == '__main__':
     if os.getuid() > 0:
@@ -33,7 +26,8 @@ if __name__ == '__main__':
         print('This computer doesn\'t supported CPU scaling configuration.')
         sys.exit(0)
     if is_debian_variant():
-        run('apt-get install -y cpufrequtils')
+        if not shutil.which('cpufreq-set'):
+            apt_install('cpufrequtils')
         cfg = sysconfig_parser('/etc/default/cpufrequtils')
         cfg.set('GOVERNOR', 'performance')
         cfg.commit()
@@ -41,21 +35,47 @@ if __name__ == '__main__':
         cpufreq.enable()
         cpufreq.restart()
     if is_gentoo_variant():
-        run('emerge -uq sys-power/cpupower')
+        if not shutil.which('cpupower'):
+            emerge_install('sys-power/cpupower')
         with open('/etc/conf.d/cpupower') as f:
             cur = f.read()
         new = re.sub(r'--governor ondemand', '--governor performance', cur, flags=re.MULTILINE)
         with open('/etc/conf.d/cpupower', 'w') as f:
             f.write(new)
-        if is_systemd():
-            cpufreq = systemd_unit('cpupower-frequency-set.service')
-            cpufreq.enable()
-            cpufreq.restart()
-        else:
-            run('rc-update add cpupower default')
-            run('rc-service cpupower start')
-    if is_redhat_variant():
-        run('yum install -y cpupowerutils')
+        cpufreq = systemd_unit('cpupower-frequency-set.service')
+        cpufreq.enable()
+        cpufreq.restart()
+    if is_amzn2():
+        if not shutil.which('cpupower'):
+            yum_install('cpupowerutils')
+        cfg = sysconfig_parser('/etc/sysconfig/scylla-cpupower')
+        cfg.set('CPUPOWER_START_OPTS', 'frequency-set -g performance')
+        cfg.set('CPUPOWER_STOP_OPTS', 'frequency-set -g ondemand')
+        cfg.commit()
+        unit_data = '''
+[Unit]
+Description=Scylla cpupower service
+After=syslog.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/sysconfig/scylla-cpupower
+ExecStart=/usr/bin/cpupower $CPUPOWER_START_OPTS
+ExecStop=/usr/bin/cpupower $CPUPOWER_STOP_OPTS
+
+[Install]
+WantedBy=multi-user.target
+'''[1:-1]
+        with open('/etc/systemd/system/scylla-cpupower.service', 'w') as f:
+            f.write(unit_data)
+        systemd_unit.reload()
+        cpupwr = systemd_unit('scylla-cpupower.service')
+        cpupwr.enable()
+        cpupwr.restart()
+    elif is_redhat_variant():
+        if not shutil.which('cpupower'):
+            yum_install('cpupowerutils')
         cfg = sysconfig_parser('/etc/sysconfig/cpupower')
         cfg.set('CPUPOWER_START_OPTS', 'frequency-set -g performance')
         cfg.set('CPUPOWER_STOP_OPTS', 'frequency-set -g ondemand')

@@ -23,10 +23,9 @@ namespace auth {
 
 namespace meta {
 
-const sstring DEFAULT_SUPERUSER_NAME("cassandra");
-const sstring AUTH_KS("system_auth");
-const sstring USERS_CF("users");
-const sstring AUTH_PACKAGE_NAME("org.apache.cassandra.auth.");
+constexpr std::string_view AUTH_KS("system_auth");
+constexpr std::string_view USERS_CF("users");
+constexpr std::string_view AUTH_PACKAGE_NAME("org.apache.cassandra.auth.");
 
 }
 
@@ -72,7 +71,7 @@ static future<> create_metadata_table_if_missing_impl(
     b.set_uuid(uuid);
     schema_ptr table = b.build();
     return ignore_existing([&mm, table = std::move(table)] () {
-        return mm.announce_new_column_family(table, false);
+        return mm.announce_new_column_family(table);
     });
 }
 
@@ -99,7 +98,12 @@ future<> wait_for_schema_agreement(::service::migration_manager& mm, const datab
 }
 
 const timeout_config& internal_distributed_timeout_config() noexcept {
+#ifdef DEBUG
+    // Give the much slower debug tests more headroom for completing auth queries.
+    static const auto t = 30s;
+#else
     static const auto t = 5s;
+#endif
     static const timeout_config tc{t, t, t, t, t, t, t};
     return tc;
 }

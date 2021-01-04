@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "hashers.hh"
@@ -29,12 +18,22 @@ template <typename T> struct hasher_traits;
 template <> struct hasher_traits<md5_hasher> { using impl_type = CryptoPP::Weak::MD5; };
 template <> struct hasher_traits<sha256_hasher> { using impl_type = CryptoPP::SHA256; };
 
-template <typename T, size_t size> struct cryptopp_hasher<T, size>::impl {
+template<typename H>
+concept HashUpdater =
+    requires(typename hasher_traits<H>::impl_type& h, const CryptoPP::byte* ptr, size_t size) {
+        // We need Update() not to throw, but it isn't marked noexcept
+        // in CryptoPP source. We'll just hope it doesn't throw.
+        { h.Update(ptr, size) } -> std::same_as<void>;
+    };
+
+template <typename T, size_t size>
+struct cryptopp_hasher<T, size>::impl {
+    static_assert(HashUpdater<T>);
     using impl_type = typename hasher_traits<T>::impl_type;
 
     impl_type hash{};
 
-    void update(const char* ptr, size_t length) {
+    void update(const char* ptr, size_t length) noexcept {
         using namespace CryptoPP;
         static_assert(sizeof(char) == sizeof(byte), "Assuming lengths will be the same");
         hash.Update(reinterpret_cast<const byte*>(ptr), length * sizeof(byte));
@@ -74,7 +73,7 @@ template <typename T, size_t size> std::array<uint8_t, size> cryptopp_hasher<T, 
     return _impl->finalize_array();
 }
 
-template <typename T, size_t size> void cryptopp_hasher<T, size>::update(const char* ptr, size_t length) { _impl->update(ptr, length); }
+template <typename T, size_t size> void cryptopp_hasher<T, size>::update(const char* ptr, size_t length) noexcept { _impl->update(ptr, length); }
 
 template <typename T, size_t size> bytes cryptopp_hasher<T, size>::calculate(const std::string_view& s) {
     typename cryptopp_hasher<T, size>::impl::impl_type hash;

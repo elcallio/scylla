@@ -15,9 +15,9 @@
 #include "database_fwd.hh"
 #include "mutation_partition_view.hh"
 #include "mutation_fragment.hh"
-#include "flat_mutation_reader.hh"
 
 class mutation;
+class flat_mutation_reader;
 
 namespace ser {
 class mutation_view;
@@ -58,6 +58,9 @@ public:
     // the mutation which was used to create this instance.
     // throws schema_mismatch_error otherwise.
     mutation unfreeze(schema_ptr s) const;
+
+    // Automatically upgrades the stored mutation to the supplied schema with custom column mapping.
+    mutation unfreeze_upgrading(schema_ptr schema, const column_mapping& cm) const;
 
     struct printer {
         const frozen_mutation& self;
@@ -106,13 +109,15 @@ using frozen_mutation_consumer_fn = std::function<future<stop_iteration>(frozen_
 future<> fragment_and_freeze(flat_mutation_reader mr, frozen_mutation_consumer_fn c,
                              size_t fragment_size = default_frozen_fragment_size);
 
+class reader_permit;
+
 class frozen_mutation_fragment {
     bytes_ostream _bytes;
 public:
     explicit frozen_mutation_fragment(bytes_ostream bytes) : _bytes(std::move(bytes)) { }
     const bytes_ostream& representation() const { return _bytes; }
 
-    mutation_fragment unfreeze(const schema& s);
+    mutation_fragment unfreeze(const schema& s, reader_permit permit);
 };
 
 frozen_mutation_fragment freeze(const schema& s, const mutation_fragment& mf);

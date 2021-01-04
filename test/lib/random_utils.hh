@@ -4,18 +4,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -164,6 +153,24 @@ inline sstring get_sstring(size_t n) {
 
 inline sstring get_sstring() {
     return get_sstring(get_int<unsigned>(1024));
+}
+
+// Picks a random subset of size `m` from the given vector.
+template <typename T>
+std::vector<T> random_subset(std::vector<T> v, unsigned m, std::mt19937& engine) {
+    assert(m <= v.size());
+    std::shuffle(v.begin(), v.end(), engine);
+    return {v.begin(), v.begin() + m};
+}
+
+// Picks a random subset of size `m` from the set {0, ..., `n` - 1}.
+template<typename T>
+std::vector<T> random_subset(unsigned n, unsigned m, std::mt19937& engine) {
+    assert(m <= n);
+
+    std::vector<T> the_set(n);
+    std::iota(the_set.begin(), the_set.end(), T{});
+    return random_subset(std::move(the_set), m, engine);
 }
 
 }

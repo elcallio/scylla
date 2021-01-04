@@ -37,13 +37,14 @@
 #include "types/map.hh"
 #include "types/list.hh"
 #include "utils/like_matcher.hh"
+#include "expr/expression.hh"
 
 namespace {
 
-void validate_operation_on_durations(const abstract_type& type, const cql3::operator_type& op) {
+void validate_operation_on_durations(const abstract_type& type, cql3::expr::oper_t op) {
     using cql3::statements::request_validations::check_false;
 
-    if (op.is_slice() && type.references_duration()) {
+    if (is_slice(op) && type.references_duration()) {
         check_false(type.is_collection(), "Slice conditions are not supported on collections containing durations");
         check_false(type.is_tuple(), "Slice conditions are not supported on tuples containing durations");
         check_false(type.is_user_type(), "Slice conditions are not supported on UDTs containing durations");
@@ -53,7 +54,7 @@ void validate_operation_on_durations(const abstract_type& type, const cql3::oper
     }
 }
 
-int is_satisfied_by(const cql3::operator_type &op, const abstract_type& cell_type,
+int is_satisfied_by(cql3::expr::oper_t op, const abstract_type& cell_type,
         const abstract_type& param_type, const data_value& cell_value, const bytes& param) {
 
         int rc;
@@ -71,21 +72,24 @@ int is_satisfied_by(const cql3::operator_type &op, const abstract_type& cell_typ
         } else {
             rc = cell_type.compare(cell_type.decompose(cell_value), param);
         }
-        if (op == cql3::operator_type::EQ) {
+        switch (op) {
+            using cql3::expr::oper_t;
+        case oper_t::EQ:
             return rc == 0;
-        } else if (op == cql3::operator_type::NEQ) {
+        case oper_t::NEQ:
             return rc != 0;
-        } else if (op == cql3::operator_type::GTE) {
+        case oper_t::GTE:
             return rc >= 0;
-        } else if (op == cql3::operator_type::LTE) {
+        case oper_t::LTE:
             return rc <= 0;
-        } else if (op == cql3::operator_type::GT) {
+        case oper_t::GT:
             return rc > 0;
-        } else if (op == cql3::operator_type::LT) {
+        case oper_t::LT:
             return rc < 0;
+        default:
+            assert(false);
+            return false;
         }
-        assert(false);
-        return false;
 }
 
 // Read the list index from key and check that list index is not
@@ -102,24 +106,6 @@ uint32_t read_and_check_list_index(const cql3::raw_value_view& key) {
 } // end of anonymous namespace
 
 namespace cql3 {
-
-bool
-column_condition::uses_function(const sstring& ks_name, const sstring& function_name) const {
-    if (bool(_collection_element) && _collection_element->uses_function(ks_name, function_name)) {
-        return true;
-    }
-    if (bool(_value) && _value->uses_function(ks_name, function_name)) {
-        return true;
-    }
-    if (!_in_values.empty()) {
-        for (auto&& value : _in_values) {
-            if (bool(value) && value->uses_function(ks_name, function_name)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
 
 void column_condition::collect_marker_specificaton(variable_specifications& bound_names) const {
     if (_collection_element) {
@@ -212,7 +198,7 @@ bool column_condition::applies_to(const data_value* cell_value, const query_opti
         }
     }
 
-    if (_op.is_compare()) {
+    if (is_compare(_op)) {
         // <, >, >=, <=, !=
         cql3::raw_value_view param = _value->bind_and_get(options);
 
@@ -220,23 +206,23 @@ bool column_condition::applies_to(const data_value* cell_value, const query_opti
             throw exceptions::invalid_request_exception("Invalid 'unset' value in condition");
         }
         if (param.is_null()) {
-            if (_op == operator_type::EQ) {
+            if (_op == expr::oper_t::EQ) {
                 return cell_value == nullptr;
-            } else if (_op == operator_type::NEQ) {
+            } else if (_op == expr::oper_t::NEQ) {
                 return cell_value != nullptr;
             } else {
                 throw exceptions::invalid_request_exception(format("Invalid comparison with null for operator \"{}\"", _op));
             }
         } else if (cell_value == nullptr) {
             // The condition parameter is not null, so only NEQ can return true
-            return _op == operator_type::NEQ;
+            return _op == expr::oper_t::NEQ;
         }
         // type::validate() is called by bind_and_get(), so it's safe to pass to_bytes() result
         // directly to compare.
         return is_satisfied_by(_op, *cell_value->type(), *column.type, *cell_value, to_bytes(param));
     }
 
-    if (_op == operator_type::LIKE) {
+    if (_op == expr::oper_t::LIKE) {
         if (cell_value == nullptr) {
             return false;
         }
@@ -255,7 +241,7 @@ bool column_condition::applies_to(const data_value* cell_value, const query_opti
         }
     }
 
-    assert(_op == operator_type::IN);
+    assert(_op == expr::oper_t::IN);
 
     std::vector<bytes_opt> in_values;
 
@@ -273,20 +259,20 @@ bool column_condition::applies_to(const data_value* cell_value, const query_opti
     // If cell value is NULL, IN list must contain NULL or an empty set/list. Otherwise it must contain cell value.
     if (cell_value) {
         return std::any_of(in_values.begin(), in_values.end(), [this, cell_value] (const bytes_opt& value) {
-            return value.has_value() && is_satisfied_by(operator_type::EQ, *cell_value->type(), *column.type, *cell_value, *value);
+            return value.has_value() && is_satisfied_by(expr::oper_t::EQ, *cell_value->type(), *column.type, *cell_value, *value);
         });
     } else {
         return std::any_of(in_values.begin(), in_values.end(), [] (const bytes_opt& value) { return !value.has_value() || value->empty(); });
     }
 }
 
-::shared_ptr<column_condition>
+lw_shared_ptr<column_condition>
 column_condition::raw::prepare(database& db, const sstring& keyspace, const column_definition& receiver) const {
     if (receiver.type->is_counter()) {
         throw exceptions::invalid_request_exception("Conditions on counters are not supported");
     }
     shared_ptr<term> collection_element_term;
-    shared_ptr<column_specification> value_spec = receiver.column_specification;
+    lw_shared_ptr<column_specification> value_spec = receiver.column_specification;
 
     if (_collection_element) {
         if (!receiver.type->is_collection()) {
@@ -295,7 +281,7 @@ column_condition::raw::prepare(database& db, const sstring& keyspace, const colu
         }
         // Pass  a correct type specification to the collection_element->prepare(), so that it can
         // later be used to validate the parameter type is compatible with receiver type.
-        shared_ptr<column_specification> element_spec;
+        lw_shared_ptr<column_specification> element_spec;
         auto ctype = static_cast<const collection_type_impl*>(receiver.type.get());
         const column_specification& recv_column_spec = *receiver.column_specification;
         if (ctype->get_kind() == abstract_type::kind::list) {
@@ -314,13 +300,13 @@ column_condition::raw::prepare(database& db, const sstring& keyspace, const colu
         collection_element_term = _collection_element->prepare(db, keyspace, element_spec);
     }
 
-    if (_op.is_compare()) {
+    if (is_compare(_op)) {
         validate_operation_on_durations(*receiver.type, _op);
         return column_condition::condition(receiver, collection_element_term,
                 _value->prepare(db, keyspace, value_spec), nullptr, _op);
     }
 
-    if (_op == operator_type::LIKE) {
+    if (_op == expr::oper_t::LIKE) {
         auto literal_term = dynamic_pointer_cast<constants::literal>(_value);
         if (literal_term) {
             // Pass matcher object
@@ -337,7 +323,7 @@ column_condition::raw::prepare(database& db, const sstring& keyspace, const colu
         }
     }
 
-    if (_op != operator_type::IN) {
+    if (_op != expr::oper_t::IN) {
         throw exceptions::invalid_request_exception(format("Unsupported operator type {} in a condition ", _op));
     }
 

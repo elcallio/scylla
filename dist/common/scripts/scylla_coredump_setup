@@ -7,18 +7,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 import os
 import sys
@@ -26,8 +15,8 @@ import argparse
 import subprocess
 import time
 import tempfile
-import subprocess
 from scylla_util import *
+from subprocess import run
 
 if __name__ == '__main__':
     if os.getuid() > 0:
@@ -42,11 +31,11 @@ if __name__ == '__main__':
 
 # Gentoo may uses OpenRC
     if is_gentoo_variant():
-        run('sysctl -p /etc/sysctl.d/99-scylla-coredump.conf')
+        run('sysctl -p /etc/sysctl.d/99-scylla-coredump.conf', shell=True, check=True)
 # Other distributions can use systemd-coredump, so setup it
     else:
         if is_debian_variant():
-            run('apt-get install -y systemd-coredump')
+            apt_install('systemd-coredump')
         conf_data = '''
 [Coredump]
 Storage=external
@@ -75,15 +64,16 @@ WantedBy=multi-user.target
 '''[1:-1]
             with open('/etc/systemd/system/var-lib-systemd-coredump.mount', 'w') as f:
                 f.write(dot_mount)
-            makedirs('/var/lib/scylla/coredump')
+            os.makedirs('/var/lib/scylla/coredump', exist_ok=True)
             systemd_unit.reload()
             systemd_unit('var-lib-systemd-coredump.mount').enable()
+            systemd_unit('var-lib-systemd-coredump.mount').start()
         if os.path.exists('/usr/lib/sysctl.d/50-coredump.conf'):
-            run('sysctl -p /usr/lib/sysctl.d/50-coredump.conf')
+            run('sysctl -p /usr/lib/sysctl.d/50-coredump.conf', shell=True, check=True)
         else:
             with open('/etc/sysctl.d/99-scylla-coredump.conf', 'w') as f:
                 f.write('kernel.core_pattern=|/usr/lib/systemd/systemd-coredump %p %u %g %s %t %e"')
-            run('sysctl -p /etc/sysctl.d/99-scylla-coredump.conf')
+            run('sysctl -p /etc/sysctl.d/99-scylla-coredump.conf', shell=True, check=True)
 
         fp = tempfile.NamedTemporaryFile()
         fp.write(b'kill -SEGV $$')
@@ -97,8 +87,54 @@ WantedBy=multi-user.target
         # need to wait for systemd-coredump to complete collecting coredump
         time.sleep(3)
         try:
-            run('coredumpctl --no-pager --no-legend info {}'.format(pid))
-            print('\nsystemd-coredump is working finely.')
-        except subprocess.CalledProcessError as e:
+            coreinfo = run('coredumpctl --no-pager --no-legend info {}'.format(pid), shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+        except subprocess.CalledProcessError:
             print('Does not able to detect coredump, failed to configure systemd-coredump.')
             sys.exit(1)
+
+        print(coreinfo)
+        print()
+
+        # "coredumpctl info" behavior had been changed since systemd-v232,
+        # we need to support both version.
+        #
+        # Before systemd-v232, it was simple.
+        # It print 'Coredump' field only when the coredump exists on filesystem.
+        # Otherwise print nothing.
+        #
+        # After the change made on systemd-v232, it become more complex.
+        # It always print 'Storage' field even the coredump does not exists.
+        # Not just available/unavailable, it describe more:
+        #  - Storage: none
+        #  - Storage: journal
+        #  - Storage: /path/to/file (inacessible)
+        #  - Storage: /path/to/file
+        #
+        # reference: https://github.com/systemd/systemd/commit/47f50642075a7a215c9f7b600599cbfee81a2913
+
+        corefail = False
+        res = re.findall(r'Storage: (.*)$', coreinfo, flags=re.MULTILINE)
+        # v232 or later
+        if res:
+            corepath = res[0]
+            if corepath == 'none' or corepath == 'journal' or corepath.endswith('(inaccessible)'):
+                corefail = True
+        # before v232
+        else:
+            res = re.findall(r'Coredump: (.*)$', coreinfo, flags=re.MULTILINE)
+            if res:
+                corepath = res[0]
+            else:
+                corefail = True
+
+        if not corefail:
+            try:
+                os.remove(corepath)
+            except FileNotFoundError:
+                corefail = True
+
+        if corefail:
+            print('Does not able to detect coredump file, failed to configure systemd-coredump.')
+            sys.exit(1)
+
+        print('\nsystemd-coredump is working finely.')

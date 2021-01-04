@@ -25,18 +25,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 #include "locator/production_snitch_base.hh"
 #include "reconnectable_snitch_helper.hh"
@@ -174,11 +163,11 @@ void production_snitch_base::parse_property_file() {
         auto key = split_line[0]; trim(key);
         auto val = split_line[1]; trim(val);
 
-        if (val.empty() || !allowed_property_keys.count(key)) {
+        if (val.empty() || !allowed_property_keys.contains(key)) {
             throw_bad_format(line);
         }
 
-        if (_prop_values.count(key)) {
+        if (_prop_values.contains(key)) {
             throw_double_declaration(key);
         }
 
@@ -215,7 +204,7 @@ void reconnectable_snitch_helper::reconnect(gms::inet_address public_address, co
 }
 
 void reconnectable_snitch_helper::reconnect(gms::inet_address public_address, gms::inet_address local_address) {
-    auto& ms = netw::get_local_messaging_service();
+    netw::messaging_service& ms = gms::get_local_gossiper().get_local_messaging();
     auto& sn_ptr = locator::i_endpoint_snitch::get_local_snitch_ptr();
 
     if (sn_ptr->get_datacenter(public_address) == _local_dc &&
@@ -229,7 +218,7 @@ void reconnectable_snitch_helper::reconnect(gms::inet_address public_address, gm
         // ...then update messaging_service cache and reset the currently
         // open connections to this endpoint on all shards...
         //
-        netw::get_messaging_service().invoke_on_all([public_address, local_address] (auto& local_ms) {
+        ms.container().invoke_on_all([public_address, local_address] (auto& local_ms) {
             local_ms.cache_preferred_ip(public_address, local_address);
             local_ms.remove_rpc_client(netw::msg_addr(public_address));
         }).get();

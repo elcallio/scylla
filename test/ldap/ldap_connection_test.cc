@@ -15,12 +15,13 @@
 #include <cassert>
 #include <exception>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/when_all.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/defer.hh>
 #include <set>
 #include <string>
 
-#include <ent/ldap/ldap_connection.hh>
+#include "ent/ldap/ldap_connection.hh"
 #include "test/lib/exception_utils.hh"
 #include "ldap_common.hh"
 #include "seastarx.hh"
@@ -33,7 +34,9 @@ namespace {
 
 logger mylog{"ldap_connection_test"}; // `log` is taken by math.
 
-const int globally_set_search_dn_before_any_test_runs = ldap_set_option(nullptr, LDAP_OPT_DEFBASE, base_dn);
+void set_defbase() {
+    ldap_set_option(nullptr, LDAP_OPT_DEFBASE, base_dn);
+}
 
 const std::set<std::string> results_expected_from_search_base_dn{
     "dc=example,dc=com",
@@ -105,6 +108,7 @@ void with_ldap_connection(const seastar::socket_address& a, std::function<void(l
 // Tests default (non-custom) libber networking.  Failure here indicates a likely bug in test.py's
 // LDAP setup.
 SEASTAR_THREAD_TEST_CASE(bind_with_default_io) {
+    set_defbase();
     const auto server_uri = "ldap://localhost:" + ldap_port;
     LDAP *manager_client_state{nullptr};
     BOOST_REQUIRE_EQUAL(LDAP_SUCCESS, ldap_initialize(&manager_client_state, server_uri.c_str()));
@@ -117,6 +121,7 @@ SEASTAR_THREAD_TEST_CASE(bind_with_default_io) {
 }
 
 SEASTAR_THREAD_TEST_CASE(bind_with_custom_sockbuf_io) {
+    set_defbase();
     mylog.trace("bind_with_custom_sockbuf_io");
     with_ldap_connection(local_ldap_address, [] (ldap_connection& c) {
         mylog.trace("bind_with_custom_sockbuf_io invoking bind");
@@ -127,6 +132,7 @@ SEASTAR_THREAD_TEST_CASE(bind_with_custom_sockbuf_io) {
 }
 
 SEASTAR_THREAD_TEST_CASE(search_with_custom_sockbuf_io) {
+    set_defbase();
     mylog.trace("search_with_custom_sockbuf_io");
     with_ldap_connection(local_ldap_address, [] (ldap_connection& c) {
         mylog.trace("search_with_custom_sockbuf_io: invoking search");
@@ -140,6 +146,7 @@ SEASTAR_THREAD_TEST_CASE(search_with_custom_sockbuf_io) {
 }
 
 SEASTAR_THREAD_TEST_CASE(multiple_outstanding_operations) {
+    set_defbase();
     mylog.trace("multiple_outstanding_operations");
     with_ldap_connection(local_ldap_address, [] (ldap_connection& c) {
         mylog.trace("multiple_outstanding_operations: bind");
@@ -149,14 +156,14 @@ SEASTAR_THREAD_TEST_CASE(multiple_outstanding_operations) {
         for (size_t i = 0; i < 30; ++i) {
             mylog.trace("multiple_outstanding_operations: invoking search base #{}", i);
             results_base.push_back(search(c, base_dn));
-            mylog.trace("multiple_outstanding_operations: search base #{} got future {}", i, &results_base.back());
+            mylog.trace("multiple_outstanding_operations: search base #{} got future {}", i, static_cast<const void*>(&results_base.back()));
         }
 
         std::vector<future<ldap_msg_ptr>> results_jsmith;
         for (size_t i = 0; i < 30; ++i) {
             mylog.trace("multiple_outstanding_operations: invoking search jsmith #{}", i);
             results_jsmith.push_back(search(c, "uid=jsmith,ou=People,dc=example,dc=com"));
-            mylog.trace("multiple_outstanding_operations: search jsmith #{} got future {}", i, &results_jsmith.back());
+            mylog.trace("multiple_outstanding_operations: search jsmith #{} got future {}", i, static_cast<const void*>(&results_jsmith.back()));
         }
 
         using boost::test_tools::per_element;
@@ -183,15 +190,18 @@ SEASTAR_THREAD_TEST_CASE(multiple_outstanding_operations) {
 }
 
 SEASTAR_THREAD_TEST_CASE(early_shutdown) {
+    set_defbase();
     mylog.trace("early_shutdown: noop");
     with_ldap_connection(local_ldap_address, [] (ldap_connection&) {});
     mylog.trace("early_shutdown: bind");
-    with_ldap_connection(local_ldap_address, [] (ldap_connection& c) { (void) bind(c); });
+    with_ldap_connection(local_ldap_address, [] (ldap_connection& c) { bind(c).handle_exception(&ignore).get(); });
     mylog.trace("early_shutdown: search");
-    with_ldap_connection(local_ldap_address, [] (ldap_connection& c) { (void) search(c, base_dn); });
+    with_ldap_connection(
+            local_ldap_address, [] (ldap_connection& c) { search(c, base_dn).handle_exception(&ignore).get(); });
 }
 
 SEASTAR_THREAD_TEST_CASE(bind_after_fail) {
+    set_defbase();
     mylog.trace("bind_after_fail: wonky connection");
     with_ldap_connection(local_fail_inject_address, [] (ldap_connection& wonky_conn) {
         bind(wonky_conn).handle_exception(&ignore).get();
@@ -205,6 +215,7 @@ SEASTAR_THREAD_TEST_CASE(bind_after_fail) {
 }
 
 SEASTAR_THREAD_TEST_CASE(search_after_fail) {
+    set_defbase();
     mylog.trace("search_after_fail: wonky connection");
     with_ldap_connection(local_fail_inject_address, [] (ldap_connection& wonky_conn) {
         search(wonky_conn, base_dn).handle_exception(&ignore).get();
@@ -222,6 +233,7 @@ SEASTAR_THREAD_TEST_CASE(search_after_fail) {
 }
 
 SEASTAR_THREAD_TEST_CASE(multiple_outstanding_operations_on_failing_connection) {
+    set_defbase();
     mylog.trace("multiple_outstanding_operations_on_failing_connection");
     with_ldap_connection(local_fail_inject_address, [] (ldap_connection& c) {
         mylog.trace("multiple_outstanding_operations_on_failing_connection: invoking bind");
@@ -250,24 +262,28 @@ SEASTAR_THREAD_TEST_CASE(multiple_outstanding_operations_on_failing_connection) 
 using exception_predicate::message_contains;
 
 SEASTAR_THREAD_TEST_CASE(bind_after_close) {
+    set_defbase();
     ldap_connection c(connect(local_ldap_address).get0());
     c.close().get();
     BOOST_REQUIRE_EXCEPTION(bind(c).get(), std::runtime_error, message_contains("ldap_connection"));
 }
 
 SEASTAR_THREAD_TEST_CASE(search_after_close) {
+    set_defbase();
     ldap_connection c(connect(local_ldap_address).get0());
     c.close().get();
     BOOST_REQUIRE_EXCEPTION(search(c, base_dn).get(), std::runtime_error, message_contains("ldap_connection"));
 }
 
 SEASTAR_THREAD_TEST_CASE(close_after_close) {
+    set_defbase();
     ldap_connection c(connect(local_ldap_address).get0());
     c.close().get();
     BOOST_REQUIRE_EXCEPTION(c.close().get(), std::runtime_error, message_contains("ldap_connection"));
 }
 
 SEASTAR_THREAD_TEST_CASE(severed_connection_yields_exceptional_future) {
+    set_defbase();
     with_ldap_connection(local_fail_inject_address, [] (ldap_connection& c) {
         int up = 1;
         while (up) {

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "database.hh"
@@ -64,6 +53,7 @@ class build_progress_virtual_reader {
 
         build_progress_reader(
                 schema_ptr legacy_schema,
+                reader_permit permit,
                 column_family& scylla_views_build_progress,
                 const dht::partition_range& range,
                 const query::partition_slice& slice,
@@ -71,7 +61,7 @@ class build_progress_virtual_reader {
                 tracing::trace_state_ptr trace_state,
                 streamed_mutation::forwarding fwd,
                 mutation_reader::forwarding fwd_mr)
-                : flat_mutation_reader::impl(std::move(legacy_schema))
+                : flat_mutation_reader::impl(std::move(legacy_schema), permit)
                 , _scylla_next_token_col(scylla_views_build_progress.schema()->get_column_definition("next_token")->id)
                 , _scylla_generation_number_col(scylla_views_build_progress.schema()->get_column_definition("generation_number")->id)
                 , _legacy_last_token_col(_schema->get_column_definition("last_token")->id)
@@ -80,6 +70,7 @@ class build_progress_virtual_reader {
                 , _slice(adjust_partition_slice())
                 , _underlying(scylla_views_build_progress.make_reader(
                         scylla_views_build_progress.schema(),
+                        std::move(permit),
                         range,
                         slice,
                         pc,
@@ -139,19 +130,19 @@ class build_progress_virtual_reader {
                             continue;
                         }
                         _previous_clustering_key = ck;
-                        mf = clustering_row(
+                        mf = mutation_fragment(*_schema, _permit, clustering_row(
                                 std::move(ck),
                                 std::move(scylla_in_progress_row.tomb()),
                                 std::move(scylla_in_progress_row.marker()),
-                                std::move(legacy_in_progress_row));
+                                std::move(legacy_in_progress_row)));
                     } else if (mf.is_range_tombstone()) {
                         auto scylla_in_progress_rt = std::move(mf).as_range_tombstone();
-                        mf = range_tombstone(
+                        mf = mutation_fragment(*_schema, _permit, range_tombstone(
                                 adjust_ckey(scylla_in_progress_rt.start),
                                 scylla_in_progress_rt.start_kind,
                                 adjust_ckey(scylla_in_progress_rt.end),
                                 scylla_in_progress_rt.end_kind,
-                                scylla_in_progress_rt.tomb);
+                                scylla_in_progress_rt.tomb));
                     } else if (mf.is_end_of_partition()) {
                         _previous_clustering_key.reset();
                     }
@@ -188,7 +179,7 @@ public:
 
     flat_mutation_reader operator()(
             schema_ptr s,
-            reader_permit,
+            reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
             const io_priority_class& pc,
@@ -197,6 +188,7 @@ public:
             mutation_reader::forwarding fwd_mr) {
         return flat_mutation_reader(std::make_unique<build_progress_reader>(
                 std::move(s),
+                std::move(permit),
                 _db.find_column_family(s->ks_name(), system_keyspace::v3::SCYLLA_VIEWS_BUILDS_IN_PROGRESS),
                 range,
                 slice,

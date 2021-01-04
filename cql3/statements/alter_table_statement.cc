@@ -59,7 +59,9 @@ alter_table_statement::alter_table_statement(shared_ptr<cf_name> name,
 }
 
 future<> alter_table_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
-    return state.has_column_family_access(keyspace(), column_family(), auth::permission::ALTER);
+    using cdt = auth::command_desc::type;
+    return state.has_column_family_access(proxy.local_db(), keyspace(), column_family(), auth::permission::ALTER,
+                                          _type == type::opts ? cdt::ALTER_WITH_OPTS : cdt::OTHER);
 }
 
 void alter_table_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const
@@ -171,7 +173,7 @@ void alter_table_statement::add_column(const schema& schema, const table& cf, sc
     }
 
     // Cannot re-add a dropped counter column. See #7831.
-    if (schema.is_counter() && schema.dropped_columns().count(column_name.text())) {
+    if (schema.is_counter() && schema.dropped_columns().contains(column_name.text())) {
         throw exceptions::invalid_request_exception(format("Cannot re-add previously dropped counter column {}", column_name));
     }
 
@@ -196,6 +198,9 @@ void alter_table_statement::add_column(const schema& schema, const table& cf, sc
                 "because a collection with the same name and a different type has already been used in the past", column_name));
         }
     }
+    if (type->is_counter() && !schema.is_counter()) {
+        throw exceptions::configuration_exception(format("Cannot add a counter column ({}) in a non counter column family", column_name));
+    }
 
     cfm.with_column(column_name.name(), type, is_static ? column_kind::static_column : column_kind::regular_column);
 
@@ -211,7 +216,7 @@ void alter_table_statement::add_column(const schema& schema, const table& cf, sc
             schema_builder builder(view);
             if (view->view_info()->include_all_columns()) {
                 builder.with_column(column_name.name(), type);
-            } else if (view->view_info()->base_non_pk_columns_in_view_pk().empty()) {
+            } else if (!view->view_info()->has_base_non_pk_columns_in_view_pk()) {
                 db::view::create_virtual_column(builder, column_name.name(), type);
             }
             view_updates.push_back(view_ptr(builder.build()));
@@ -272,7 +277,7 @@ void alter_table_statement::drop_column(const schema& schema, const table& cf, s
     }
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> alter_table_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const
+future<shared_ptr<cql_transport::event::schema_change>> alter_table_statement::announce_migration(service::storage_proxy& proxy) const
 {
     auto& db = proxy.get_db().local();
     auto s = validation::validate_column_family(db, keyspace(), column_family());
@@ -380,7 +385,7 @@ future<shared_ptr<cql_transport::event::schema_change>> alter_table_statement::a
         break;
     }
 
-    return service::get_local_migration_manager().announce_column_family_update(cfm.build(), false, std::move(view_updates), is_local_only)
+    return service::get_local_migration_manager().announce_column_family_update(cfm.build(), false, std::move(view_updates))
         .then([this] {
             using namespace cql_transport;
             return ::make_shared<event::schema_change>(

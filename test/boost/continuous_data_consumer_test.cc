@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "vint-serialization.hh"
@@ -24,6 +13,7 @@
 
 #include "bytes.hh"
 #include "utils/buffer_input_stream.hh"
+#include "test/lib/reader_permit.hh"
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/core/iostream.hh>
@@ -61,7 +51,7 @@ class test_consumer final : public data_consumer::continuous_data_consumer<test_
 
 public:
     test_consumer(uint64_t tested_value)
-        : continuous_data_consumer(no_reader_permit(), prepare_stream(tested_value), 0, calculate_length(tested_value))
+        : continuous_data_consumer(tests::make_permit(), prepare_stream(tested_value), 0, calculate_length(tested_value))
         , _tested_value(tested_value)
     { }
 

@@ -51,20 +51,15 @@ namespace json_helpers {
  * should be treated as case-sensitive, while regular strings should be
  * case-insensitive.
  */
-static std::unordered_map<sstring, Json::Value> handle_case_sensitivity(Json::Value&& value_map) {
-    std::unordered_map<sstring, Json::Value> case_sensitive_map;
-    for (auto it = value_map.begin(); it != value_map.end(); ++it) {
-#if defined(JSONCPP_VERSION_HEXA) && (JSONCPP_VERSION_HEXA >= 0x010600) // >= 1.6.0
-        sstring name = it.name();
-#else
-        // NOTICE(sarna): Unsafe for strings with embedded null character
-        sstring name = it.memberName();
-#endif
+static std::unordered_map<sstring, rjson::value> handle_case_sensitivity(rjson::value&& value_map) {
+    std::unordered_map<sstring, rjson::value> case_sensitive_map;
+    for (auto it = value_map.MemberBegin(); it != value_map.MemberEnd(); ++it) {
+        sstring name(rjson::to_string_view(it->name));
         if (name.size() > 1 && *name.begin() == '"' && name.back() == '"') {
-            case_sensitive_map.emplace(name.substr(1, name.size() - 2), std::move(*it));
+            case_sensitive_map.emplace(name.substr(1, name.size() - 2), std::move(it->value));
         } else {
             std::transform(name.begin(), name.end(), name.begin(), ::tolower);
-            case_sensitive_map.emplace(std::move(name), std::move(*it));
+            case_sensitive_map.emplace(std::move(name), std::move(it->value));
         }
     }
     return case_sensitive_map;
@@ -73,18 +68,17 @@ static std::unordered_map<sstring, Json::Value> handle_case_sensitivity(Json::Va
 std::unordered_map<sstring, bytes_opt>
 parse(const sstring& json_string, const std::vector<column_definition>& expected_receivers, cql_serialization_format sf) {
     std::unordered_map<sstring, bytes_opt> json_map;
-    Json::Value raw_value_map = json::to_json_value(json_string);
-    std::unordered_map<sstring, Json::Value> prepared_map = handle_case_sensitivity(std::move(raw_value_map));
+    auto prepared_map = handle_case_sensitivity(rjson::parse(json_string));
     for (const auto& def : expected_receivers) {
         sstring cql_name = def.name_as_text();
         auto value_it = prepared_map.find(cql_name);
         if (value_it == prepared_map.end()) {
             continue;
-        } else if (value_it->second.isNull()) {
+        } else if (value_it->second.IsNull()) {
             json_map.emplace(std::move(cql_name), bytes_opt{});
             prepared_map.erase(value_it);
         } else {
-            json_map.emplace(std::move(cql_name), from_json_object(*def.type, value_it->second, sf));
+            json_map.emplace(std::move(cql_name), from_json_object(*def.type, std::move(value_it->second), sf));
             prepared_map.erase(value_it);
         }
     }
@@ -137,7 +131,7 @@ void update_statement::add_update_for_key(mutation& m, const query::clustering_r
         if (rb->name().empty() || rb->type == empty_type) {
             // There is no column outside the PK. So no operation could have passed through validation
             assert(_column_operations.empty());
-            constants::setter(*s->regular_begin(), make_shared(constants::value(cql3::raw_value::make_value(bytes())))).execute(m, prefix, params);
+            constants::setter(*s->regular_begin(), make_shared<constants::value>(cql3::raw_value::make_value(bytes()))).execute(m, prefix, params);
         } else {
             // dense means we don't have a row marker, so don't accept to set only the PK. See CASSANDRA-5648.
             if (_column_operations.empty()) {
@@ -215,19 +209,19 @@ insert_prepared_json_statement::execute_set_value(mutation& m, const clustering_
     visit(*column.type, make_visitor(
     [&] (const list_type_impl& ltype) {
         lists::setter::execute(m, prefix, params, column,
-                ::make_shared(lists::value::from_serialized(fragmented_temporary_buffer::view(*value), ltype, sf)));
+                ::make_shared<lists::value>(lists::value::from_serialized(fragmented_temporary_buffer::view(*value), ltype, sf)));
     },
     [&] (const set_type_impl& stype) {
         sets::setter::execute(m, prefix, params, column,
-                ::make_shared(sets::value::from_serialized(fragmented_temporary_buffer::view(*value), stype, sf)));
+                ::make_shared<sets::value>(sets::value::from_serialized(fragmented_temporary_buffer::view(*value), stype, sf)));
     },
     [&] (const map_type_impl& mtype) {
         maps::setter::execute(m, prefix, params, column,
-                ::make_shared(maps::value::from_serialized(fragmented_temporary_buffer::view(*value), mtype, sf)));
+                ::make_shared<maps::value>(maps::value::from_serialized(fragmented_temporary_buffer::view(*value), mtype, sf)));
     },
     [&] (const user_type_impl& utype) {
         user_types::setter::execute(m, prefix, params, column,
-                ::make_shared(user_types::value::from_serialized(fragmented_temporary_buffer::view(*value), utype)));
+                ::make_shared<user_types::value>(user_types::value::from_serialized(fragmented_temporary_buffer::view(*value), utype)));
     },
     [&] (const abstract_type& type) {
         if (type.is_collection()) {
@@ -325,7 +319,7 @@ insert_statement::prepare_internal(database& db, schema_ptr schema,
         if (!def) {
             throw exceptions::invalid_request_exception(format("Unknown identifier {}", *id));
         }
-        if (column_ids.count(id->name())) {
+        if (column_ids.contains(id->name())) {
             throw exceptions::invalid_request_exception(format("Multiple definitions found for column {}", *id));
         }
         column_ids.emplace(id->name());
@@ -333,7 +327,7 @@ insert_statement::prepare_internal(database& db, schema_ptr schema,
         auto&& value = _column_values[i];
 
         if (def->is_primary_key()) {
-            relations.push_back(::make_shared<single_column_relation>(col, operator_type::EQ, value));
+            relations.push_back(::make_shared<single_column_relation>(col, expr::oper_t::EQ, value));
         } else {
             auto operation = operation::set_value(value).prepare(db, keyspace(), *def);
             operation->collect_marker_specification(bound_names);
@@ -362,7 +356,7 @@ insert_json_statement::prepare_internal(database& db, schema_ptr schema,
 {
     assert(dynamic_pointer_cast<constants::literal>(_json_value) || dynamic_pointer_cast<abstract_marker::raw>(_json_value));
     auto json_column_placeholder = ::make_shared<column_identifier>("", true);
-    auto prepared_json_value = _json_value->prepare(db, "", ::make_shared<column_specification>("", "", json_column_placeholder, utf8_type));
+    auto prepared_json_value = _json_value->prepare(db, "", make_lw_shared<column_specification>("", "", json_column_placeholder, utf8_type));
     prepared_json_value->collect_marker_specification(bound_names);
     auto stmt = ::make_shared<cql3::statements::insert_prepared_json_statement>(audit_info(), bound_names.size(), schema, std::move(attrs), stats, std::move(prepared_json_value), _default_unset);
     prepare_conditions(db, *schema, bound_names, *stmt);
@@ -371,7 +365,7 @@ insert_json_statement::prepare_internal(database& db, schema_ptr schema,
 
 update_statement::update_statement(::shared_ptr<cf_name> name,
                                    std::unique_ptr<attributes::raw> attrs,
-                                   std::vector<std::pair<::shared_ptr<column_identifier::raw>, ::shared_ptr<operation::raw_update>>> updates,
+                                   std::vector<std::pair<::shared_ptr<column_identifier::raw>, std::unique_ptr<operation::raw_update>>> updates,
                                    std::vector<relation_ptr> where_clause,
                                    conditions_vector conditions, bool if_exists)
     : raw::modification_statement(std::move(name), std::move(attrs), std::move(conditions), false, if_exists)

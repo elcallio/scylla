@@ -37,6 +37,8 @@
 #include "tombstone.hh"
 #include "exceptions/exceptions.hh"
 #include "cql3/query_options.hh"
+#include "query-request.hh"
+#include "query-result.hh"
 
 namespace cql3 {
 
@@ -83,10 +85,6 @@ public:
         struct row {
             // Order CAS columns by ordinal column id.
             std::map<ordinal_column_id, data_value> cells;
-            // Set if the statement is used for checking conditions of a CAS request.
-            // Only those statements that have this flag set should be included into
-            // the CAS result set.
-            mutable bool is_in_cas_result_set = false;
             // Return true if this row has at least one static column set.
             bool has_static_columns(const schema& schema) const {
                 if (!schema.has_static_columns()) {

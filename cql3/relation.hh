@@ -30,26 +30,26 @@
 
 #pragma once
 
-#include "operator.hh"
 #include "schema_fwd.hh"
 #include "column_identifier.hh"
 #include "variable_specifications.hh"
 #include "restrictions/restriction.hh"
 #include "statements/bound.hh"
 #include "term.hh"
+#include "expr/expression.hh"
 
 namespace cql3 {
 
 class relation : public enable_shared_from_this<relation> {
 protected:
-    const operator_type& _relation_type;
+    expr::oper_t _relation_type;
 public:
-    relation(const operator_type& relation_type)
+    relation(const expr::oper_t& relation_type)
         : _relation_type(relation_type) {
     }
     virtual ~relation() {}
 
-    virtual const operator_type& get_operator() const {
+    virtual const expr::oper_t& get_operator() const {
         return _relation_type;
     }
 
@@ -77,7 +77,7 @@ public:
      * otherwise.
      */
     virtual bool is_contains() const final {
-        return _relation_type == operator_type::CONTAINS;
+        return _relation_type == expr::oper_t::CONTAINS;
     }
 
     /**
@@ -86,7 +86,7 @@ public:
      * otherwise.
      */
     virtual bool is_contains_key() const final {
-        return _relation_type == operator_type::CONTAINS_KEY;
+        return _relation_type == expr::oper_t::CONTAINS_KEY;
     }
 
     /**
@@ -95,7 +95,7 @@ public:
      * otherwise.
      */
     virtual bool is_IN() const final {
-        return _relation_type == operator_type::IN;
+        return _relation_type == expr::oper_t::IN;
     }
 
     /**
@@ -104,7 +104,7 @@ public:
      * otherwise.
      */
     virtual bool is_EQ() const final {
-        return _relation_type == operator_type::EQ;
+        return _relation_type == expr::oper_t::EQ;
     }
 
     /**
@@ -113,11 +113,11 @@ public:
      * @return <code>true</code> if the operator of this relation is a <code>Slice</code>, <code>false</code> otherwise.
      */
     virtual bool is_slice() const final {
-        return _relation_type == operator_type::GT
-                || _relation_type == operator_type::GTE
-                || _relation_type == operator_type::LTE
+        return _relation_type == expr::oper_t::GT
+                || _relation_type == expr::oper_t::GTE
+                || _relation_type == expr::oper_t::LTE
                 || _relation_type ==
-            operator_type::LT;
+            expr::oper_t::LT;
     }
 
     /**
@@ -129,27 +129,27 @@ public:
      * @throws InvalidRequestException if this <code>Relation</code> is not valid
      */
     virtual ::shared_ptr<restrictions::restriction> to_restriction(database& db, schema_ptr schema, variable_specifications& bound_names) final {
-        if (_relation_type == operator_type::EQ) {
+        if (_relation_type == expr::oper_t::EQ) {
             return new_EQ_restriction(db, schema, bound_names);
-        } else if (_relation_type == operator_type::LT) {
+        } else if (_relation_type == expr::oper_t::LT) {
             return new_slice_restriction(db, schema, bound_names, statements::bound::END, false);
-        } else if (_relation_type == operator_type::LTE) {
+        } else if (_relation_type == expr::oper_t::LTE) {
             return new_slice_restriction(db, schema, bound_names, statements::bound::END, true);
-        } else if (_relation_type == operator_type::GTE) {
+        } else if (_relation_type == expr::oper_t::GTE) {
             return new_slice_restriction(db, schema, bound_names, statements::bound::START, true);
-        } else if (_relation_type == operator_type::GT) {
+        } else if (_relation_type == expr::oper_t::GT) {
             return new_slice_restriction(db, schema, bound_names, statements::bound::START, false);
-        } else if (_relation_type == operator_type::IN) {
+        } else if (_relation_type == expr::oper_t::IN) {
             return new_IN_restriction(db, schema, bound_names);
-        } else if (_relation_type == operator_type::CONTAINS) {
+        } else if (_relation_type == expr::oper_t::CONTAINS) {
             return new_contains_restriction(db, schema, bound_names, false);
-        } else if (_relation_type == operator_type::CONTAINS_KEY) {
+        } else if (_relation_type == expr::oper_t::CONTAINS_KEY) {
             return new_contains_restriction(db, schema, bound_names, true);
-        } else if (_relation_type == operator_type::IS_NOT) {
+        } else if (_relation_type == expr::oper_t::IS_NOT) {
             // This case is not supposed to happen: statement_restrictions
             // constructor does not call this function for views' IS_NOT.
             throw exceptions::invalid_request_exception(format("Unsupported \"IS NOT\" relation: {}", to_string()));
-        } else if (_relation_type == operator_type::LIKE) {
+        } else if (_relation_type == expr::oper_t::LIKE) {
             return new_LIKE_restriction(db, schema, bound_names);
         } else {
             throw exceptions::invalid_request_exception(format("Unsupported \"!=\" relation: {}", to_string()));
@@ -238,7 +238,7 @@ protected:
      * @return the <code>Term</code> corresponding to the specified <code>Raw</code>
      * @throws InvalidRequestException if the <code>Raw</code> term is not valid
      */
-    virtual ::shared_ptr<term> to_term(const std::vector<::shared_ptr<column_specification>>& receivers,
+    virtual ::shared_ptr<term> to_term(const std::vector<lw_shared_ptr<column_specification>>& receivers,
                                        const term::raw& raw,
                                        database& db,
                                        const sstring& keyspace,
@@ -254,7 +254,7 @@ protected:
      * @return the <code>Term</code>s corresponding to the specified <code>Raw</code> terms
      * @throws InvalidRequestException if the <code>Raw</code> terms are not valid
      */
-    std::vector<::shared_ptr<term>> to_terms(const std::vector<::shared_ptr<column_specification>>& receivers,
+    std::vector<::shared_ptr<term>> to_terms(const std::vector<lw_shared_ptr<column_specification>>& receivers,
                                              const std::vector<::shared_ptr<term::raw>>& raws,
                                              database& db,
                                              const sstring& keyspace,

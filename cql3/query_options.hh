@@ -30,7 +30,7 @@
 
 #pragma once
 
-#include <seastar/util/gcc6-concepts.hh>
+#include <concepts>
 #include "timestamp.hh"
 #include "bytes.hh"
 #include "db/consistency_level_type.hh"
@@ -68,7 +68,6 @@ private:
     const std::optional<std::vector<sstring_view>> _names;
     std::vector<cql3::raw_value> _values;
     std::vector<cql3::raw_value_view> _value_views;
-    mutable bytes_ostream _temporaries;
     const bool _skip_metadata;
     const specific_options _options;
     cql_serialization_format _cql_serialization_format;
@@ -86,11 +85,11 @@ private:
      * @param values_ranges a vector of values ranges for each statement in the batch.
      */
     template<typename OneMutationDataRange>
-    GCC6_CONCEPT( requires requires (OneMutationDataRange range) {
+    requires requires (OneMutationDataRange range) {
          std::begin(range);
          std::end(range);
-    } && ( requires (OneMutationDataRange range) { { *range.begin() } -> raw_value_view; } ||
-           requires (OneMutationDataRange range) { { *range.begin() } -> raw_value; } ) )
+    } && ( requires (OneMutationDataRange range) { { *range.begin() } -> std::convertible_to<raw_value_view>; } ||
+           requires (OneMutationDataRange range) { { *range.begin() } -> std::convertible_to<raw_value>; } )
     explicit query_options(query_options&& o, std::vector<OneMutationDataRange> values_ranges);
 
 public:
@@ -134,11 +133,11 @@ public:
      * @param values_ranges a vector of values ranges for each statement in the batch.
      */
     template<typename OneMutationDataRange>
-    GCC6_CONCEPT( requires requires (OneMutationDataRange range) {
+    requires requires (OneMutationDataRange range) {
          std::begin(range);
          std::end(range);
-    } && ( requires (OneMutationDataRange range) { { *range.begin() } -> raw_value_view; } ||
-           requires (OneMutationDataRange range) { { *range.begin() } -> raw_value; } ) )
+    } && ( requires (OneMutationDataRange range) { { *range.begin() } -> std::convertible_to<raw_value_view>; } ||
+           requires (OneMutationDataRange range) { { *range.begin() } -> std::convertible_to<raw_value>; } )
     static query_options make_batch_options(query_options&& o, std::vector<OneMutationDataRange> values_ranges) {
         return query_options(std::move(o), std::move(values_ranges));
     }
@@ -166,9 +165,6 @@ public:
     size_t get_values_count() const {
         return _value_views.size();
     }
-
-    cql3::raw_value_view make_temporary(cql3::raw_value value) const;
-    bytes_view linearize(fragmented_temporary_buffer::view) const;
 
     bool skip_metadata() const {
         return _skip_metadata;
@@ -234,17 +230,17 @@ public:
         return _cql_config;
     }
 
-    void prepare(const std::vector<::shared_ptr<column_specification>>& specs);
+    void prepare(const std::vector<lw_shared_ptr<column_specification>>& specs);
 private:
     void fill_value_views();
 };
 
 template<typename OneMutationDataRange>
-GCC6_CONCEPT( requires requires (OneMutationDataRange range) {
+requires requires (OneMutationDataRange range) {
      std::begin(range);
      std::end(range);
-} && ( requires (OneMutationDataRange range) { { *range.begin() } -> raw_value_view; } ||
-       requires (OneMutationDataRange range) { { *range.begin() } -> raw_value; } ) )
+} && ( requires (OneMutationDataRange range) { { *range.begin() } -> std::convertible_to<raw_value_view>; } ||
+       requires (OneMutationDataRange range) { { *range.begin() } -> std::convertible_to<raw_value>; } )
 query_options::query_options(query_options&& o, std::vector<OneMutationDataRange> values_ranges)
     : query_options(std::move(o))
 {

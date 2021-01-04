@@ -10,7 +10,7 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/print.hh>
 #include <map>
-#include <stdexcept>
+#include "exceptions/exceptions.hh"
 
 
 
@@ -36,9 +36,9 @@ using service_levels_info = std::map<sstring, service_level_options>;
 ///
 /// A logical argument error for a service_level statement operation.
 ///
-class service_level_argument_exception : public std::invalid_argument {
+class service_level_argument_exception : public exceptions::invalid_request_exception {
 public:
-    using std::invalid_argument::invalid_argument;
+    using exceptions::invalid_request_exception::invalid_request_exception;
 };
 
 ///

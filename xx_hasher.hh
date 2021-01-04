@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -26,7 +15,7 @@
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Warray-bounds"
-#include <xxHash/xxhash.h>
+#include <xxhash.h>
 #pragma GCC diagnostic pop
 
 #include <array>
@@ -40,7 +29,7 @@ public:
         XXH64_reset(&_state, seed);
     }
 
-    void update(const char* ptr, size_t length) {
+    void update(const char* ptr, size_t length) noexcept {
         XXH64_update(&_state, ptr, length);
     }
 
@@ -66,4 +55,11 @@ private:
         serialize_int64(out, 0);
         serialize_int64(out, finalize_uint64());
     }
+};
+
+// Used to specialize templates in order to fix a bug
+// in handling null values: #4567
+class legacy_xx_hasher_without_null_digest : public xx_hasher {
+public:
+    explicit legacy_xx_hasher_without_null_digest(uint64_t seed = 0) noexcept : xx_hasher(seed) {}
 };

@@ -15,8 +15,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <syslog.h>
-#include <fmt/time.h>
+#include <fmt/chrono.h>
 #include "utils/class_registrator.hh"
+
+namespace cql3 {
+
+class query_processor;
+
+}
 
 namespace audit {
 
@@ -117,7 +123,7 @@ future<> audit_syslog_storage_helper::write_login(const sstring& username,
     return make_ready_future<>();
 }
 
-using registry = class_registrator<storage_helper, audit_syslog_storage_helper>;
+using registry = class_registrator<storage_helper, audit_syslog_storage_helper, cql3::query_processor&>;
 static registry registrator1("audit_syslog_storage_helper");
 
 }

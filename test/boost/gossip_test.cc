@@ -27,6 +27,7 @@
 #include "db/system_distributed_keyspace.hh"
 #include "service/qos/service_level_controller.hh"
 #include "db/config.hh"
+#include "sstables/compaction_manager.hh"
 
 namespace db::view {
 class view_update_generator;
@@ -36,15 +37,17 @@ SEASTAR_TEST_CASE(test_boot_shutdown){
     return seastar::async([] {
         distributed<database> db;
         database_config dbcfg;
+        dbcfg.available_memory = memory::stats().total_memory();
         auto cfg = std::make_unique<db::config>();
         sharded<service::migration_notifier> mm_notif;
         sharded<abort_source> abort_sources;
-        sharded<auth::service> auth_service;
         sharded<db::system_distributed_keyspace> sys_dist_ks;
         sharded<db::view::view_update_generator> view_update_generator;
         utils::fb_utilities::set_broadcast_address(gms::inet_address("127.0.0.1"));
         sharded<gms::feature_service> feature_service;
-        sharded<locator::token_metadata> token_metadata;
+        sharded<locator::shared_token_metadata> token_metadata;
+        sharded<netw::messaging_service> _messaging;
+        sharded<auth::service> auth_service;
 
         token_metadata.start().get();
         auto stop_token_mgr = defer([&token_metadata] { token_metadata.stop().get(); });
@@ -57,7 +60,7 @@ SEASTAR_TEST_CASE(test_boot_shutdown){
 
         feature_service.start(gms::feature_config_from_db_config(*cfg)).get();
         sharded<qos::service_level_controller> sl_controller;
-        sl_controller.start(qos::service_level_options{1000}).get();
+        sl_controller.start(std::ref(auth_service), qos::service_level_options{1000}).get();
         auto stop_sl_controller = defer([&] { sl_controller.stop().get(); });
 
         auto stop_feature_service = defer([&] { feature_service.stop().get(); });
@@ -65,19 +68,29 @@ SEASTAR_TEST_CASE(test_boot_shutdown){
         locator::i_endpoint_snitch::create_snitch("SimpleSnitch").get();
         auto stop_snitch = defer([&] { locator::i_endpoint_snitch::stop_snitch().get(); });
 
-        netw::get_messaging_service().start(std::ref(sl_controller), gms::inet_address("127.0.0.1"), 7000, false /* don't bind */).get();
-        auto stop_messaging_service = defer([&] { netw::get_messaging_service().stop().get(); });
+        _messaging.start(std::ref(sl_controller), gms::inet_address("127.0.0.1"), 7000).get();
+        auto stop_messaging_service = defer([&] { _messaging.stop().get(); });
 
-        gms::get_gossiper().start(std::ref(abort_sources), std::ref(feature_service), std::ref(token_metadata), std::ref(*cfg)).get();
+        gms::get_gossiper().start(std::ref(abort_sources), std::ref(feature_service), std::ref(token_metadata), std::ref(_messaging), std::ref(*cfg)).get();
         auto stop_gossiper = defer([&] { gms::get_gossiper().stop().get(); });
 
         service::storage_service_config sscfg;
         sscfg.available_memory =  memory::stats().total_memory();
 
-        service::get_storage_service().start(std::ref(abort_sources), std::ref(db), std::ref(gms::get_gossiper()), std::ref(auth_service), std::ref(sys_dist_ks), std::ref(view_update_generator), std::ref(feature_service), sscfg, std::ref(mm_notif), std::ref(token_metadata), std::ref(sl_controller), true).get();
+        service::get_storage_service().start(std::ref(abort_sources), std::ref(db), std::ref(gms::get_gossiper()), std::ref(sys_dist_ks), std::ref(view_update_generator), std::ref(feature_service), sscfg, std::ref(mm_notif), std::ref(token_metadata), std::ref(_messaging), std::ref(sl_controller), true).get();
         auto stop_ss = defer([&] { service::get_storage_service().stop().get(); });
 
-        db.start(std::ref(*cfg), dbcfg, std::ref(mm_notif), std::ref(feature_service), std::ref(token_metadata)).get();
+        sharded<semaphore> sst_dir_semaphore;
+        sst_dir_semaphore.start(cfg->initial_sstable_loading_concurrency()).get();
+        auto stop_sst_dir_sem = defer([&sst_dir_semaphore] {
+            sst_dir_semaphore.stop().get();
+        });
+
+        db.start(std::ref(*cfg), dbcfg, std::ref(mm_notif), std::ref(feature_service), std::ref(token_metadata), std::ref(abort_sources), std::ref(sst_dir_semaphore)).get();
+        db.invoke_on_all([] (database& db) {
+            db.get_compaction_manager().enable();
+        }).get();
+
         auto stop_db = defer([&] { db.stop().get(); });
         auto stop_database_d = defer([&db] {
             stop_database(db).get();

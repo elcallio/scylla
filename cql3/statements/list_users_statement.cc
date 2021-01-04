@@ -52,7 +52,7 @@ cql3::statements::list_users_statement::execute(service::storage_proxy& proxy, s
     static const sstring virtual_table_name("users");
 
     static const auto make_column_spec = [](const sstring& name, const ::shared_ptr<const abstract_type>& ty) {
-        return ::make_shared<column_specification>(
+        return make_lw_shared<column_specification>(
             auth::meta::AUTH_KS,
             virtual_table_name,
             ::make_shared<column_identifier>(name, true),
@@ -60,7 +60,7 @@ cql3::statements::list_users_statement::execute(service::storage_proxy& proxy, s
     };
 
     static thread_local const auto metadata = ::make_shared<cql3::metadata>(
-        std::vector<::shared_ptr<column_specification>>{
+        std::vector<lw_shared_ptr<column_specification>>{
                 make_column_spec("name", utf8_type),
                 make_column_spec("super", boolean_type)});
 
@@ -79,7 +79,7 @@ cql3::statements::list_users_statement::execute(service::storage_proxy& proxy, s
             return do_for_each(sorted_roles, [&as, &results](const sstring& role) {
                 return when_all_succeed(
                         as.has_superuser(role),
-                        as.underlying_role_manager().can_login(role)).then([&results, &role](bool super, bool login) {
+                        as.underlying_role_manager().can_login(role)).then_unpack([&results, &role](bool super, bool login) {
                     if (login) {
                         results->add_column_value(utf8_type->decompose(role));
                         results->add_column_value(boolean_type->decompose(super));

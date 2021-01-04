@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "auth/standard_role_manager.hh"
@@ -50,11 +39,7 @@ namespace meta {
 namespace role_members_table {
 
 constexpr std::string_view name{"role_members" , 12};
-
-static std::string_view qualified_name() noexcept {
-    static const sstring instance = AUTH_KS + "." + sstring(name);
-    return instance;
-}
+constexpr std::string_view qualified_name("system_auth.role_members");
 
 }
 
@@ -62,7 +47,7 @@ namespace role_attributes_table {
 constexpr std::string_view name{"role_attributes", 15};
 
 static std::string_view qualified_name() noexcept {
-    static const sstring instance = AUTH_KS + "." + sstring(name);
+    static const sstring instance = make_sstring(AUTH_KS, ".", name);
     return instance;
 }
 static std::string_view creation_query() noexcept {
@@ -105,7 +90,7 @@ static db::consistency_level consistency_for_role(std::string_view role_name) no
 
 static future<std::optional<record>> find_record(cql3::query_processor& qp, std::string_view role_name) {
     static const sstring query = format("SELECT * FROM {} WHERE {} = ?",
-            meta::roles_table::qualified_name(),
+            meta::roles_table::qualified_name,
             meta::roles_table::role_col_name);
 
     return qp.execute_internal(
@@ -145,13 +130,8 @@ static bool has_can_login(const cql3::untyped_result_set_row& row) {
     return row.has("can_login") && !(boolean_type->deserialize(row.get_blob("can_login")).is_null());
 }
 
-std::string_view standard_role_manager_name() noexcept {
-    static const sstring instance = meta::AUTH_PACKAGE_NAME + "CassandraRoleManager";
-    return instance;
-}
-
 std::string_view standard_role_manager::qualified_java_name() const noexcept {
-    return standard_role_manager_name();
+    return "org.apache.cassandra.auth.CassandraRoleManager";
 }
 
 const resource_set& standard_role_manager::protected_resources() const {
@@ -169,7 +149,7 @@ future<> standard_role_manager::create_metadata_tables_if_missing() const {
             "  member text,"
             "  PRIMARY KEY (role, member)"
             ")",
-            meta::role_members_table::qualified_name());
+            meta::role_members_table::qualified_name);
 
     auto role_attributes_table_created = make_ready_future<>();
 
@@ -194,14 +174,14 @@ future<> standard_role_manager::create_metadata_tables_if_missing() const {
                     _qp,
                     create_role_members_query,
                     _migration_manager),
-            std::move(role_attributes_table_created));
+            std::move(role_attributes_table_created)).discard_result();
 }
 
 future<> standard_role_manager::create_default_role_if_missing() const {
     return default_role_row_satisfies(_qp, &has_can_login).then([this](bool exists) {
         if (!exists) {
             static const sstring query = format("INSERT INTO {} ({}, is_superuser, can_login) VALUES (?, true, true)",
-                    meta::roles_table::qualified_name(),
+                    meta::roles_table::qualified_name,
                     meta::roles_table::role_col_name);
 
             return _qp.execute_internal(
@@ -289,7 +269,7 @@ future<> standard_role_manager::stop() {
 
 future<> standard_role_manager::create_or_replace(std::string_view role_name, const role_config& c) const {
     static const sstring query = format("INSERT INTO {} ({}, is_superuser, can_login) VALUES (?, ?, ?)",
-            meta::roles_table::qualified_name(),
+            meta::roles_table::qualified_name,
             meta::roles_table::role_col_name);
 
     return _qp.execute_internal(
@@ -334,7 +314,7 @@ standard_role_manager::alter(std::string_view role_name, const role_config_updat
 
         return _qp.execute_internal(
                 format("UPDATE {} SET {} WHERE {} = ?",
-                        meta::roles_table::qualified_name(),
+                        meta::roles_table::qualified_name,
                         build_column_assignments(u),
                         meta::roles_table::role_col_name),
                 consistency_for_role(role_name),
@@ -352,7 +332,7 @@ future<> standard_role_manager::drop(std::string_view role_name) const {
         // First, revoke this role from all roles that are members of it.
         const auto revoke_from_members = [this, role_name] {
             static const sstring query = format("SELECT member FROM {} WHERE role = ?",
-                    meta::role_members_table::qualified_name());
+                    meta::role_members_table::qualified_name);
 
             return _qp.execute_internal(
                     query,
@@ -396,7 +376,7 @@ future<> standard_role_manager::drop(std::string_view role_name) const {
         // Finally, delete the role itself.
         auto delete_role = [this, role_name] {
             static const sstring query = format("DELETE FROM {} WHERE {} = ?",
-                    meta::roles_table::qualified_name(),
+                    meta::roles_table::qualified_name,
                     meta::roles_table::role_col_name);
 
             return _qp.execute_internal(
@@ -406,9 +386,8 @@ future<> standard_role_manager::drop(std::string_view role_name) const {
                     {sstring(role_name)}).discard_result();
         };
 
-
         return when_all_succeed(revoke_from_members(), revoke_members_of(),
-                remove_attributes_of()).then([delete_role = std::move(delete_role)] {
+                remove_attributes_of()).then_unpack([delete_role = std::move(delete_role)] {
             return delete_role();
         });
     });
@@ -424,7 +403,7 @@ standard_role_manager::modify_membership(
     const auto modify_roles = [this, role_name, grantee_name, ch] {
         const auto query = format(
                 "UPDATE {} SET member_of = member_of {} ? WHERE {} = ?",
-                meta::roles_table::qualified_name(),
+                meta::roles_table::qualified_name,
                 (ch == membership_change::add ? '+' : '-'),
                 meta::roles_table::role_col_name);
 
@@ -440,7 +419,7 @@ standard_role_manager::modify_membership(
             case membership_change::add:
                 return _qp.execute_internal(
                         format("INSERT INTO {} (role, member) VALUES (?, ?)",
-                                meta::role_members_table::qualified_name()),
+                                meta::role_members_table::qualified_name),
                         consistency_for_role(role_name),
                         internal_distributed_timeout_config(),
                         {sstring(role_name), sstring(grantee_name)}).discard_result();
@@ -448,7 +427,7 @@ standard_role_manager::modify_membership(
             case membership_change::remove:
                 return _qp.execute_internal(
                         format("DELETE FROM {} WHERE role = ? AND member = ?",
-                                meta::role_members_table::qualified_name()),
+                                meta::role_members_table::qualified_name),
                         consistency_for_role(role_name),
                         internal_distributed_timeout_config(),
                         {sstring(role_name), sstring(grantee_name)}).discard_result();
@@ -457,7 +436,7 @@ standard_role_manager::modify_membership(
         return make_ready_future<>();
     };
 
-    return when_all_succeed(modify_roles(), modify_role_members());
+    return when_all_succeed(modify_roles(), modify_role_members).discard_result();
 }
 
 future<>
@@ -466,7 +445,7 @@ standard_role_manager::grant(std::string_view grantee_name, std::string_view rol
         return this->query_granted(
                 grantee_name,
                 recursive_role_query::yes).then([role_name, grantee_name](role_set roles) {
-            if (roles.count(sstring(role_name)) != 0) {
+            if (roles.contains(sstring(role_name))) {
                 throw role_already_included(grantee_name, role_name);
             }
 
@@ -478,7 +457,7 @@ standard_role_manager::grant(std::string_view grantee_name, std::string_view rol
         return this->query_granted(
                 role_name,
                 recursive_role_query::yes).then([role_name, grantee_name](role_set roles) {
-            if (roles.count(sstring(grantee_name)) != 0) {
+            if (roles.contains(sstring(grantee_name))) {
                 throw role_already_included(role_name, grantee_name);
             }
 
@@ -486,7 +465,7 @@ standard_role_manager::grant(std::string_view grantee_name, std::string_view rol
         });
     };
 
-   return when_all_succeed(check_redundant(), check_cycle()).then([this, role_name, grantee_name] {
+   return when_all_succeed(check_redundant(), check_cycle()).then_unpack([this, role_name, grantee_name] {
        return this->modify_membership(grantee_name, role_name, membership_change::add);
    });
 }
@@ -501,7 +480,7 @@ standard_role_manager::revoke(std::string_view revokee_name, std::string_view ro
         return this->query_granted(
                 revokee_name,
                 recursive_role_query::no).then([revokee_name, role_name](role_set roles) {
-            if (roles.count(sstring(role_name)) == 0) {
+            if (!roles.contains(sstring(role_name))) {
                 throw revoke_ungranted_role(revokee_name, role_name);
             }
 
@@ -545,7 +524,7 @@ future<role_set> standard_role_manager::query_granted(std::string_view grantee_n
 future<role_set> standard_role_manager::query_all() const {
     static const sstring query = format("SELECT {} FROM {}",
             meta::roles_table::role_col_name,
-            meta::roles_table::qualified_name());
+            meta::roles_table::qualified_name);
 
     // To avoid many copies of a view.
     static const auto role_col_name_string = sstring(meta::roles_table::role_col_name);

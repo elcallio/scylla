@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -185,15 +174,39 @@ public:
             n -= _current_size;
             ++_current;
             _current_size = std::min(_current->size(), _total_size);
+            _current_position = _current->get();
         }
         _total_size -= n;
         _current_size -= n;
-        _current_position = _current->get() + n;
+        _current_position += n;
         if (!_current_size && _total_size) {
             ++_current;
             _current_size = std::min(_current->size(), _total_size);
             _current_position = _current->get();
         }
+    }
+
+    void remove_current() noexcept {
+        _total_size -= _current_size;
+        if (_total_size) {
+            ++_current;
+            _current_size = std::min(_current->size(), _total_size);
+            _current_position = _current->get();
+        } else {
+            _current_size = 0;
+            _current_position = nullptr;
+        }
+    }
+
+    view prefix(size_t n) const {
+        auto tmp = *this;
+        tmp._total_size = std::min(tmp._total_size, n);
+        tmp._current_size = std::min(tmp._current_size, n);
+        return tmp;
+    }
+
+    bytes_view current_fragment() const noexcept {
+        return bytes_view(reinterpret_cast<const bytes_view::value_type*>(_current_position), _current_size);
     }
 
     // Invalidates iterators
@@ -239,7 +252,8 @@ public:
         return !(*this == other);
     }
 };
-GCC6_CONCEPT(static_assert(FragmentRange<fragmented_temporary_buffer::view>));
+static_assert(FragmentRange<fragmented_temporary_buffer::view>);
+static_assert(FragmentedView<fragmented_temporary_buffer::view>);
 
 inline fragmented_temporary_buffer::operator view() const noexcept
 {
@@ -251,12 +265,10 @@ inline fragmented_temporary_buffer::operator view() const noexcept
 
 namespace fragmented_temporary_buffer_concepts {
 
-GCC6_CONCEPT(
 template<typename T>
-concept bool ExceptionThrower = requires(T obj, size_t n) {
+concept ExceptionThrower = requires(T obj, size_t n) {
     obj.throw_out_of_range(n, n);
 };
-)
 
 }
 
@@ -266,6 +278,9 @@ class fragmented_temporary_buffer::istream {
     const char* _current_end;
     size_t _bytes_left = 0;
 private:
+    size_t contig_remain() const {
+        return _current_end - _current_position;
+    }
     void next_fragment() {
         _bytes_left -= _current->size();
         if (_bytes_left) {
@@ -279,7 +294,7 @@ private:
     }
 
     template<typename ExceptionThrower>
-    GCC6_CONCEPT(requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>)
+    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
     void check_out_of_range(ExceptionThrower& exceptions, size_t n) {
         if (__builtin_expect(bytes_left() < n, false)) {
             exceptions.throw_out_of_range(n, bytes_left());
@@ -328,7 +343,7 @@ public:
             throw std::out_of_range(format("attempted to read {:d} bytes from a {:d} byte buffer", attempted_read, actual_left));
         }
     };
-    GCC6_CONCEPT(static_assert(fragmented_temporary_buffer_concepts::ExceptionThrower<default_exception_thrower>));
+    static_assert(fragmented_temporary_buffer_concepts::ExceptionThrower<default_exception_thrower>);
 
     istream(const vector_type& fragments, size_t total_size) noexcept
         : _current(fragments.begin())
@@ -342,33 +357,30 @@ public:
     }
 
     void skip(size_t n) noexcept {
-        auto new_end = _current_position + n;
-        if (__builtin_expect(new_end > _current_end, false)) {
+        if (__builtin_expect(contig_remain() < n, false)) {
             return skip_slow(n);
         }
-        _current_position = new_end;
+        _current_position += n;
     }
 
     template<typename T, typename ExceptionThrower = default_exception_thrower>
-    GCC6_CONCEPT(requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>)
+    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
     T read(ExceptionThrower&& exceptions = default_exception_thrower()) {
-        auto new_end = _current_position + sizeof(T);
-        if (__builtin_expect(new_end > _current_end, false)) {
+        if (__builtin_expect(contig_remain() < sizeof(T), false)) {
             return read_slow<T>(std::forward<ExceptionThrower>(exceptions));
         }
         T obj;
         std::copy_n(_current_position, sizeof(T), reinterpret_cast<char*>(&obj));
-        _current_position = new_end;
+        _current_position += sizeof(T);
         return obj;
     }
 
     template<typename Output, typename ExceptionThrower = default_exception_thrower>
-    GCC6_CONCEPT(requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>)
+    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
     Output read_to(size_t n, Output out, ExceptionThrower&& exceptions = default_exception_thrower()) {
-        auto new_end = _current_position + n;
-        if (__builtin_expect(new_end <= _current_end, true)) {
-            out = std::copy(_current_position, new_end, out);
-            _current_position = new_end;
+        if (__builtin_expect(contig_remain() >= n, true)) {
+            out = std::copy_n(_current_position, n, out);
+            _current_position += n;
             return out;
         }
         check_out_of_range(exceptions, n);
@@ -386,12 +398,11 @@ public:
     }
 
     template<typename ExceptionThrower = default_exception_thrower>
-    GCC6_CONCEPT(requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>)
+    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
     view read_view(size_t n, ExceptionThrower&& exceptions = default_exception_thrower()) {
-        auto new_end = _current_position + n;
-        if (__builtin_expect(new_end <= _current_end, true)) {
+        if (__builtin_expect(contig_remain() >= n, true)) {
             auto v = view(_current, _current_position - _current->get(), n);
-            _current_position = new_end;
+            _current_position += n;
             return v;
         }
         check_out_of_range(exceptions, n);
@@ -407,12 +418,11 @@ public:
     }
 
     template<typename ExceptionThrower = default_exception_thrower>
-    GCC6_CONCEPT(requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>)
+    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
     bytes_view read_bytes_view(size_t n, bytes_ostream& linearization_buffer, ExceptionThrower&& exceptions = default_exception_thrower()) {
-        auto new_end = _current_position + n;
-        if (__builtin_expect(new_end <= _current_end, true)) {
+        if (__builtin_expect(contig_remain() >= n, true)) {
             auto v = bytes_view(reinterpret_cast<const bytes::value_type*>(_current_position), n);
-            _current_position = new_end;
+            _current_position += n;
             return v;
         }
         check_out_of_range(exceptions, n);

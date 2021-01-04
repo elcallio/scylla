@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <boost/test/unit_test.hpp>
@@ -42,7 +31,7 @@ public:
             const query::partition_slice& slice, flat_mutation_reader&& rd) {
         if (s->cf_name() == _cf_name) {
             return make_filtering_reader(std::move(rd), [this, &range, &slice, s = std::move(s)] (const dht::decorated_key& dk) {
-                testlog.info("listener {}: read {}", this, dk);
+                testlog.info("listener {}: read {}", fmt::ptr(this), dk);
                 ++read;
                 return true;
             });
@@ -75,7 +64,7 @@ results test_data_listeners(cql_test_env& e, sstring cf_name) {
     e.db().invoke_on_all([&listeners, &cf_name] (database& db) {
         auto listener = std::make_unique<table_listener>(cf_name);
         db.data_listeners().install(&*listener);
-        testlog.info("installed listener {}", &*listener);
+        testlog.info("installed listener {}", fmt::ptr(&*listener));
         listeners.push_back(std::move(listener));
     }).get();
 
@@ -93,7 +82,7 @@ results test_data_listeners(cql_test_env& e, sstring cf_name) {
                     continue;
                 }
                 results res{li->read, li->write};
-                testlog.info("uninstalled listener {}: rd={} wr={}", li, li->read, li->write);
+                testlog.info("uninstalled listener {}: rd={} wr={}", fmt::ptr(li), li->read, li->write);
                 db.data_listeners().uninstall(li);
                 return res;
             }

@@ -78,13 +78,10 @@ create_view_statement::create_view_statement(
 }
 
 future<> create_view_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
-    return state.has_column_family_access(keyspace(), _base_name->get_column_family(), auth::permission::ALTER);
+    return state.has_column_family_access(proxy.local_db(), keyspace(), _base_name->get_column_family(), auth::permission::ALTER);
 }
 
 void create_view_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const {
-    if (!proxy.features().cluster_supports_materialized_views()) {
-        throw exceptions::invalid_request_exception("Can't create materialized views until the whole cluster has been upgraded");
-    }
 }
 
 static const column_definition* get_column_definition(const schema& schema, column_identifier::raw& identifier) {
@@ -114,7 +111,7 @@ static bool validate_primary_key(
     }
 
     bool new_non_pk_column = false;
-    if (base_pk.find(def) == base_pk.end()) {
+    if (!base_pk.contains(def)) {
         if (has_non_pk_column) {
             throw exceptions::invalid_request_exception(format("Cannot include more than one non-primary key column '{}' in materialized view primary key", def->name_as_text()));
         }
@@ -132,7 +129,7 @@ static bool validate_primary_key(
     return new_non_pk_column;
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::announce_migration(service::storage_proxy& proxy, bool is_local_only) const {
+future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::announce_migration(service::storage_proxy& proxy) const {
     // We need to make sure that:
     //  - primary key includes all columns in base table's primary key
     //  - make sure that the select statement does not have anything other than columns
@@ -217,7 +214,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     }
 
     auto parameters = make_lw_shared<raw::select_statement::parameters>(raw::select_statement::parameters::orderings_type(), false, true);
-    raw::select_statement raw_select(_base_name, std::move(parameters), _select_clause, _where_clause, nullptr, nullptr, {});
+    raw::select_statement raw_select(_base_name, std::move(parameters), _select_clause, _where_clause, nullptr, nullptr, {}, std::make_unique<cql3::attributes::raw>());
     raw_select.prepare_keyspace(keyspace());
     raw_select.set_bound_variables({});
 
@@ -260,12 +257,12 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     // used in the view and whether or not to generate a tombstone. In order to not surprise our users, we require
     // that they include all of the columns. We provide them with a list of all of the columns left to include.
     for (auto& def : schema->all_columns()) {
-        bool included_def = included.empty() || included.find(&def) != included.end();
+        bool included_def = included.empty() || included.contains(&def);
         if (included_def && def.is_static()) {
             throw exceptions::invalid_request_exception(format("Unable to include static column '{}' which would be included by Materialized View SELECT * statement", def));
         }
 
-        bool def_in_target_pk = std::find(target_primary_keys.begin(), target_primary_keys.end(), &def) != target_primary_keys.end();
+        bool def_in_target_pk = target_primary_keys.contains(&def);
         if (included_def && !def_in_target_pk) {
             target_non_pk_columns.push_back(&def);
         }
@@ -299,7 +296,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     // problem. And this case actually works correctly.
     auto non_pk_restrictions = restrictions->get_non_pk_restriction();
     if (non_pk_restrictions.size() == 1 && has_non_pk_column &&
-            std::find(target_primary_keys.begin(), target_primary_keys.end(), non_pk_restrictions.cbegin()->first) != target_primary_keys.end()) {
+            target_primary_keys.contains(non_pk_restrictions.cbegin()->first)) {
         // This case (filter by new PK column of the view) works, as explained above
     } else if (!non_pk_restrictions.empty()) {
         auto column_names = ::join(", ", non_pk_restrictions | boost::adaptors::map_keys | boost::adaptors::transformed(std::mem_fn(&column_definition::name_as_text)));
@@ -342,8 +339,8 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     auto where_clause_text = util::relations_to_where_clause(_where_clause);
     builder.with_view_info(schema->id(), schema->cf_name(), included.empty(), std::move(where_clause_text));
 
-    return make_ready_future<>().then([definition = view_ptr(builder.build()), is_local_only]() mutable {
-        return service::get_local_migration_manager().announce_new_view(definition, is_local_only);
+    return make_ready_future<>().then([definition = view_ptr(builder.build())]() mutable {
+        return service::get_local_migration_manager().announce_new_view(definition);
     }).then_wrapped([this] (auto&& f) {
         try {
             f.get();

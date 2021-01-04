@@ -34,6 +34,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/stream.hh>
+#include <seastar/core/file.hh>
 #include "replay_position.hh"
 #include "commitlog_entry.hh"
 #include "db/timeout_clock.hh"
@@ -126,6 +127,7 @@ public:
 
         bool reuse_segments = true;
         bool use_o_dsync = false;
+        bool warn_about_segments_left_on_disk_after_shutdown = true;
 
         const db::extensions * extensions = nullptr;
     };
@@ -138,7 +140,7 @@ public:
         static const std::string FILENAME_PREFIX;
         static const std::string FILENAME_EXTENSION;
 
-        descriptor(descriptor&&) = default;
+        descriptor(descriptor&&) noexcept = default;
         descriptor(const descriptor&) = default;
         descriptor(segment_id_type i, const std::string& fname_prefix, uint32_t v = 1, sstring = {});
         descriptor(replay_position p, const std::string& fname_prefix = FILENAME_PREFIX);

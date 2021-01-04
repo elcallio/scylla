@@ -89,12 +89,12 @@ struct table {
         testlog.trace("flushing");
         prev_mt = std::exchange(mt, make_lw_shared<memtable>(s.schema()));
         auto flushed = make_lw_shared<memtable>(s.schema());
-        flushed->apply(*prev_mt).get();
+        flushed->apply(*prev_mt, tests::make_permit()).get();
         prev_mt->mark_flushed(flushed->as_data_source());
         testlog.trace("updating cache");
-        cache.update([&] {
+        cache.update(row_cache::external_updater([&] {
             underlying.apply(flushed);
-        }, *prev_mt).get();
+        }), *prev_mt).get();
         testlog.trace("flush done");
         prev_mt = {};
     }
@@ -134,17 +134,17 @@ struct table {
 
     std::unique_ptr<reader> make_reader(dht::partition_range pr, query::partition_slice slice) {
         testlog.trace("making reader, pk={} ck={}", pr, slice);
-        auto r = std::make_unique<reader>(reader{std::move(pr), std::move(slice), make_empty_flat_reader(s.schema())});
+        auto r = std::make_unique<reader>(reader{std::move(pr), std::move(slice), make_empty_flat_reader(s.schema(), tests::make_permit())});
         std::vector<flat_mutation_reader> rd;
         if (prev_mt) {
-            rd.push_back(prev_mt->make_flat_reader(s.schema(), r->pr, r->slice, default_priority_class(), nullptr,
+            rd.push_back(prev_mt->make_flat_reader(s.schema(), tests::make_permit(), r->pr, r->slice, default_priority_class(), nullptr,
                 streamed_mutation::forwarding::no, mutation_reader::forwarding::no));
         }
-        rd.push_back(mt->make_flat_reader(s.schema(), r->pr, r->slice, default_priority_class(), nullptr,
+        rd.push_back(mt->make_flat_reader(s.schema(), tests::make_permit(), r->pr, r->slice, default_priority_class(), nullptr,
             streamed_mutation::forwarding::no, mutation_reader::forwarding::no));
-        rd.push_back(cache.make_reader(s.schema(), r->pr, r->slice, default_priority_class(), nullptr,
+        rd.push_back(cache.make_reader(s.schema(), tests::make_permit(), r->pr, r->slice, default_priority_class(), nullptr,
             streamed_mutation::forwarding::no, mutation_reader::forwarding::no));
-        r->rd = make_combined_reader(s.schema(), std::move(rd), streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
+        r->rd = make_combined_reader(s.schema(), tests::make_permit(), std::move(rd), streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
         return r;
     }
 
@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
         ;
 
     return app.run(argc, argv, [&app] {
-        if (app.configuration().count("trace")) {
+        if (app.configuration().contains("trace")) {
             testlog.set_level(seastar::log_level::trace);
         }
 

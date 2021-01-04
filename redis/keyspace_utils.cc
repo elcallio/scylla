@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "redis/keyspace_utils.hh"
@@ -44,7 +33,7 @@ namespace redis {
 
 static logging::logger logger("keyspace_utils");
 schema_ptr strings_schema(sstring ks_name) {
-     schema_builder builder(make_lw_shared(schema(generate_legacy_id(ks_name, redis::STRINGs), ks_name, redis::STRINGs,
+     schema_builder builder(make_shared_schema(generate_legacy_id(ks_name, redis::STRINGs), ks_name, redis::STRINGs,
      // partition key
      {{"pkey", utf8_type}},
      // clustering key
@@ -57,7 +46,7 @@ schema_ptr strings_schema(sstring ks_name) {
      utf8_type,
      // comment
      "save STRINGs for redis"
-    )));
+    ));
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
     builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
@@ -65,7 +54,7 @@ schema_ptr strings_schema(sstring ks_name) {
 }
 
 schema_ptr lists_schema(sstring ks_name) {
-     schema_builder builder(make_lw_shared(schema(generate_legacy_id(ks_name, redis::LISTs), ks_name, redis::LISTs,
+     schema_builder builder(make_shared_schema(generate_legacy_id(ks_name, redis::LISTs), ks_name, redis::LISTs,
      // partition key
      {{"pkey", utf8_type}},
      // clustering key
@@ -78,7 +67,7 @@ schema_ptr lists_schema(sstring ks_name) {
      utf8_type,
      // comment
      "save LISTs for redis"
-    )));
+    ));
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
     builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
@@ -86,7 +75,7 @@ schema_ptr lists_schema(sstring ks_name) {
 }
 
 schema_ptr hashes_schema(sstring ks_name) {
-     schema_builder builder(make_lw_shared(schema(generate_legacy_id(ks_name, redis::HASHes), ks_name, redis::HASHes,
+     schema_builder builder(make_shared_schema(generate_legacy_id(ks_name, redis::HASHes), ks_name, redis::HASHes,
      // partition key
      {{"pkey", utf8_type}},
      // clustering key
@@ -99,7 +88,7 @@ schema_ptr hashes_schema(sstring ks_name) {
      utf8_type,
      // comment
      "save HASHes for redis"
-    )));
+    ));
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
     builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
@@ -107,7 +96,7 @@ schema_ptr hashes_schema(sstring ks_name) {
 }
 
 schema_ptr sets_schema(sstring ks_name) {
-     schema_builder builder(make_lw_shared(schema(generate_legacy_id(ks_name, redis::SETs), ks_name, redis::SETs,
+     schema_builder builder(make_shared_schema(generate_legacy_id(ks_name, redis::SETs), ks_name, redis::SETs,
      // partition key
      {{"pkey", utf8_type}},
      // clustering key
@@ -120,7 +109,7 @@ schema_ptr sets_schema(sstring ks_name) {
      utf8_type,
      // comment
      "save SETs for redis"
-    )));
+    ));
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
     builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
@@ -128,7 +117,7 @@ schema_ptr sets_schema(sstring ks_name) {
 }
 
 schema_ptr zsets_schema(sstring ks_name) {
-     schema_builder builder(make_lw_shared(schema(generate_legacy_id(ks_name, redis::ZSETs), ks_name, redis::ZSETs,
+     schema_builder builder(make_shared_schema(generate_legacy_id(ks_name, redis::ZSETs), ks_name, redis::ZSETs,
      // partition key
      {{"pkey", utf8_type}},
      // clustering key
@@ -141,7 +130,7 @@ schema_ptr zsets_schema(sstring ks_name) {
      utf8_type,
      // comment
      "save ZSETs for redis"
-    )));
+    ));
     builder.set_gc_grace_seconds(0);
     builder.with(schema_builder::compact_storage::yes);
     builder.with_version(db::system_keyspace::generate_schema_version(builder.uuid()));
@@ -150,7 +139,7 @@ schema_ptr zsets_schema(sstring ks_name) {
 
 future<> create_keyspace_if_not_exists_impl(db::config& config, int default_replication_factor) {
     auto keyspace_replication_strategy_options = config.redis_keyspace_replication_strategy_options();
-    if (keyspace_replication_strategy_options.count("class") == 0) {
+    if (!keyspace_replication_strategy_options.contains("class")) {
         keyspace_replication_strategy_options["class"] = "SimpleStrategy";
         keyspace_replication_strategy_options["replication_factor"] = sprint("%d", default_replication_factor);
     }
@@ -167,8 +156,8 @@ future<> create_keyspace_if_not_exists_impl(db::config& config, int default_repl
         }
         attrs->add_property(cql3::statements::ks_prop_defs::KW_REPLICATION, replication_properties); 
         attrs->validate();
-        const auto& tm = proxy.get_token_metadata();
-        return service::get_local_migration_manager().announce_new_keyspace(attrs->as_ks_metadata(name, tm), false);
+        const auto& tm = *proxy.get_token_metadata_ptr();
+        return service::get_local_migration_manager().announce_new_keyspace(attrs->as_ks_metadata(name, tm));
     };
     auto table_gen = [] (sstring ks_name, sstring cf_name, schema_ptr schema) {
         auto& proxy = service::get_local_storage_proxy();
@@ -176,10 +165,10 @@ future<> create_keyspace_if_not_exists_impl(db::config& config, int default_repl
             return make_ready_future<>();
         }
         logger.info("Create keyspace: {}, table: {} for redis.", ks_name, cf_name);
-        return service::get_local_migration_manager().announce_new_column_family(schema, false);
+        return service::get_local_migration_manager().announce_new_column_family(schema);
     };
-    // create 16 default database for redis.
-    return parallel_for_each(boost::irange<unsigned>(0, 16), [keyspace_gen = std::move(keyspace_gen), table_gen = std::move(table_gen)] (auto c) {
+    // create default databases for redis.
+    return parallel_for_each(boost::irange<unsigned>(0, config.redis_database_count()), [keyspace_gen = std::move(keyspace_gen), table_gen = std::move(table_gen)] (auto c) {
         auto ks_name = sprint("REDIS_%d", c);
         return keyspace_gen(ks_name).then([ks_name, table_gen] {
             return when_all_succeed(
@@ -188,9 +177,7 @@ future<> create_keyspace_if_not_exists_impl(db::config& config, int default_repl
                 table_gen(ks_name, redis::SETs, sets_schema(ks_name)),
                 table_gen(ks_name, redis::HASHes, hashes_schema(ks_name)),
                 table_gen(ks_name, redis::ZSETs, zsets_schema(ks_name))
-            ).then([] {
-                return make_ready_future<>();
-            });
+            ).discard_result();
         });
     });
 }

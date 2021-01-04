@@ -98,7 +98,7 @@ public:
         return _c.process(reinterpret_cast<const uint8_t*>(data), size);
     }
     template<typename FragmentedBuffer>
-    GCC6_CONCEPT(requires FragmentRange<FragmentedBuffer>)
+    requires FragmentRange<FragmentedBuffer>
     void process_fragmented(const FragmentedBuffer& buffer) {
         return _c.process_fragmented(buffer);
     }
@@ -191,6 +191,7 @@ public:
     // Divide the size-on-disk threshold by #cpus used, since we assume
     // we distribute stuff more or less equally across shards.
     const uint64_t max_disk_size; // per-shard
+    const uint64_t disk_usage_threshold;
 
     bool _shutdown = false;
     std::optional<shared_promise<>> _shutdown_promise = {};
@@ -247,8 +248,10 @@ public:
         uint64_t segments_destroyed = 0;
         uint64_t pending_flushes = 0;
         uint64_t flush_limit_exceeded = 0;
-        uint64_t total_size = 0;
         uint64_t buffer_list_bytes = 0;
+        // size on disk, actually used - i.e. containing data (allocate+cycle)
+        uint64_t active_size_on_disk = 0;
+        // size allocated on disk - i.e. files created (new, reserve, recycled)
         uint64_t total_size_on_disk = 0;
         uint64_t requests_blocked_memory = 0;
     };
@@ -294,7 +297,7 @@ public:
     future<sseg_ptr> new_segment();
     future<sseg_ptr> active_segment(db::timeout_clock::time_point timeout);
     future<sseg_ptr> allocate_segment();
-    future<sseg_ptr> allocate_segment_ex(const descriptor&, sstring filename, open_flags);
+    future<sseg_ptr> allocate_segment_ex(descriptor, sstring filename, open_flags);
 
     sstring filename(const descriptor& d) const {
         return cfg.commit_log_location + "/" + d.filename();
@@ -315,6 +318,7 @@ public:
     future<> do_pending_deletes();
 
     future<> delete_segments(std::vector<sstring>);
+    future<> delete_file(const sstring&);
 
     void discard_unused_segments();
     void discard_completed_segments(const cf_id_type&);
@@ -433,6 +437,7 @@ class db::commitlog::segment : public enable_shared_from_this<segment>, public c
 
     uint64_t _file_pos = 0;
     uint64_t _flush_pos = 0;
+    uint64_t _size_on_disk = 0;
 
     bool _closed = false;
     // Not the same as _closed since files can be reused
@@ -492,10 +497,11 @@ public:
     // TODO : tune initial / default size
     static constexpr size_t default_size = align_up<size_t>(128 * 1024, alignment);
 
-    segment(::shared_ptr<segment_manager> m, const descriptor& d, file && f)
+    segment(::shared_ptr<segment_manager> m, descriptor&& d, file&& f, uint64_t initial_disk_size)
             : _segment_manager(std::move(m)), _desc(std::move(d)), _file(std::move(f)),
-        _file_name(_segment_manager->cfg.commit_log_location + "/" + _desc.filename()), _sync_time(
-                    clock_type::now()), _pending_ops(true) // want exception propagation
+        _file_name(_segment_manager->cfg.commit_log_location + "/" + _desc.filename()), 
+        _size_on_disk(initial_disk_size),
+        _sync_time(clock_type::now()), _pending_ops(true) // want exception propagation
     {
         ++_segment_manager->totals.segments_created;
         clogger.debug("Created new segment {}", *this);
@@ -504,19 +510,21 @@ public:
         if (!_closed_file) {
             _segment_manager->add_file_to_close(std::move(_file));
         }
+        
+        _segment_manager->totals.buffer_list_bytes -= _buffer.size_bytes();
+        
         if (is_clean()) {
             clogger.debug("Segment {} is no longer active and will submitted for delete now", *this);
             ++_segment_manager->totals.segments_destroyed;
-            _segment_manager->totals.total_size_on_disk -= size_on_disk();
-            _segment_manager->totals.total_size -= (size_on_disk() + _buffer.size_bytes());
+            _segment_manager->totals.active_size_on_disk -= file_position();
             _segment_manager->add_file_to_delete(_file_name, _desc);
-        } else {
+        } else if (_segment_manager->cfg.warn_about_segments_left_on_disk_after_shutdown) {
             clogger.warn("Segment {} is dirty and is left on disk.", *this);
         }
     }
 
     bool is_schema_version_known(schema_ptr s) {
-        return _known_schema_versions.count(s->version());
+        return _known_schema_versions.contains(s->version());
     }
     void add_schema_version(schema_ptr s) {
         _known_schema_versions.emplace(s->version());
@@ -608,7 +616,7 @@ public:
             // block before actual file end.
             // we should only get here when all actual data is 
             // already flushed (see below, close()).
-            if (size_on_disk() < _segment_manager->max_size) {
+            if (file_position() < _segment_manager->max_size) {
                 clogger.trace("{} is closed but not terminated.", *this);
                 if (_buffer.empty()) {
                     new_buffer(0);
@@ -667,7 +675,7 @@ public:
         _buffer_ostream = _buffer.get_ostream();
         auto out = _buffer_ostream.write_substream(overhead);
         out.fill('\0', overhead);
-        _segment_manager->totals.total_size += k;
+        _segment_manager->totals.buffer_list_bytes += _buffer.size_bytes();
     }
 
     bool buffer_is_empty() const {
@@ -750,12 +758,12 @@ public:
                     auto current = *view.begin();
                     return _file.dma_write(off, current.data(), current.size(), priority_class).then_wrapped([this, size, &off, &view](future<size_t>&& f) {
                         try {
-                            auto bytes = std::get<0>(f.get());
+                            auto bytes = f.get0();
                             _segment_manager->totals.bytes_written += bytes;
-                            _segment_manager->totals.total_size_on_disk += bytes;
+                            _segment_manager->totals.active_size_on_disk += bytes;
                             ++_segment_manager->totals.cycle_count;
                             if (bytes == view.size_bytes()) {
-                                clogger.debug("Final write of {} to {}: {}/{} bytes at {}", bytes, *this, size, size, off);
+                                clogger.trace("Final write of {} to {}: {}/{} bytes at {}", bytes, *this, size, size, off);
                                 return make_ready_future<stop_iteration>(stop_iteration::yes);
                             }
                             // gah, partial write. should always get here with dma chunk sized
@@ -763,7 +771,7 @@ public:
                             bytes = align_down(bytes, alignment);
                             off += bytes;
                             view.remove_prefix(bytes);
-                            clogger.debug("Partial write of {} to {}: {}/{} bytes at at {}", bytes, *this, size - view.size_bytes(), size, off - bytes);
+                            clogger.trace("Partial write of {} to {}: {}/{} bytes at at {}", bytes, *this, size - view.size_bytes(), size, off - bytes);
                             return make_ready_future<stop_iteration>(stop_iteration::no);
                             // TODO: retry/ignore/fail/stop - optional behaviour in origin.
                             // we fast-fail the whole commit.
@@ -774,7 +782,12 @@ public:
                     });
                 });
             }).finally([this, buf = std::move(buf), size] {
-                    _segment_manager->notify_memory_written(size);
+                _segment_manager->notify_memory_written(size);
+                _segment_manager->totals.buffer_list_bytes -= buf.size_bytes();
+                if (_size_on_disk < _file_pos) {
+                    _segment_manager->totals.total_size_on_disk += (_file_pos - _size_on_disk);
+                    _size_on_disk = _file_pos;
+                }
             });
         }, [me, flush_after, top, rp] { // lambda instead of bind, so we keep "me" alive.
             assert(me->_pending_ops.has_operation(rp));
@@ -923,7 +936,7 @@ public:
         return position_type(_file_pos + buffer_position());
     }
 
-    size_t size_on_disk() const {
+    size_t file_position() const {
         return _file_pos;
     }
 
@@ -1025,6 +1038,8 @@ db::commitlog::segment_manager::segment_manager(config c)
     , max_size(std::min<size_t>(std::numeric_limits<position_type>::max(), std::max<size_t>(cfg.commitlog_segment_size_in_mb, 1) * 1024 * 1024))
     , max_mutation_size(max_size >> 1)
     , max_disk_size(size_t(std::ceil(cfg.commitlog_total_space_in_mb / double(smp::count))) * 1024 * 1024)
+    // our threshold for trying to force a flush. needs heristics, for now max - segment_size/2.
+    , disk_usage_threshold(max_disk_size - (max_disk_size > (max_size/2) ? (max_size/2) : 0))
     , _flush_semaphore(cfg.max_active_flushes)
     // That is enough concurrency to allow for our largest mutation (max_mutation_size), plus
     // an existing in-flight buffer. Since we'll force the cycling() of any buffer that is bigger
@@ -1056,6 +1071,11 @@ future<> db::commitlog::segment_manager::replenish_reserve() {
                 return make_ready_future<>();
             }
             return with_gate(_gate, [this] {
+                // note: if we were strict with disk size, we would refuse to do this 
+                // unless disk footprint is lower than threshold. but we cannot (yet?)
+                // trust that flush logic will absolutely free up an existing 
+                // segment (because colocation stuff etc), so always allow a new
+                // file if needed. That and performance stuff...
                 return allocate_segment().then([this](sseg_ptr s) {
                     auto ret = _reserve_segments.push(std::move(s));
                     if (!ret) {
@@ -1200,7 +1220,11 @@ void db::commitlog::segment_manager::create_counters(const sstring& metrics_cate
                                            "A non-zero value indicates that there are too many pending flush operations (see pending_flushes) and some of "
                                            "them will be blocked till the total amount of pending flush operations drops below {}.", cfg.max_active_flushes))),
 
-        sm::make_gauge("disk_total_bytes", totals.total_size,
+        sm::make_gauge("disk_total_bytes", totals.total_size_on_disk,
+                       sm::description("Holds a size of disk space in bytes reserved for data so far. "
+                                       "A too high value indicates that we have some bottleneck in the writing to sstables path.")),
+
+        sm::make_gauge("disk_active_bytes", totals.active_size_on_disk,
                        sm::description("Holds a size of disk space in bytes used for data so far. "
                                        "A too high value indicates that we have some bottleneck in the writing to sstables path.")),
 
@@ -1248,43 +1272,15 @@ void db::commitlog::segment_manager::flush_segments(bool force) {
     }
 }
 
-/// \brief Helper for ensuring a file is closed if an exception is thrown.
-///
-/// The file provided by the file_fut future is passed to func.
-/// * If func throws an exception E, the file is closed and we return
-///   a failed future with E.
-/// * If func returns a value V, the file is not closed and we return
-///   a future with V.
-/// Note that when an exception is not thrown, it is the
-/// responsibility of func to make sure the file will be closed. It
-/// can close the file itself, return it, or store it somewhere.
-///
-/// \tparam Func The type of function this wraps
-/// \param file_fut A future that produces a file
-/// \param func A function that uses a file
-/// \return A future that passes the file produced by file_fut to func
-///         and closes it if func fails
-template <typename Func>
-static auto close_on_failure(future<file> file_fut, Func func) {
-    return file_fut.then([func = std::move(func)](file f) {
-        return futurize_invoke(func, f).handle_exception([f] (std::exception_ptr e) mutable {
-            return f.close().then_wrapped([f, e = std::move(e)] (future<> x) {
-                using futurator = futurize<std::result_of_t<Func(file)>>;
-                return futurator::make_exception_future(e);
-            });
-        });
-    });
-}
-
-future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager::allocate_segment_ex(const descriptor& d, sstring filename, open_flags flags) {
+future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager::allocate_segment_ex(descriptor d, sstring filename, open_flags flags) {
     file_open_options opt;
     opt.extent_allocation_size_hint = max_size;
-    auto fut = do_io_check(commit_error_handler, [=] {
+    auto fut = do_io_check(commit_error_handler, [this, filename, flags, opt] () mutable {
         auto fut = open_file_dma(filename, flags, opt);
         if (cfg.extensions && !cfg.extensions->commitlog_file_extensions().empty()) {
             for (auto * ext : cfg.extensions->commitlog_file_extensions()) {
-                fut = close_on_failure(std::move(fut), [ext, filename, flags](file f) {
-                   return ext->wrap_file(filename, f, flags).then([f](file nf) mutable {
+                fut = with_file_close_on_failure(std::move(fut), [ext, filename = std::move(filename), flags](file f) mutable {
+                   return ext->wrap_file(std::move(filename), f, flags).then([f](file nf) mutable {
                        return nf ? nf : std::move(f);
                    });
                 });
@@ -1293,7 +1289,7 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
         return fut;
     });
 
-    return close_on_failure(std::move(fut), [this, d, filename, flags] (file f) {
+    return with_file_close_on_failure(std::move(fut), [this, d = std::move(d), filename = std::move(filename), flags] (file f) mutable {
         f = make_checked_file(commit_error_handler, f);
         // xfs doesn't like files extended betond eof, so enlarge the file
         auto fut = make_ready_future<>();
@@ -1310,14 +1306,20 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
             // instead of this, but for now we must do explicit buffer writes.
             fut = fsiz.then([f, this, filename](uint64_t existing_size) mutable {
                 // if recycled (or from last run), we might have either truncated smaller or written it 
-                // (slighty) larger due to final zeroing of file
-                if (existing_size >= max_size) {
+                // (slightly) larger due to final zeroing of file
+                if (existing_size > max_size) {
                     return f.truncate(max_size);
+                } else if (existing_size == max_size) {
+                    return make_ready_future<>();
                 }
+                
+                totals.total_size_on_disk += (max_size - existing_size);
+
                 clogger.trace("Pre-writing {} of {} KB to segment {}", (max_size - existing_size)/1024, max_size/1024, filename);
                 return f.allocate(existing_size, max_size - existing_size).then([this, existing_size, f]() mutable {
                     static constexpr size_t buf_size = 4 * segment::alignment;
-                    return do_with(allocate_single_buffer(buf_size), max_size - existing_size, [this, f](temporary_buffer<char>& buf, uint64_t& rem) mutable {
+                    size_t zerofill_size = max_size - align_down(existing_size, segment::alignment);
+                    return do_with(allocate_single_buffer(buf_size), zerofill_size, [this, f](temporary_buffer<char>& buf, uint64_t& rem) mutable {
                         std::fill(buf.get_write(), buf.get_write() + buf.size(), 0);
                         return repeat([this, f, &rem, &buf]() mutable {
                             if (rem == 0) {
@@ -1334,7 +1336,7 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
                                 v.emplace_back(iovec{ buf.get_write(), s});
                                 m += s;
                             }
-                            return f.dma_write(max_size - rem, std::move(v), service::get_local_commitlog_priority()).then([&rem](size_t s) {
+                            return f.dma_write(max_size - rem, std::move(v), service::get_local_commitlog_priority()).then([&rem](size_t s) mutable {
                                 rem -= s;
                                 return stop_iteration::no;
                             });
@@ -1346,7 +1348,7 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
             fut = f.truncate(max_size);
         }
         return fut.then([this, d, f, filename] () mutable {
-            auto s = make_shared<segment>(shared_from_this(), d, std::move(f));
+            auto s = make_shared<segment>(shared_from_this(), std::move(d), std::move(f), max_size);
             return make_ready_future<sseg_ptr>(s);
         });
     });
@@ -1376,12 +1378,12 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
         // that recycled the file we could potentially have
         // out-of-order files. (Sort does not help).
         clogger.debug("Using recycled segment file {} -> {}", src, dst);
-        return rename_file(std::move(src), dst).then([=] {
-            return allocate_segment_ex(d, dst, flags);
+        return rename_file(std::move(src), dst).then([this, d = std::move(d), dst = std::move(dst), flags] () mutable {
+            return allocate_segment_ex(std::move(d), std::move(dst), flags);
         });
     }
 
-    return allocate_segment_ex(d, dst, flags|open_flags::create);
+    return allocate_segment_ex(std::move(d), std::move(dst), flags|open_flags::create);
 }
 
 future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager::new_segment() {
@@ -1391,7 +1393,8 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
 
     ++_new_counter;
 
-    if (_reserve_segments.empty() && (_reserve_segments.max_size() < cfg.max_reserve_segments)) {
+    // don't increase reserve count if we are at max, or we would go over disk limit. 
+    if (_reserve_segments.empty() && (_reserve_segments.max_size() < cfg.max_reserve_segments) && (totals.total_size_on_disk + max_size) <= max_disk_size) {
         _reserve_segments.set_max_size(_reserve_segments.max_size() + 1);
         clogger.debug("Increased segment reserve count to {}", _reserve_segments.max_size());
     }
@@ -1414,11 +1417,9 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
                 promise<> p;
                 _segment_allocating.emplace(p.get_future());
                 auto f = _segment_allocating->get_future(timeout);
-                futurize_invoke([this] {
-                    return with_gate(_gate, [this] {
-                        return new_segment().discard_result().finally([this]() {
-                            _segment_allocating = std::nullopt;
-                        });
+                try_with_gate(_gate, [this] {
+                    return new_segment().discard_result().finally([this]() {
+                        _segment_allocating = std::nullopt;
                     });
                 }).forward_to(std::move(p));
                 return f;
@@ -1476,7 +1477,7 @@ std::ostream& operator<<(std::ostream& out, const db::replay_position& p) {
 void db::commitlog::segment_manager::discard_unused_segments() {
     clogger.trace("Checking for unused segments ({} active)", _segments.size());
 
-    auto i = std::remove_if(_segments.begin(), _segments.end(), [=](sseg_ptr s) {
+    std::erase_if(_segments, [=](sseg_ptr s) {
         if (s->can_delete()) {
             clogger.debug("Segment {} is unused", *s);
             return true;
@@ -1490,9 +1491,6 @@ void db::commitlog::segment_manager::discard_unused_segments() {
         }
         return false;
     });
-    if (i != _segments.end()) {
-        _segments.erase(i, _segments.end());
-    }
 
     // launch in background, but guard with gate so this deletion is
     // sure to finish in shutdown, because at least through this path,
@@ -1516,7 +1514,7 @@ future<> db::commitlog::segment_manager::clear_reserve_segments() {
 
     return parallel_for_each(i, e, [this](const sstring& filename) {
         clogger.debug("Deleting recycled segment file {}", filename);
-        return commit_io_check(&seastar::remove_file, filename);
+        return delete_file(filename);
     }).finally([this, re = std::move(re)] {
         return do_pending_deletes();
     });
@@ -1574,12 +1572,21 @@ future<> db::commitlog::segment_manager::shutdown() {
 }
 
 void db::commitlog::segment_manager::add_file_to_delete(sstring filename, descriptor d) {
-    assert(!_files_to_delete.count(filename));
+    assert(!_files_to_delete.contains(filename));
     _files_to_delete.emplace(std::move(filename), std::move(d));
 }
 
 void db::commitlog::segment_manager::add_file_to_close(file f) {
     _files_to_close.emplace_back(std::move(f));
+}
+
+future<> db::commitlog::segment_manager::delete_file(const sstring& filename) {
+    return seastar::file_size(filename).then([this, filename](uint64_t size) {
+        clogger.debug("Deleting segment file {}", filename);
+        return commit_io_check(&seastar::remove_file, filename).then([this, size] {
+            totals.total_size_on_disk -= size;  
+        });
+    });
 }
 
 future<> db::commitlog::segment_manager::delete_segments(std::vector<sstring> files) {
@@ -1596,10 +1603,8 @@ future<> db::commitlog::segment_manager::delete_segments(std::vector<sstring> fi
         }
         return f.finally([&] {
             // We allow reuse of the segment if the current disk size is less than shard max.
-            // We however don't know the exact size of this file (or the others on the recycle
-            // list, so assume they are max_size large.
-            auto usage = totals.total_size_on_disk + (1 + _recycled_segments.size()) * max_size;
-            if (!_shutdown && cfg.reuse_segments && usage < max_disk_size) {
+            auto usage = totals.total_size_on_disk;
+            if (!_shutdown && cfg.reuse_segments && usage <= max_disk_size) {
                 descriptor d(next_id(), "Recycled-" + cfg.fname_prefix);
                 auto dst = this->filename(d);
 
@@ -1607,15 +1612,14 @@ future<> db::commitlog::segment_manager::delete_segments(std::vector<sstring> fi
                 // must rename the file since we must ensure the
                 // data is not replayed. Changing the name will
                 // cause header ID to be invalid in the file -> ignored
-                return rename_file(filename, dst).then([=] {
+                return rename_file(filename, dst).then([this, dst] {
                     _recycled_segments.emplace_back(dst);
                     return make_ready_future<>();
                 }).handle_exception([this, filename](auto&&) {
-                    return commit_io_check(&seastar::remove_file, filename);
+                    return delete_file(filename);
                 });
             }
-            clogger.debug("Deleting segment file {}", filename);
-            return commit_io_check(&seastar::remove_file, filename);
+            return delete_file(filename);
         }).handle_exception([&filename](auto ep) {
             clogger.error("Could not delete segment {}: {}", filename, ep);
         });
@@ -1674,11 +1678,11 @@ void db::commitlog::segment_manager::on_timer() {
         // IFF a new segment was put in use since last we checked, and we're
         // above threshold, request flush.
         if (_new_counter > 0) {
-            auto max = max_disk_size;
-            auto cur = totals.total_size_on_disk;
+            auto max = disk_usage_threshold;
+            auto cur = totals.active_size_on_disk;
             if (max != 0 && cur >= max) {
                 _new_counter = 0;
-                clogger.debug("Size on disk {} MB exceeds local maximum {} MB", cur / (1024 * 1024), max / (1024 * 1024));
+                clogger.debug("Used size on disk {} MB exceeds local maximum {} MB", cur / (1024 * 1024), max / (1024 * 1024));
                 flush_segments();
             }
         }
@@ -2118,18 +2122,17 @@ db::commitlog::read_log_file(const sstring& filename, const sstring& pfx, seasta
         f = make_checked_file(commit_error_handler, std::move(f));
         descriptor d(filename, pfx);
         auto w = make_lw_shared<work>(std::move(f), d, read_io_prio_class, off);
-        auto ret = w->s.listen(next);
+        auto ret = w->s.listen(next).done();
 
-        //FIXME: discarded future.
-        (void)w->s.started().then(std::bind(&work::read_file, w.get())).then([w] {
+        return w->s.started().then(std::bind(&work::read_file, w.get())).then([w] {
             if (!w->failed) {
                 w->s.close();
             }
         }).handle_exception([w](auto ep) {
             w->s.set_exception(ep);
+        }).finally([ret = std::move(ret)] () mutable {
+            return std::move(ret);
         });
-
-        return ret.done();
     });
 }
 
@@ -2138,7 +2141,7 @@ std::vector<sstring> db::commitlog::get_active_segment_names() const {
 }
 
 uint64_t db::commitlog::get_total_size() const {
-    return _segment_manager->totals.total_size;
+    return _segment_manager->totals.active_size_on_disk + _segment_manager->totals.buffer_list_bytes;
 }
 
 uint64_t db::commitlog::get_completed_tasks() const {

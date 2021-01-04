@@ -18,7 +18,7 @@ namespace audit {
 class audit_syslog_storage_helper : public storage_helper {
     int _syslog_fd;
 public:
-    audit_syslog_storage_helper() {};
+    explicit audit_syslog_storage_helper(cql3::query_processor&) {};
     virtual ~audit_syslog_storage_helper();
     virtual future<> start(const db::config& cfg) override;
     virtual future<> stop() override;

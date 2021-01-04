@@ -57,6 +57,7 @@ struct test_config {
     bool query_single_key;
     unsigned duration_in_seconds;
     bool counters;
+    bool flush_memtables;
     unsigned operations_per_shard = 0;
 };
 
@@ -86,6 +87,11 @@ static void create_partitions(cql_test_env& env, test_config& cfg) {
         } else {
             execute_update_for_key(env, make_key(sequence));
         }
+    }
+
+    if (cfg.flush_memtables) {
+        std::cout << "Flushing partitions..." << std::endl;
+        env.db().invoke_on_all(&database::flush_all_memtables).get();
     }
 }
 
@@ -220,7 +226,8 @@ void write_json_result(std::string result_file, const test_config& cfg, double m
     // It'd be nice to have std::chrono::format(), wouldn't it?
     auto current_time = std::time(nullptr);
     char time_str[100];
-    std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", std::localtime(&current_time));
+    ::tm time_buf;
+    std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", ::localtime_r(&current_time, &time_buf));
     version["run_date_time"] = time_str;
 
     results["versions"]["scylla-server"] = std::move(version);
@@ -242,6 +249,7 @@ int main(int argc, char** argv) {
         ("concurrency", bpo::value<unsigned>()->default_value(100), "workers per core")
         ("operations-per-shard", bpo::value<unsigned>(), "run this many operations per shard (overrides duration)")
         ("counters", "test counters")
+        ("flush", "flush memtables before test")
         ("json-result", bpo::value<std::string>(), "name of the json result file")
         ;
 
@@ -251,25 +259,25 @@ int main(int argc, char** argv) {
         auto conf_seed = app.configuration()["random-seed"];
         auto seed = conf_seed.empty() ? std::random_device()() : conf_seed.as<unsigned>();
         std::cout << "random-seed=" << seed << '\n';
-        smp::invoke_on_all([seed] {
+        return smp::invoke_on_all([seed] {
             seastar::testing::local_random_engine.seed(seed + this_shard_id());
-        }).get();
-
-        return do_with_cql_env_thread([&app] (auto&& env) {
+        }).then([&app] {
+          return do_with_cql_env_thread([&app] (auto&& env) {
             auto cfg = test_config();
             cfg.partitions = app.configuration()["partitions"].as<unsigned>();
             cfg.duration_in_seconds = app.configuration()["duration"].as<unsigned>();
             cfg.concurrency = app.configuration()["concurrency"].as<unsigned>();
-            cfg.query_single_key = app.configuration().count("query-single-key");
-            cfg.counters = app.configuration().count("counters");
-            if (app.configuration().count("write")) {
+            cfg.query_single_key = app.configuration().contains("query-single-key");
+            cfg.counters = app.configuration().contains("counters");
+            cfg.flush_memtables = app.configuration().contains("flush");
+            if (app.configuration().contains("write")) {
                 cfg.mode = test_config::run_mode::write;
-            } else if (app.configuration().count("delete")) {
+            } else if (app.configuration().contains("delete")) {
                 cfg.mode = test_config::run_mode::del;
             } else {
                 cfg.mode = test_config::run_mode::read;
             };
-            if (app.configuration().count("operations-per-shard")) {
+            if (app.configuration().contains("operations-per-shard")) {
                 cfg.operations_per_shard = app.configuration()["operations-per-shard"].as<unsigned>();
             }
             auto results = do_test(env, cfg);
@@ -285,9 +293,10 @@ int main(int argc, char** argv) {
             auto mad = results[results.size() / 2];
             std::cout << format("\nmedian {:.2f}\nmedian absolute deviation: {:.2f}\nmaximum: {:.2f}\nminimum: {:.2f}\n", median, mad, max, min);
 
-            if (app.configuration().count("json-result")) {
+            if (app.configuration().contains("json-result")) {
                 write_json_result(app.configuration()["json-result"].as<std::string>(), cfg, median, mad, max, min);
             }
           });
+        });
     });
 }

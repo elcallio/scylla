@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -37,15 +26,19 @@ namespace service { class storage_service; }
 
 namespace gms {
 
+class feature_service;
+
 struct feature_config {
-    bool enable_sstables_mc_format = false;
-    bool enable_user_defined_functions = false;
-    bool enable_cdc = false;
-    std::set<sstring> disabled_features;
+private:
+    std::set<sstring> _disabled_features;
+    std::set<sstring> _masked_features;
     feature_config();
+
+    friend class feature_service;
+    friend feature_config feature_config_from_db_config(db::config& cfg, std::set<sstring> disabled);
 };
 
-feature_config feature_config_from_db_config(db::config& cfg);
+feature_config feature_config_from_db_config(db::config& cfg, std::set<sstring> disabled = {});
 
 /**
  * A gossip feature tracks whether all the nodes the current one is
@@ -64,26 +57,16 @@ public:
     future<> stop();
     // Has to run inside seastar::async context
     void enable(const sstring& name);
+    void support(const std::string_view& name);
     void enable(const std::set<std::string_view>& list);
     db::schema_features cluster_schema_features() const;
     std::set<std::string_view> known_feature_set();
+    std::set<std::string_view> supported_feature_set();
 
 private:
-    gms::feature _range_tombstones_feature;
-    gms::feature _large_partitions_feature;
-    gms::feature _materialized_views_feature;
-    gms::feature _counters_feature;
-    gms::feature _indexes_feature;
-    gms::feature _digest_multipartition_read_feature;
-    gms::feature _correct_counter_order_feature;
-    gms::feature _schema_tables_v3;
-    gms::feature _correct_non_compound_range_tombstones;
-    gms::feature _write_failure_reply_feature;
-    gms::feature _xxhash_feature;
     gms::feature _udf_feature;
-    gms::feature _roles_feature;
-    gms::feature _stream_with_rpc_stream_feature;
     gms::feature _mc_sstable_feature;
+    gms::feature _md_sstable_feature;
     gms::feature _row_level_repair_feature;
     gms::feature _truncation_table;
     gms::feature _correct_static_compact_in_mc;
@@ -96,67 +79,24 @@ private:
     gms::feature _hinted_handoff_separate_connection;
     gms::feature _lwt_feature;
     gms::feature _per_table_partitioners_feature;
+    gms::feature _per_table_caching_feature;
+    gms::feature _digest_for_null_values_feature;
+    gms::feature _correct_idx_token_in_secondary_index_feature;
+    gms::feature _alternator_streams_feature;
     gms::feature _in_memory_tables;
+    gms::feature _workload_prioritization;
 
 public:
-    const gms::feature& cluster_supports_range_tombstones() const {
-        return _range_tombstones_feature;
-    }
-
-    bool cluster_supports_large_partitions() const {
-        return bool(_large_partitions_feature);
-    }
-
-    bool cluster_supports_materialized_views() const {
-        return bool(_materialized_views_feature);
-    }
-
-    bool cluster_supports_counters() const {
-        return bool(_counters_feature);
-    }
-
-    bool cluster_supports_indexes() const {
-        return bool(_indexes_feature);
-    }
-
-    bool cluster_supports_digest_multipartition_reads() const {
-        return bool(_digest_multipartition_read_feature);
-    }
-
-    bool cluster_supports_correct_counter_order() const {
-        return bool(_correct_counter_order_feature);
-    }
-
-    const gms::feature& cluster_supports_schema_tables_v3() const {
-        return _schema_tables_v3;
-    }
-
-    bool cluster_supports_reading_correctly_serialized_range_tombstones() const {
-        return bool(_correct_non_compound_range_tombstones);
-    }
-
-    bool cluster_supports_write_failure_reply() const {
-        return bool(_write_failure_reply_feature);
-    }
-
-    const gms::feature& cluster_supports_xxhash_digest_algorithm() const {
-        return _xxhash_feature;
-    }
-
     bool cluster_supports_user_defined_functions() const {
         return bool(_udf_feature);
     }
 
-    bool cluster_supports_roles() const {
-        return bool(_roles_feature);
-    }
-
-    bool cluster_supports_stream_with_rpc_stream() const {
-        return bool(_stream_with_rpc_stream_feature);
-    }
-
     const feature& cluster_supports_mc_sstable() const {
         return _mc_sstable_feature;
+    }
+
+    const feature& cluster_supports_md_sstable() const {
+        return _md_sstable_feature;
     }
 
     const feature& cluster_supports_cdc() const {
@@ -165,6 +105,14 @@ public:
 
     const feature& cluster_supports_per_table_partitioners() const {
         return _per_table_partitioners_feature;
+    }
+
+    const feature& cluster_supports_per_table_caching() const {
+        return _per_table_caching_feature;
+    }
+
+    const feature& cluster_supports_digest_for_null_values() const {
+        return _digest_for_null_values_feature;
     }
 
     bool cluster_supports_row_level_repair() const {
@@ -206,8 +154,20 @@ public:
         return bool(_lwt_feature);
     }
 
+    bool cluster_supports_correct_idx_token_in_secondary_index() const {
+        return bool(_correct_idx_token_in_secondary_index_feature);
+    }
+
+    bool cluster_supports_alternator_streams() const {
+        return bool(_alternator_streams_feature);
+    }
+
     const gms::feature& cluster_supports_in_memory_tables() const {
         return _in_memory_tables;
+    }
+
+    const gms::feature& cluster_supports_workload_prioritization() const {
+        return _workload_prioritization;
     }
 };
 

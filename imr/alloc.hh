@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -64,15 +53,13 @@ public:
     }
 };
 
-GCC6_CONCEPT(
 template<typename T>
-concept bool ContextFactory = requires(const T factory, const uint8_t* ptr) {
+concept ContextFactory = requires(const T factory, const uint8_t* ptr) {
     { factory.create(ptr) } noexcept;
 };
 
 static_assert(ContextFactory<no_context_factory_t>,
               "no_context_factory_t has to meet ContextFactory constraints");
-)
 
 /// LSA migrator for IMR objects
 ///
@@ -81,7 +68,7 @@ static_assert(ContextFactory<no_context_factory_t>,
 /// of type `Structure`. The deserialisation context needed to invoke the mover
 /// is going to be created by the provided context factory `CtxFactory`.
 template<typename Structure, typename CtxFactory>
-GCC6_CONCEPT(requires ContextFactory<CtxFactory>)
+requires ContextFactory<CtxFactory>
 class lsa_migrate_fn final : public migrate_fn_type, CtxFactory {
 public:
     using structure = Structure;

@@ -5,22 +5,12 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
 
+#include <concepts>
 #include "imr/alloc.hh"
 #include "imr/compound.hh"
 #include "imr/fundamental.hh"
@@ -59,11 +49,9 @@ using default_sizer_t = decltype(Structure::get_sizer());
 template<typename Structure>
 using default_serializer_t = decltype(Structure::get_serializer(nullptr));
 
-GCC6_CONCEPT(
-
 /// A simple writer that accepts only sizer or serializer as an argument.
 template<typename Writer, typename Structure>
-concept bool WriterSimple = requires(Writer writer, default_sizer_t<Structure> sizer,
+concept WriterSimple = requires(Writer writer, default_sizer_t<Structure> sizer,
                                      default_serializer_t<Structure> serializer)
 {
     writer(sizer);
@@ -72,7 +60,7 @@ concept bool WriterSimple = requires(Writer writer, default_sizer_t<Structure> s
 
 /// A writer that accepts both sizer or serializer and a memory allocator.
 template<typename Writer, typename Structure>
-concept bool WriterAllocator = requires(Writer writer, default_sizer_t<Structure> sizer,
+concept WriterAllocator = requires(Writer writer, default_sizer_t<Structure> sizer,
                                         default_serializer_t<Structure> serializer,
                                         imr::alloc::object_allocator::sizer alloc_sizer,
                                         imr::alloc::object_allocator::serializer alloc_serializer)
@@ -80,7 +68,5 @@ concept bool WriterAllocator = requires(Writer writer, default_sizer_t<Structure
     writer(sizer, alloc_sizer);
     writer(serializer, alloc_serializer);
 };
-
-)
 
 }

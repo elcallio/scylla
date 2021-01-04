@@ -45,7 +45,7 @@ namespace selection {
 
 selection::selection(schema_ptr schema,
     std::vector<const column_definition*> columns,
-    std::vector<::shared_ptr<column_specification>> metadata_,
+    std::vector<lw_shared_ptr<column_specification>> metadata_,
     bool collect_timestamps,
     bool collect_TTLs,
     trivial is_trivial)
@@ -81,7 +81,7 @@ private:
     const bool _is_wildcard;
 public:
     static ::shared_ptr<simple_selection> make(schema_ptr schema, std::vector<const column_definition*> columns, bool is_wildcard) {
-        std::vector<::shared_ptr<column_specification>> metadata;
+        std::vector<lw_shared_ptr<column_specification>> metadata;
         metadata.reserve(columns.size());
         for (auto&& col : columns) {
             metadata.emplace_back(col->column_specification);
@@ -95,7 +95,7 @@ public:
      * get much duplicate in practice, it's more efficient not to bother.
      */
     simple_selection(schema_ptr schema, std::vector<const column_definition*> columns,
-        std::vector<::shared_ptr<column_specification>> metadata, bool is_wildcard)
+        std::vector<lw_shared_ptr<column_specification>> metadata, bool is_wildcard)
             : selection(schema, std::move(columns), std::move(metadata), false, false, trivial::yes)
             , _is_wildcard(is_wildcard)
     { }
@@ -144,16 +144,12 @@ private:
     ::shared_ptr<selector_factories> _factories;
 public:
     selection_with_processing(schema_ptr schema, std::vector<const column_definition*> columns,
-            std::vector<::shared_ptr<column_specification>> metadata, ::shared_ptr<selector_factories> factories)
+            std::vector<lw_shared_ptr<column_specification>> metadata, ::shared_ptr<selector_factories> factories)
         : selection(schema, std::move(columns), std::move(metadata),
             factories->contains_write_time_selector_factory(),
             factories->contains_ttl_selector_factory())
         , _factories(std::move(factories))
     { }
-
-    virtual bool uses_function(const sstring& ks_name, const sstring& function_name) const override {
-        return _factories->uses_function(ks_name, function_name);
-    }
 
     virtual uint32_t add_column_for_post_processing(const column_definition& c) override {
         uint32_t index = selection::add_column_for_post_processing(c);
@@ -253,14 +249,14 @@ uint32_t selection::add_column_for_post_processing(const column_definition& c) {
     }
 }
 
-std::vector<::shared_ptr<column_specification>>
+std::vector<lw_shared_ptr<column_specification>>
 selection::collect_metadata(const schema& schema, const std::vector<::shared_ptr<raw_selector>>& raw_selectors,
         const selector_factories& factories) {
-    std::vector<::shared_ptr<column_specification>> r;
+    std::vector<lw_shared_ptr<column_specification>> r;
     r.reserve(raw_selectors.size());
     auto i = raw_selectors.begin();
     for (auto&& factory : factories) {
-        ::shared_ptr<column_specification> col_spec = factory->get_column_specification(schema);
+        lw_shared_ptr<column_specification> col_spec = factory->get_column_specification(schema);
         ::shared_ptr<column_identifier> alias = (*i++)->alias;
         r.push_back(alias ? col_spec->with_alias(alias) : col_spec);
     }
@@ -377,11 +373,11 @@ std::unique_ptr<result_set> result_set_builder::build() {
 
 result_set_builder::restrictions_filter::restrictions_filter(::shared_ptr<restrictions::statement_restrictions> restrictions,
         const query_options& options,
-        uint32_t remaining,
+        uint64_t remaining,
         schema_ptr schema,
-        uint32_t per_partition_limit,
+        uint64_t per_partition_limit,
         std::optional<partition_key> last_pkey,
-        uint32_t rows_fetched_for_last_partition)
+        uint64_t rows_fetched_for_last_partition)
     : _restrictions(restrictions)
     , _options(options)
     , _skip_pk_restrictions(!_restrictions->pk_restrictions_need_filtering())
@@ -406,10 +402,11 @@ bool result_set_builder::restrictions_filter::do_filter(const selection& selecti
     }
 
     auto clustering_columns_restrictions = _restrictions->get_clustering_columns_restrictions();
-    if (clustering_columns_restrictions->is_multi_column()) {
-        auto multi_column_restriction = dynamic_pointer_cast<cql3::restrictions::multi_column_restriction>(clustering_columns_restrictions);
+    if (dynamic_pointer_cast<cql3::restrictions::multi_column_restriction>(clustering_columns_restrictions)) {
         clustering_key_prefix ckey = clustering_key_prefix::from_exploded(clustering_key);
-        return multi_column_restriction->is_satisfied_by(*_schema, ckey, _options);
+        return expr::is_satisfied_by(
+                clustering_columns_restrictions->expression,
+                partition_key, clustering_key, static_row, row, selection, _options);
     }
 
     auto static_row_iterator = static_row.iterator();
@@ -423,29 +420,13 @@ bool result_set_builder::restrictions_filter::do_filter(const selection& selecti
             if (cdef->kind == column_kind::regular_column && !row_iterator) {
                 continue;
             }
-            auto& cell_iterator = (cdef->kind == column_kind::static_column) ? static_row_iterator : *row_iterator;
-            std::optional<query::result_bytes_view> result_view_opt;
-            if (cdef->type->is_multi_cell()) {
-                result_view_opt = cell_iterator.next_collection_cell();
-            } else {
-                auto cell = cell_iterator.next_atomic_cell();
-                if (cell) {
-                    result_view_opt = cell->value();
-                }
-            }
             auto restr_it = non_pk_restrictions_map.find(cdef);
             if (restr_it == non_pk_restrictions_map.end()) {
                 continue;
             }
             restrictions::single_column_restriction& restriction = *restr_it->second;
-            bool regular_restriction_matches;
-            if (result_view_opt) {
-                regular_restriction_matches = result_view_opt->with_linearized([&restriction, this](bytes_view data) {
-                    return restriction.is_satisfied_by(data, _options);
-                });
-            } else {
-                regular_restriction_matches = restriction.is_satisfied_by(bytes(), _options);
-            }
+            bool regular_restriction_matches = expr::is_satisfied_by(
+                    restriction.expression, partition_key, clustering_key, static_row, row, selection, _options);
             if (!regular_restriction_matches) {
                 _current_static_row_does_not_match = (cdef->kind == column_kind::static_column);
                 return false;
@@ -462,9 +443,8 @@ bool result_set_builder::restrictions_filter::do_filter(const selection& selecti
                 continue;
             }
             restrictions::single_column_restriction& restriction = *restr_it->second;
-            const bytes& value_to_check = partition_key[cdef->id];
-            bool pk_restriction_matches = restriction.is_satisfied_by(value_to_check, _options);
-            if (!pk_restriction_matches) {
+            if (!expr::is_satisfied_by(
+                        restriction.expression, partition_key, clustering_key, static_row, row, selection, _options)) {
                 _current_partition_key_does_not_match = true;
                 return false;
             }
@@ -483,9 +463,8 @@ bool result_set_builder::restrictions_filter::do_filter(const selection& selecti
                 return false;
             }
             restrictions::single_column_restriction& restriction = *restr_it->second;
-            const bytes& value_to_check = clustering_key[cdef->id];
-            bool pk_restriction_matches = restriction.is_satisfied_by(value_to_check, _options);
-            if (!pk_restriction_matches) {
+            if (!expr::is_satisfied_by(
+                        restriction.expression, partition_key, clustering_key, static_row, row, selection, _options)) {
                 return false;
             }
             }
@@ -521,7 +500,7 @@ void result_set_builder::restrictions_filter::reset(const partition_key* key) {
     _current_static_row_does_not_match = false;
     _rows_dropped = 0;
     _per_partition_remaining = _per_partition_limit;
-    if (_is_first_partition_on_page && _per_partition_limit < std::numeric_limits<typeof(_per_partition_limit)>::max()) {
+    if (_is_first_partition_on_page && _per_partition_limit < std::numeric_limits<decltype(_per_partition_limit)>::max()) {
         // If any rows related to this key were also present in the previous query,
         // we need to take it into account as well.
         if (key && _last_pkey && _last_pkey->equal(*_schema, *key)) {

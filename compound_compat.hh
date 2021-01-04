@@ -50,7 +50,14 @@ public:
         , _packed(packed)
     { }
 
-    class iterator : public std::iterator<std::input_iterator_tag, bytes::value_type> {
+    class iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = bytes::value_type;
+        using difference_type = std::ptrdiff_t;
+        using pointer = bytes::value_type*;
+        using reference = bytes::value_type&;
+    private:
         bool _singular;
         // Offset within virtual output space of a component.
         //
@@ -137,8 +144,8 @@ public:
                 _type.begin(k1), _type.end(k1),
                 _type.begin(k2), _type.end(k2),
                 [] (const bytes_view& c1, const bytes_view& c2) -> int {
-                    if (c1.size() != c2.size()) {
-                        return c1.size() < c2.size() ? -1 : 1;
+                    if (c1.size() != c2.size() || !c1.size()) {
+                        return c1.size() < c2.size() ? -1 : c1.size() ? 1 : 0;
                     }
                     return memcmp(c1.begin(), c2.begin(), c1.size());
                 });
@@ -201,6 +208,8 @@ public:
             : _bytes(std::move(b))
             , _is_compound(true)
     { }
+
+    explicit composite(const composite_view& v);
 
     composite()
             : _bytes()
@@ -326,7 +335,14 @@ public:
         return eoc_byte == 0 ? eoc::none : (eoc_byte < 0 ? eoc::start : eoc::end);
     }
 
-    class iterator : public std::iterator<std::input_iterator_tag, const component_view> {
+    class iterator {
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = const component_view;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const component_view*;
+        using reference = const component_view&;
+    private:
         bytes_view _v;
         component_view _current;
         bool _strict_mode = true;
@@ -350,10 +366,9 @@ public:
         void read_current() {
             try {
                 do_read_current();
-            } catch (marshal_exception& e) {
+            } catch (marshal_exception&) {
                 if (_strict_mode) {
-                    //FIXME: `on_internal_error()` variant that takes `std::exception_ptr`.
-                    on_internal_error(compound_logger, e.what());
+                    on_internal_error(compound_logger, std::current_exception());
                 } else {
                     throw;
                 }
@@ -379,6 +394,7 @@ public:
         iterator(end_iterator_tag) : _v(nullptr, 0) {}
 
     public:
+        iterator() : iterator(end_iterator_tag()) {}
         iterator& operator++() {
             read_current();
             return *this;
@@ -493,6 +509,7 @@ public:
 };
 
 class composite_view final {
+    friend class composite;
     bytes_view _bytes;
     bool _is_compound;
 public:
@@ -591,6 +608,11 @@ public:
         return os << "{" << ::join(", ", v.components()) << ", compound=" << v._is_compound << ", static=" << v.is_static() << "}";
     }
 };
+
+inline
+composite::composite(const composite_view& v)
+    : composite(bytes(v._bytes), v._is_compound)
+{ }
 
 inline
 std::ostream& operator<<(std::ostream& os, const composite& v) {

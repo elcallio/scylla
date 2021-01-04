@@ -31,7 +31,6 @@
 
 #include <tuple>
 #include <seastar/core/gate.hh>
-#include <seastar/core/apply.hh>
 #include <seastar/core/metrics_registration.hh>
 #include "tracing/tracing.hh"
 #include "table_helper.hh"
@@ -56,6 +55,7 @@ private:
     int64_t _slow_query_last_nanos = 0;
     service::query_state _dummy_query_state;
 
+    cql3::query_processor* _qp_anchor;
     table_helper _sessions;
     table_helper _sessions_time_idx;
     table_helper _events;
@@ -78,10 +78,10 @@ public:
     //
     // TODO: Create a stub_tracing_session object to discard the traces
     // requested during the initialization phase.
-    virtual future<> start() override;
+    virtual future<> start(cql3::query_processor& qp) override;
 
     virtual future<> stop() override {
-        return _pending_writes.close();
+        return _pending_writes.close().then([this] { _qp_anchor = nullptr; });
     };
 
     virtual void write_records_bulk(records_bulk& bulk) override;
@@ -121,7 +121,7 @@ private:
      * @note A caller must ensure that @param events_records is alive till the
      * returned future resolves.
      */
-    future<> apply_events_mutation(lw_shared_ptr<one_session_records> records, std::deque<event_record>& events_records);
+    future<> apply_events_mutation(cql3::query_processor& qp, lw_shared_ptr<one_session_records> records, std::deque<event_record>& events_records);
 
     /**
      * Create a mutation data for a new session record

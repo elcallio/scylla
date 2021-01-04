@@ -16,6 +16,8 @@
 
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/result_set_assertions.hh"
+#include "test/lib/reader_permit.hh"
+#include "test/lib/log.hh"
 
 #include "database.hh"
 #include "partition_slice_builder.hh"
@@ -28,6 +30,7 @@
 #include "db/commitlog/commitlog_replayer.hh"
 #include "test/lib/tmpdir.hh"
 #include "db/data_listeners.hh"
+#include "multishard_mutation_query.hh"
 
 using namespace std::chrono_literals;
 
@@ -45,13 +48,13 @@ SEASTAR_TEST_CASE(test_safety_after_truncate) {
             mutation m(s, pkey);
             m.set_clustered_cell(clustering_key_prefix::make_empty(), "v", int32_t(42), {});
             pranges.emplace_back(dht::partition_range::make_singular(dht::decorate_key(*s, std::move(pkey))));
-            db.apply(s, freeze(m), db::commitlog::force_sync::no, db::no_timeout).get();
+            db.apply(s, freeze(m), tracing::trace_state_ptr(), db::commitlog::force_sync::no, db::no_timeout).get();
         }
 
         auto assert_query_result = [&] (size_t expected_size) {
             auto max_size = std::numeric_limits<size_t>::max();
-            auto cmd = query::read_command(s->id(), s->version(), partition_slice_builder(*s).build(), 1000);
-            auto result = db.query(s, cmd, query::result_options::only_result(), pranges, nullptr, max_size, db::no_timeout).get0();
+            auto cmd = query::read_command(s->id(), s->version(), partition_slice_builder(*s).build(), query::max_result_size(max_size), query::row_limit(1000));
+            auto&& [result, cache_tempature] = db.query(s, cmd, query::result_options::only_result(), pranges, nullptr, db::no_timeout).get0();
             assert_that(query::result_set::from_raw_result(s, cmd.slice, *result)).has_size(expected_size);
         };
         assert_query_result(1000);
@@ -81,34 +84,34 @@ SEASTAR_TEST_CASE(test_querying_with_limits) {
                 auto pkey = partition_key::from_single_value(*s, to_bytes(format("key{:d}", i)));
                 mutation m(s, pkey);
                 m.partition().apply(tombstone(api::timestamp_type(1), gc_clock::now()));
-                db.apply(s, freeze(m), db::commitlog::force_sync::no, db::no_timeout).get();
+                db.apply(s, freeze(m), tracing::trace_state_ptr(), db::commitlog::force_sync::no, db::no_timeout).get();
             }
             for (uint32_t i = 3; i <= 8; ++i) {
                 auto pkey = partition_key::from_single_value(*s, to_bytes(format("key{:d}", i)));
                 mutation m(s, pkey);
                 m.set_clustered_cell(clustering_key_prefix::make_empty(), "v", int32_t(42), 1);
-                db.apply(s, freeze(m), db::commitlog::force_sync::no, db::no_timeout).get();
+                db.apply(s, freeze(m), tracing::trace_state_ptr(), db::commitlog::force_sync::no, db::no_timeout).get();
                 pranges.emplace_back(dht::partition_range::make_singular(dht::decorate_key(*s, std::move(pkey))));
             }
 
             auto max_size = std::numeric_limits<size_t>::max();
             {
-                auto cmd = query::read_command(s->id(), s->version(), partition_slice_builder(*s).build(), 3);
-                auto result = db.query(s, cmd, query::result_options::only_result(), pranges, nullptr, max_size, db::no_timeout).get0();
+                auto cmd = query::read_command(s->id(), s->version(), partition_slice_builder(*s).build(), query::max_result_size(max_size), query::row_limit(3));
+                auto result = std::get<0>(db.query(s, cmd, query::result_options::only_result(), pranges, nullptr, db::no_timeout).get0());
                 assert_that(query::result_set::from_raw_result(s, cmd.slice, *result)).has_size(3);
             }
 
             {
-                auto cmd = query::read_command(s->id(), s->version(), partition_slice_builder(*s).build(),
-                        query::max_rows, gc_clock::now(), std::nullopt, 5);
-                auto result = db.query(s, cmd, query::result_options::only_result(), pranges, nullptr, max_size, db::no_timeout).get0();
+                auto cmd = query::read_command(s->id(), s->version(), partition_slice_builder(*s).build(), query::max_result_size(max_size),
+                        query::row_limit(query::max_rows), query::partition_limit(5));
+                auto result = std::get<0>(db.query(s, cmd, query::result_options::only_result(), pranges, nullptr, db::no_timeout).get0());
                 assert_that(query::result_set::from_raw_result(s, cmd.slice, *result)).has_size(5);
             }
 
             {
-                auto cmd = query::read_command(s->id(), s->version(), partition_slice_builder(*s).build(),
-                        query::max_rows, gc_clock::now(), std::nullopt, 3);
-                auto result = db.query(s, cmd, query::result_options::only_result(), pranges, nullptr, max_size, db::no_timeout).get0();
+                auto cmd = query::read_command(s->id(), s->version(), partition_slice_builder(*s).build(), query::max_result_size(max_size),
+                        query::row_limit(query::max_rows), query::partition_limit(3));
+                auto result = std::get<0>(db.query(s, cmd, query::result_options::only_result(), pranges, nullptr, db::no_timeout).get0());
                 assert_that(query::result_set::from_raw_result(s, cmd.slice, *result)).has_size(3);
             }
         });
@@ -116,21 +119,21 @@ SEASTAR_TEST_CASE(test_querying_with_limits) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source) {
-    do_with_cql_env([] (cql_test_env& e) {
+    do_with_cql_env_thread([] (cql_test_env& e) {
         run_mutation_source_tests([&] (schema_ptr s, const std::vector<mutation>& partitions) -> mutation_source {
             try {
                 e.local_db().find_column_family(s->ks_name(), s->cf_name());
-                service::get_local_migration_manager().announce_column_family_drop(s->ks_name(), s->cf_name(), true).get();
+                service::get_local_migration_manager().announce_column_family_drop(s->ks_name(), s->cf_name()).get();
             } catch (const no_such_column_family&) {
                 // expected
             }
-            service::get_local_migration_manager().announce_new_column_family(s, true).get();
+            service::get_local_migration_manager().announce_new_column_family(s).get();
             column_family& cf = e.local_db().find_column_family(s);
             for (auto&& m : partitions) {
-                e.local_db().apply(cf.schema(), freeze(m), db::commitlog::force_sync::no, db::no_timeout).get();
+                e.local_db().apply(cf.schema(), freeze(m), tracing::trace_state_ptr(), db::commitlog::force_sync::no, db::no_timeout).get();
             }
             cf.flush().get();
-            cf.get_row_cache().invalidate([] {}).get();
+            cf.get_row_cache().invalidate(row_cache::external_updater([] {})).get();
             return mutation_source([&] (schema_ptr s,
                     reader_permit,
                     const dht::partition_range& range,
@@ -139,10 +142,9 @@ SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_sourc
                     tracing::trace_state_ptr trace_state,
                     streamed_mutation::forwarding fwd,
                     mutation_reader::forwarding fwd_mr) {
-                return cf.make_reader(s, range, slice, pc, std::move(trace_state), fwd, fwd_mr);
+                return cf.make_reader(s, tests::make_permit(), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
             });
         });
-        return make_ready_future<>();
     }).get();
 }
 
@@ -157,7 +159,7 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_incomplete_sstables) {
 
     // Create incomplete sstables in test data directory
     sstring ks = "system";
-    sstring cf = "local-7ad54392bcdd35a684174e047860b377";
+    sstring cf = "peers-37f71aca7dc2383ba70672528af04d4f";
     sstring sst_dir = (data_dir.path() / std::string_view(ks) / std::string_view(cf)).string();
 
     auto require_exist = [] (const sstring& name, bool should_exist) {
@@ -189,14 +191,12 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_incomplete_sstables) {
     temp_file_name = sst::filename(sst_dir, ks, cf, sst::version_types::mc, 4, sst::format_types::big, component_type::Data);
     touch_file(temp_file_name);
 
-    do_with_cql_env([&sst_dir, &ks, &cf, &require_exist] (cql_test_env& e) {
+    do_with_cql_env_thread([&sst_dir, &ks, &cf, &require_exist] (cql_test_env& e) {
         require_exist(sst::temp_sst_dir(sst_dir, 2), false);
         require_exist(sst::temp_sst_dir(sst_dir, 3), false);
 
         require_exist(sst::filename(sst_dir, ks, cf, sst::version_types::mc, 4, sst::format_types::big, component_type::TemporaryTOC), false);
         require_exist(sst::filename(sst_dir, ks, cf, sst::version_types::mc, 4, sst::format_types::big, component_type::Data), false);
-
-        return make_ready_future<>();
     }, db_cfg_ptr).get();
 }
 
@@ -211,7 +211,7 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_pending_delete) {
 
     // Create incomplete sstables in test data directory
     sstring ks = "system";
-    sstring cf = "local-7ad54392bcdd35a684174e047860b377";
+    sstring cf = "peers-37f71aca7dc2383ba70672528af04d4f";
     sstring sst_dir = (data_dir.path() / std::string_view(ks) / std::string_view(cf)).string();
     sstring pending_delete_dir = sst_dir + "/" + sst::pending_delete_dir_basename();
 
@@ -237,7 +237,7 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_pending_delete) {
 
     auto write_file = [&require_exist] (const sstring& file_name, const sstring& text) {
         auto f = open_file_dma(file_name, open_flags::wo | open_flags::create | open_flags::truncate).get0();
-        auto os = make_file_output_stream(f, file_output_stream_options{});
+        auto os = make_file_output_stream(f, file_output_stream_options{}).get0();
         os.write(text).get();
         os.flush().get();
         os.close().get();
@@ -290,7 +290,7 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_pending_delete) {
                component_basename(7, component_type::TOC) + "\n" +
                component_basename(8, component_type::TOC) + "\n");
 
-    do_with_cql_env([&] (cql_test_env& e) {
+    do_with_cql_env_thread([&] (cql_test_env& e) {
         // Empty log file
         require_exist(pending_delete_dir + "/sstables-0-0.log", false);
 
@@ -317,16 +317,15 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_pending_delete) {
         require_exist(gen_filename(6, component_type::Data), false);
         require_exist(gen_filename(7, component_type::TemporaryTOC), false);
         require_exist(pending_delete_dir + "/sstables-6-8.log", false);
-
-        return make_ready_future<>();
     }, db_cfg_ptr).get();
 }
 
 // Snapshot tests and their helpers
 future<> do_with_some_data(std::function<future<> (cql_test_env& env)> func) {
     return seastar::async([func = std::move(func)] () mutable {
+        tmpdir tmpdir_for_data;
         auto db_cfg_ptr = make_shared<db::config>();
-        db_cfg_ptr->data_file_directories(std::vector<sstring>({ tmpdir().path().string() }));
+        db_cfg_ptr->data_file_directories(std::vector<sstring>({ tmpdir_for_data.path().string() }));
         do_with_cql_env_thread([func = std::move(func)] (cql_test_env& e) {
             e.create_table([](std::string_view ks_name) {
                 return schema({}, ks_name, "cf",
@@ -348,7 +347,7 @@ future<> do_with_some_data(std::function<future<> (cql_test_env& env)> func) {
 future<> take_snapshot(cql_test_env& e) {
     return e.db().invoke_on_all([] (database& db) {
         auto& cf = db.find_column_family("ks", "cf");
-        return cf.snapshot("test");
+        return cf.snapshot(db, "test");
     });
 }
 
@@ -458,4 +457,85 @@ SEASTAR_TEST_CASE(toppartitions_cross_shard_schema_ptr) {
         // This should trigger the bug in debug mode
         tq.gather().get();
     });
+}
+
+SEASTAR_THREAD_TEST_CASE(read_max_size) {
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("CREATE TABLE test (pk text, ck int, v text, PRIMARY KEY (pk, ck));").get();
+        auto id = e.prepare("INSERT INTO test (pk, ck, v) VALUES (?, ?, ?);").get0();
+
+        auto& db = e.local_db();
+        auto& tab = db.find_column_family("ks", "test");
+        auto s = tab.schema();
+
+        auto pk = make_local_key(s);
+        const auto raw_pk = utf8_type->decompose(data_value(pk));
+        const auto cql3_pk = cql3::raw_value::make_value(raw_pk);
+
+        const auto value = sstring(1024, 'a');
+        const auto raw_value = utf8_type->decompose(data_value(value));
+        const auto cql3_value = cql3::raw_value::make_value(raw_value);
+
+        const int num_rows = 1024;
+
+        for (int i = 0; i != num_rows; ++i) {
+            const auto cql3_ck = cql3::raw_value::make_value(int32_type->decompose(data_value(i)));
+            e.execute_prepared(id, {cql3_pk, cql3_ck, cql3_value}).get();
+        }
+
+        const auto partition_ranges = std::vector<dht::partition_range>{query::full_partition_range};
+
+        const std::vector<std::pair<sstring, std::function<future<size_t>(schema_ptr, const query::read_command&)>>> query_methods{
+                {"query_mutations()", [&db, &partition_ranges] (schema_ptr s, const query::read_command& cmd) -> future<size_t> {
+                    return db.query_mutations(s, cmd, partition_ranges.front(), {}, db::no_timeout).then(
+                            [] (const std::tuple<reconcilable_result, cache_temperature>& res) {
+                        return std::get<0>(res).memory_usage();
+                    });
+                }},
+                {"query()", [&db, &partition_ranges] (schema_ptr s, const query::read_command& cmd) -> future<size_t> {
+                    return db.query(s, cmd, query::result_options::only_result(), partition_ranges, {}, db::no_timeout).then(
+                            [] (const std::tuple<lw_shared_ptr<query::result>, cache_temperature>& res) {
+                        return size_t(std::get<0>(res)->buf().size());
+                    });
+                }},
+                {"query_mutations_on_all_shards()", [&e, &partition_ranges] (schema_ptr s, const query::read_command& cmd) -> future<size_t> {
+                    return query_mutations_on_all_shards(e.db(), s, cmd, partition_ranges, {}, db::no_timeout).then(
+                            [] (const std::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>& res) {
+                        return std::get<0>(res)->memory_usage();
+                    });
+                }}
+        };
+
+        for (auto [query_method_name, query_method] : query_methods) {
+            for (auto allow_short_read : {true, false}) {
+                for (auto max_size : {1024u, 1024u * 1024u, 1024u * 1024u * 1024u}) {
+                    const auto should_throw = max_size < (num_rows * value.size() * 2) && !allow_short_read;
+                    testlog.info("checking: query_method={}, allow_short_read={}, max_size={}, should_throw={}", query_method_name, allow_short_read, max_size, should_throw);
+                    auto slice = s->full_slice();
+                    if (allow_short_read) {
+                        slice.options.set<query::partition_slice::option::allow_short_read>();
+                    } else {
+                        slice.options.remove<query::partition_slice::option::allow_short_read>();
+                    }
+                    query::read_command cmd(s->id(), s->version(), slice, query::max_result_size(max_size));
+                    try {
+                        auto size = query_method(s, cmd).get0();
+                        // Just to ensure we are not interpreting empty results as success.
+                        BOOST_REQUIRE(size != 0);
+                        if (should_throw) {
+                            BOOST_FAIL("Expected exception, but none was thrown.");
+                        } else {
+                            testlog.trace("No exception thrown, as expected.");
+                        }
+                    } catch (std::runtime_error& e) {
+                        if (should_throw) {
+                            testlog.trace("Exception thrown, as expected: {}", e);
+                        } else {
+                            BOOST_FAIL(fmt::format("Expected no exception, but caught: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+    }).get();
 }

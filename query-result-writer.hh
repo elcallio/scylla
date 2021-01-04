@@ -21,9 +21,9 @@
 #include "idl/query.dist.hh"
 #include "serializer_impl.hh"
 #include "serialization_visitors.hh"
-#include "idl/query.dist.impl.hh"
-#include "idl/keys.dist.impl.hh"
 #include "idl/uuid.dist.impl.hh"
+#include "idl/keys.dist.impl.hh"
+#include "idl/query.dist.impl.hh"
 
 namespace query {
 
@@ -39,7 +39,7 @@ class result::partition_writer {
     ser::vector_position _pos;
     digester& _digest;
     digester _digest_pos;
-    uint32_t& _row_count;
+    uint64_t& _row_count;
     uint32_t& _partition_count;
     api::timestamp_type& _last_modified;
 public:
@@ -51,7 +51,7 @@ public:
         ser::vector_position pos,
         ser::after_qr_partition__key<bytes_ostream> w,
         digester& digest,
-        uint32_t& row_count,
+        uint64_t& row_count,
         uint32_t& partition_count,
         api::timestamp_type& last_modified)
         : _request(request)
@@ -96,7 +96,7 @@ public:
     digester& digest() {
         return _digest;
     }
-    uint32_t& row_count() {
+    uint64_t& row_count() {
         return _row_count;
     }
     uint32_t& partition_count() {
@@ -113,7 +113,7 @@ class result::builder {
     const partition_slice& _slice;
     ser::query_result__partitions<bytes_ostream> _w;
     result_request _request;
-    uint32_t _row_count = 0;
+    uint64_t _row_count = 0;
     uint32_t _partition_count = 0;
     api::timestamp_type _last_modified = api::missing_timestamp;
     short_read _short_read;
@@ -136,7 +136,7 @@ public:
 
     const partition_slice& slice() const { return _slice; }
 
-    uint32_t row_count() const {
+    uint64_t row_count() const {
         return _row_count;
     }
 

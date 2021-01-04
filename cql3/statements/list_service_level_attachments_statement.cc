@@ -4,7 +4,7 @@
  * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
-#include <seastarx.hh>
+#include "seastarx.hh"
 #include "cql3/statements/list_service_level_attachments_statement.hh"
 #include "service/qos/service_level_controller.hh"
 #include "transport/messages/result_message.hh"
@@ -31,7 +31,7 @@ void list_service_level_attachments_statement::validate(service::storage_proxy &
 }
 
 future<> list_service_level_attachments_statement::check_access(service::storage_proxy& sp, const service::client_state &state) const {
-    return state.ensure_has_permission(auth::permission::DESCRIBE, auth::root_service_level_resource());
+    return state.ensure_has_permission(auth::command_desc{.permission = auth::permission::DESCRIBE, .resource = auth::root_service_level_resource()});
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>
@@ -40,14 +40,14 @@ list_service_level_attachments_statement::execute(service::storage_proxy &sp,
         const query_options &) const {
 
     static auto make_column = [] (sstring name, const shared_ptr<const abstract_type> type) {
-        return ::make_shared<column_specification>(
+        return make_lw_shared<column_specification>(
                 "QOS",
                 "service_levels_attachments",
                 ::make_shared<column_identifier>(std::move(name), true),
                 type);
     };
 
-    static thread_local const std::vector<::shared_ptr<column_specification>> metadata({
+    static thread_local const std::vector<lw_shared_ptr<column_specification>> metadata({
         make_column("role", utf8_type), make_column("service_level", utf8_type)
     });
 

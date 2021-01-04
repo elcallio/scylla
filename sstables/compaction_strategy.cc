@@ -36,10 +36,8 @@
 #include "compaction_strategy_impl.hh"
 #include "schema.hh"
 #include "sstable_set.hh"
-#include "compatible_ring_position.hh"
 #include <boost/range/algorithm/find.hpp>
 #include <boost/range/adaptors.hpp>
-#include <boost/icl/interval_map.hpp>
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include "size_tiered_compaction_strategy.hh"
 #include "date_tiered_compaction_strategy.hh"
@@ -48,395 +46,16 @@
 #include "in_memory_compaction_strategy.hh"
 #include "sstables/compaction_backlog_manager.hh"
 #include "sstables/size_tiered_backlog_tracker.hh"
-#include "mutation_source_metadata.hh"
-#include "mutation_writer/timestamp_based_splitting_writer.hh"
 #include "incremental_compaction_strategy.hh"
+#include "sstable_set_impl.hh"
 
 logging::logger date_tiered_manifest::logger = logging::logger("DateTieredCompactionStrategy");
 logging::logger leveled_manifest::logger("LeveledManifest");
 
 namespace sstables {
 
-extern logging::logger clogger;
-
-void sstable_run::insert(shared_sstable sst) {
-    _all.insert(std::move(sst));
-}
-
-void sstable_run::erase(shared_sstable sst) {
-    _all.erase(sst);
-}
-
-uint64_t sstable_run::data_size() const {
-    return boost::accumulate(_all | boost::adaptors::transformed(std::mem_fn(&sstable::data_size)), uint64_t(0));
-}
-
-std::ostream& operator<<(std::ostream& os, const sstables::sstable_run& run) {
-    os << "Run = {\n";
-    if (run.all().empty()) {
-        os << "  Identifier: not found\n";
-    } else {
-        os << format("  Identifier: {}\n", (*run.all().begin())->run_identifier());
-    }
-
-    auto frags = boost::copy_range<std::vector<shared_sstable>>(run.all());
-    boost::sort(frags, [] (const shared_sstable& x, const shared_sstable& y) {
-        return x->get_first_decorated_key().token() < y->get_first_decorated_key().token();
-    });
-    os << "  Fragments = {\n";
-    for (auto& frag : frags) {
-        os << format("    {}={}:{}\n", frag->generation(), frag->get_first_decorated_key().token(), frag->get_last_decorated_key().token());
-    }
-    os << "  }\n}\n";
-    return os;
-}
-
-class incremental_selector_impl {
-public:
-    virtual ~incremental_selector_impl() {}
-    virtual std::tuple<dht::partition_range, std::vector<shared_sstable>, dht::ring_position_view> select(const dht::ring_position_view&) = 0;
-};
-
-class sstable_set_impl {
-public:
-    virtual ~sstable_set_impl() {}
-    virtual std::unique_ptr<sstable_set_impl> clone() const = 0;
-    virtual std::vector<shared_sstable> select(const dht::partition_range& range) const = 0;
-    virtual void insert(shared_sstable sst) = 0;
-    virtual void erase(shared_sstable sst) = 0;
-    virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const = 0;
-};
-
-sstable_set::sstable_set(std::unique_ptr<sstable_set_impl> impl, schema_ptr s, lw_shared_ptr<sstable_list> all)
-        : _impl(std::move(impl))
-        , _schema(std::move(s))
-        , _all(std::move(all)) {
-}
-
-sstable_set::sstable_set(const sstable_set& x)
-        : _impl(x._impl->clone())
-        , _schema(x._schema)
-        , _all(make_lw_shared(sstable_list(*x._all)))
-        , _all_runs(x._all_runs) {
-}
-
-sstable_set::sstable_set(sstable_set&&) noexcept = default;
-
-sstable_set&
-sstable_set::operator=(const sstable_set& x) {
-    if (this != &x) {
-        auto tmp = sstable_set(x);
-        *this = std::move(tmp);
-    }
-    return *this;
-}
-
-sstable_set&
-sstable_set::operator=(sstable_set&&) noexcept = default;
-
-std::vector<shared_sstable>
-sstable_set::select(const dht::partition_range& range) const {
-    return _impl->select(range);
-}
-
-std::vector<sstable_run>
-sstable_set::select(const std::vector<shared_sstable>& sstables) const {
-    auto run_ids = boost::copy_range<std::unordered_set<utils::UUID>>(sstables | boost::adaptors::transformed(std::mem_fn(&sstable::run_identifier)));
-    return boost::copy_range<std::vector<sstable_run>>(run_ids | boost::adaptors::transformed([this] (utils::UUID run_id) {
-        return _all_runs.at(run_id);
-    }));
-}
-
-void
-sstable_set::insert(shared_sstable sst) {
-    _impl->insert(sst);
-    try {
-        _all->insert(sst);
-        try {
-            _all_runs[sst->run_identifier()].insert(sst);
-        } catch (...) {
-            _all->erase(sst);
-            throw;
-        }
-    } catch (...) {
-        _impl->erase(sst);
-        throw;
-    }
-}
-
-void
-sstable_set::erase(shared_sstable sst) {
-    _impl->erase(sst);
-    _all->erase(sst);
-    _all_runs[sst->run_identifier()].erase(sst);
-}
-
-sstable_set::~sstable_set() = default;
-
-sstable_set::incremental_selector::incremental_selector(std::unique_ptr<incremental_selector_impl> impl, const schema& s)
-    : _impl(std::move(impl))
-    , _cmp(s) {
-}
-
-sstable_set::incremental_selector::~incremental_selector() = default;
-
-sstable_set::incremental_selector::incremental_selector(sstable_set::incremental_selector&&) noexcept = default;
-
-sstable_set::incremental_selector::selection
-sstable_set::incremental_selector::select(const dht::ring_position_view& pos) const {
-    if (!_current_range_view || !_current_range_view->contains(pos, _cmp)) {
-        std::tie(_current_range, _current_sstables, _current_next_position) = _impl->select(pos);
-        _current_range_view = _current_range->transform([] (const dht::ring_position& rp) { return dht::ring_position_view(rp); });
-    }
-    return {_current_sstables, _current_next_position};
-}
-
-sstable_set::incremental_selector
-sstable_set::make_incremental_selector() const {
-    return incremental_selector(_impl->make_incremental_selector(), *_schema);
-}
-
-// default sstable_set, not specialized for anything
-class bag_sstable_set : public sstable_set_impl {
-    // erasing is slow, but select() is fast
-    std::vector<shared_sstable> _sstables;
-public:
-    virtual std::unique_ptr<sstable_set_impl> clone() const override {
-        return std::make_unique<bag_sstable_set>(*this);
-    }
-    virtual std::vector<shared_sstable> select(const dht::partition_range& range = query::full_partition_range) const override {
-        return _sstables;
-    }
-    virtual void insert(shared_sstable sst) override {
-        _sstables.push_back(std::move(sst));
-    }
-    virtual void erase(shared_sstable sst) override {
-        auto it = boost::range::find(_sstables, sst);
-        if (it != _sstables.end()){
-            _sstables.erase(it);
-        }
-    }
-    virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const override;
-    class incremental_selector;
-};
-
-class bag_sstable_set::incremental_selector : public incremental_selector_impl {
-    const std::vector<shared_sstable>& _sstables;
-public:
-    incremental_selector(const std::vector<shared_sstable>& sstables)
-        : _sstables(sstables) {
-    }
-    virtual std::tuple<dht::partition_range, std::vector<shared_sstable>, dht::ring_position_view> select(const dht::ring_position_view&) override {
-        return std::make_tuple(dht::partition_range::make_open_ended_both_sides(), _sstables, dht::ring_position_view::max());
-    }
-};
-
-std::unique_ptr<incremental_selector_impl> bag_sstable_set::make_incremental_selector() const {
-    return std::make_unique<incremental_selector>(_sstables);
-}
-
-// specialized when sstables are partitioned in the token range space
-// e.g. leveled compaction strategy
-class partitioned_sstable_set : public sstable_set_impl {
-    using value_set = std::unordered_set<shared_sstable>;
-    using interval_map_type = boost::icl::interval_map<compatible_ring_position_or_view, value_set>;
-    using interval_type = interval_map_type::interval_type;
-    using map_iterator = interval_map_type::const_iterator;
-private:
-    schema_ptr _schema;
-    std::vector<shared_sstable> _unleveled_sstables;
-    interval_map_type _leveled_sstables;
-    // Change counter on interval map for leveled sstables which is used by
-    // incremental selector to determine whether or not to invalidate iterators.
-    uint64_t _leveled_sstables_change_cnt = 0;
-    bool _use_level_metadata = false;
-private:
-    static interval_type make_interval(const schema& s, const dht::partition_range& range) {
-        return interval_type::closed(
-                compatible_ring_position_or_view(s, dht::ring_position_view(range.start()->value())),
-                compatible_ring_position_or_view(s, dht::ring_position_view(range.end()->value())));
-    }
-    interval_type make_interval(const dht::partition_range& range) const {
-        return make_interval(*_schema, range);
-    }
-    static interval_type make_interval(const schema_ptr& s, const sstable& sst) {
-        return interval_type::closed(
-                compatible_ring_position_or_view(s, dht::ring_position(sst.get_first_decorated_key())),
-                compatible_ring_position_or_view(s, dht::ring_position(sst.get_last_decorated_key())));
-    }
-    interval_type make_interval(const sstable& sst) {
-        return make_interval(_schema, sst);
-    }
-    interval_type singular(const dht::ring_position& rp) const {
-        // We should use the view here, since this is used for queries.
-        auto rpv = dht::ring_position_view(rp);
-        auto crp = compatible_ring_position_or_view(*_schema, std::move(rpv));
-        return interval_type::closed(crp, crp);
-    }
-    std::pair<map_iterator, map_iterator> query(const dht::partition_range& range) const {
-        if (range.start() && range.end()) {
-            return _leveled_sstables.equal_range(make_interval(range));
-        }
-        else if (range.start() && !range.end()) {
-            auto start = singular(range.start()->value());
-            return { _leveled_sstables.lower_bound(start), _leveled_sstables.end() };
-        } else if (!range.start() && range.end()) {
-            auto end = singular(range.end()->value());
-            return { _leveled_sstables.begin(), _leveled_sstables.upper_bound(end) };
-        } else {
-            return { _leveled_sstables.begin(), _leveled_sstables.end() };
-        }
-    }
-    // SSTables are stored separately to avoid interval map's fragmentation issue when level 0 falls behind.
-    bool store_as_unleveled(const shared_sstable& sst) const {
-        return _use_level_metadata && sst->get_sstable_level() == 0;
-    }
-public:
-    static dht::ring_position to_ring_position(const compatible_ring_position_or_view& crp) {
-        // Ring position views, representing bounds of sstable intervals are
-        // guaranteed to have key() != nullptr;
-        const auto& pos = crp.position();
-        return dht::ring_position(pos.token(), *pos.key());
-    }
-    static dht::partition_range to_partition_range(const interval_type& i) {
-        return dht::partition_range::make(
-                {to_ring_position(i.lower()), boost::icl::is_left_closed(i.bounds())},
-                {to_ring_position(i.upper()), boost::icl::is_right_closed(i.bounds())});
-    }
-    static dht::partition_range to_partition_range(const dht::ring_position_view& pos, const interval_type& i) {
-        auto lower_bound = [&] {
-            if (pos.key()) {
-                return dht::partition_range::bound(dht::ring_position(pos.token(), *pos.key()),
-                        pos.is_after_key() == dht::ring_position_view::after_key::no);
-            } else {
-                return dht::partition_range::bound(dht::ring_position(pos.token(), pos.get_token_bound()), true);
-            }
-        }();
-        auto upper_bound = dht::partition_range::bound(to_ring_position(i.lower()), !boost::icl::is_left_closed(i.bounds()));
-        return dht::partition_range::make(std::move(lower_bound), std::move(upper_bound));
-    }
-    explicit partitioned_sstable_set(schema_ptr schema, bool use_level_metadata = true)
-            : _schema(std::move(schema))
-            , _use_level_metadata(use_level_metadata) {
-    }
-    virtual std::unique_ptr<sstable_set_impl> clone() const override {
-        return std::make_unique<partitioned_sstable_set>(*this);
-    }
-    virtual std::vector<shared_sstable> select(const dht::partition_range& range) const override {
-        auto ipair = query(range);
-        auto b = std::move(ipair.first);
-        auto e = std::move(ipair.second);
-        value_set result;
-        while (b != e) {
-            boost::copy(b++->second, std::inserter(result, result.end()));
-        }
-        auto r = _unleveled_sstables;
-        r.insert(r.end(), result.begin(), result.end());
-        return r;
-    }
-    virtual void insert(shared_sstable sst) override {
-        if (store_as_unleveled(sst)) {
-            _unleveled_sstables.push_back(std::move(sst));
-        } else {
-            _leveled_sstables_change_cnt++;
-            _leveled_sstables.add({make_interval(*sst), value_set({sst})});
-        }
-    }
-    virtual void erase(shared_sstable sst) override {
-        if (store_as_unleveled(sst)) {
-            _unleveled_sstables.erase(std::remove(_unleveled_sstables.begin(), _unleveled_sstables.end(), sst), _unleveled_sstables.end());
-        } else {
-            _leveled_sstables_change_cnt++;
-            _leveled_sstables.subtract({make_interval(*sst), value_set({sst})});
-        }
-    }
-    virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const override;
-    class incremental_selector;
-};
-
-class partitioned_sstable_set::incremental_selector : public incremental_selector_impl {
-    schema_ptr _schema;
-    const std::vector<shared_sstable>& _unleveled_sstables;
-    const interval_map_type& _leveled_sstables;
-    const uint64_t& _leveled_sstables_change_cnt;
-    uint64_t _last_known_leveled_sstables_change_cnt;
-    map_iterator _it;
-    // Only to back the dht::ring_position_view returned from select().
-    dht::ring_position _next_position;
-private:
-    dht::ring_position_view next_position(map_iterator it) {
-        if (it == _leveled_sstables.end()) {
-            _next_position = dht::ring_position::max();
-            return dht::ring_position_view::max();
-        } else {
-            _next_position = partitioned_sstable_set::to_ring_position(it->first.lower());
-            return dht::ring_position_view(_next_position, dht::ring_position_view::after_key(!boost::icl::is_left_closed(it->first.bounds())));
-        }
-    }
-    static bool is_before_interval(const compatible_ring_position_or_view& crp, const interval_type& interval) {
-        if (boost::icl::is_left_closed(interval.bounds())) {
-            return crp < interval.lower();
-        } else {
-            return crp <= interval.lower();
-        }
-    }
-    void maybe_invalidate_iterator(const compatible_ring_position_or_view& crp) {
-        if (_last_known_leveled_sstables_change_cnt != _leveled_sstables_change_cnt) {
-            _it = _leveled_sstables.lower_bound(interval_type::closed(crp, crp));
-            _last_known_leveled_sstables_change_cnt = _leveled_sstables_change_cnt;
-        }
-    }
-public:
-    incremental_selector(schema_ptr schema, const std::vector<shared_sstable>& unleveled_sstables, const interval_map_type& leveled_sstables,
-                         const uint64_t& leveled_sstables_change_cnt)
-        : _schema(std::move(schema))
-        , _unleveled_sstables(unleveled_sstables)
-        , _leveled_sstables(leveled_sstables)
-        , _leveled_sstables_change_cnt(leveled_sstables_change_cnt)
-        , _last_known_leveled_sstables_change_cnt(leveled_sstables_change_cnt)
-        , _it(leveled_sstables.begin())
-        , _next_position(dht::ring_position::min()) {
-    }
-    virtual std::tuple<dht::partition_range, std::vector<shared_sstable>, dht::ring_position_view> select(const dht::ring_position_view& pos) override {
-        auto crp = compatible_ring_position_or_view(*_schema, pos);
-        auto ssts = _unleveled_sstables;
-        using namespace dht;
-
-        maybe_invalidate_iterator(crp);
-
-        while (_it != _leveled_sstables.end()) {
-            if (boost::icl::contains(_it->first, crp)) {
-                ssts.insert(ssts.end(), _it->second.begin(), _it->second.end());
-                return std::make_tuple(partitioned_sstable_set::to_partition_range(_it->first), std::move(ssts), next_position(std::next(_it)));
-            }
-            // We don't want to skip current interval if pos lies before it.
-            if (is_before_interval(crp, _it->first)) {
-                return std::make_tuple(partitioned_sstable_set::to_partition_range(pos, _it->first), std::move(ssts), next_position(_it));
-            }
-            _it++;
-        }
-        return std::make_tuple(partition_range::make_open_ended_both_sides(), std::move(ssts), ring_position_view::max());
-    }
-};
-
-std::unique_ptr<incremental_selector_impl> partitioned_sstable_set::make_incremental_selector() const {
-    return std::make_unique<incremental_selector>(_schema, _unleveled_sstables, _leveled_sstables, _leveled_sstables_change_cnt);
-}
-
-std::unique_ptr<sstable_set_impl> compaction_strategy_impl::make_sstable_set(schema_ptr schema) const {
-    return std::make_unique<bag_sstable_set>();
-}
-
-std::unique_ptr<sstable_set_impl> leveled_compaction_strategy::make_sstable_set(schema_ptr schema) const {
-    return std::make_unique<partitioned_sstable_set>(std::move(schema));
-}
-
-std::unique_ptr<sstable_set_impl> make_partitioned_sstable_set(schema_ptr schema, bool use_level_metadata) {
-    return std::make_unique<partitioned_sstable_set>(std::move(schema), use_level_metadata);
-}
-
 compaction_descriptor compaction_strategy_impl::get_major_compaction_job(column_family& cf, std::vector<sstables::shared_sstable> candidates) {
-    return compaction_descriptor(std::move(candidates));
+    return compaction_descriptor(std::move(candidates), cf.get_sstable_set(), service::get_local_compaction_priority());
 }
 
 bool compaction_strategy_impl::worth_dropping_tombstones(const shared_sstable& sst, gc_clock::time_point gc_before) {
@@ -453,25 +72,38 @@ bool compaction_strategy_impl::worth_dropping_tombstones(const shared_sstable& s
     return sst->estimate_droppable_tombstone_ratio(gc_before) >= _tombstone_threshold;
 }
 
-std::vector<resharding_descriptor>
-compaction_strategy_impl::get_resharding_jobs(column_family& cf, std::vector<sstables::shared_sstable> candidates) {
-    std::vector<resharding_descriptor> jobs;
-    shard_id reshard_at_current = 0;
-
-    clogger.debug("Trying to get resharding jobs for {}.{}...", cf.schema()->ks_name(), cf.schema()->cf_name());
-    for (auto& candidate : candidates) {
-        auto level = candidate->get_sstable_level();
-        jobs.push_back(resharding_descriptor{{std::move(candidate)}, std::numeric_limits<uint64_t>::max(), reshard_at_current++ % smp::count, level});
-    }
-    return jobs;
-}
-
 uint64_t compaction_strategy_impl::adjust_partition_estimate(const mutation_source_metadata& ms_meta, uint64_t partition_estimate) {
     return partition_estimate;
 }
 
 reader_consumer compaction_strategy_impl::make_interposer_consumer(const mutation_source_metadata& ms_meta, reader_consumer end_consumer) {
     return end_consumer;
+}
+
+compaction_descriptor
+compaction_strategy_impl::get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, const ::io_priority_class& iop, reshape_mode mode) {
+    return compaction_descriptor();
+}
+
+std::optional<sstring> compaction_strategy_impl::get_value(const std::map<sstring, sstring>& options, const sstring& name) {
+    auto it = options.find(name);
+    if (it == options.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+compaction_strategy_impl::compaction_strategy_impl(const std::map<sstring, sstring>& options) {
+    using namespace cql3::statements;
+
+    auto tmp_value = get_value(options, TOMBSTONE_THRESHOLD_OPTION);
+    _tombstone_threshold = property_definitions::to_double(TOMBSTONE_THRESHOLD_OPTION, tmp_value, DEFAULT_TOMBSTONE_THRESHOLD);
+
+    tmp_value = get_value(options, TOMBSTONE_COMPACTION_INTERVAL_OPTION);
+    auto interval = property_definitions::to_long(TOMBSTONE_COMPACTION_INTERVAL_OPTION, tmp_value, DEFAULT_TOMBSTONE_COMPACTION_INTERVAL().count());
+    _tombstone_compaction_interval = db_clock::duration(std::chrono::seconds(interval));
+
+    // FIXME: validate options.
 }
 
 } // namespace sstables
@@ -494,8 +126,9 @@ size_tiered_backlog_tracker::compacted_backlog(const compaction_backlog_tracker:
     inflight_component in;
     for (auto const& crp : ongoing_compactions) {
         auto compacted = crp.second->compacted();
+        auto effective_size = crp.first->data_size() - compacted;
         in.total_bytes += compacted;
-        in.contribution += compacted * log4((crp.first->data_size()));
+        in.contribution += compacted * log4(effective_size);
     }
     return in;
 }
@@ -504,12 +137,12 @@ double size_tiered_backlog_tracker::backlog(const compaction_backlog_tracker::on
     inflight_component partial = partial_backlog(ow);
     inflight_component compacted = compacted_backlog(oc);
 
-    auto total_bytes = _total_bytes + partial.total_bytes - compacted.total_bytes;
-    if ((total_bytes <= 0)) {
+    auto effective_total_size = _total_bytes + partial.total_bytes - compacted.total_bytes;
+    if ((effective_total_size <= 0)) {
         return 0;
     }
     auto sstables_contribution = _sstables_backlog_contribution + partial.contribution - compacted.contribution;
-    auto b = (total_bytes * log4(total_bytes)) - sstables_contribution;
+    auto b = (effective_total_size * log4(effective_total_size)) - sstables_contribution;
     return b > 0 ? b : 0;
 }
 
@@ -528,6 +161,8 @@ void size_tiered_backlog_tracker::remove_sstable(sstables::shared_sstable sst) {
 }
 
 namespace sstables {
+
+extern logging::logger clogger;
 
 // The backlog for TWCS is just the sum of the individual backlogs in each time window.
 // We'll keep various SizeTiered backlog tracker objects-- one per window for the static SSTables.
@@ -767,68 +402,13 @@ time_window_compaction_strategy::time_window_compaction_strategy(const std::map<
     , _stcs_options(options)
     , _backlog_tracker(std::make_unique<time_window_backlog_tracker>(_options))
 {
-    if (!options.count(TOMBSTONE_COMPACTION_INTERVAL_OPTION) && !options.count(TOMBSTONE_THRESHOLD_OPTION)) {
+    if (!options.contains(TOMBSTONE_COMPACTION_INTERVAL_OPTION) && !options.contains(TOMBSTONE_THRESHOLD_OPTION)) {
         _disable_tombstone_compaction = true;
         clogger.debug("Disabling tombstone compactions for TWCS");
     } else {
         clogger.debug("Enabling tombstone compactions for TWCS");
     }
     _use_clustering_key_filter = true;
-}
-
-uint64_t time_window_compaction_strategy::adjust_partition_estimate(const mutation_source_metadata& ms_meta, uint64_t partition_estimate) {
-    if (!ms_meta.min_timestamp || !ms_meta.max_timestamp) {
-        // Not enough information, we assume the worst
-        return partition_estimate / max_data_segregation_window_count;
-    }
-    const auto min_window = get_window_for(_options, *ms_meta.min_timestamp);
-    const auto max_window = get_window_for(_options, *ms_meta.max_timestamp);
-    return partition_estimate / (max_window - min_window + 1);
-}
-
-namespace {
-
-class classify_by_timestamp {
-    time_window_compaction_strategy_options _options;
-    std::vector<int64_t> _known_windows;
-
-public:
-    explicit classify_by_timestamp(time_window_compaction_strategy_options options) : _options(std::move(options)) { }
-    int64_t operator()(api::timestamp_type ts) {
-        const auto window = time_window_compaction_strategy::get_window_for(_options, ts);
-        if (const auto it = boost::find(_known_windows, window); it != _known_windows.end()) {
-            std::swap(*it, _known_windows.front());
-            return window;
-        }
-        if (_known_windows.size() < time_window_compaction_strategy::max_data_segregation_window_count) {
-            _known_windows.push_back(window);
-            return window;
-        }
-        int64_t closest_window;
-        int64_t min_diff = std::numeric_limits<int64_t>::max();
-        for (const auto known_window : _known_windows) {
-            if (const auto diff = std::abs(known_window - window); diff < min_diff) {
-                min_diff = diff;
-                closest_window = known_window;
-            }
-        }
-        return closest_window;
-    };
-};
-
-} // anonymous namespace
-
-reader_consumer time_window_compaction_strategy::make_interposer_consumer(const mutation_source_metadata& ms_meta, reader_consumer end_consumer) {
-    if (ms_meta.min_timestamp && ms_meta.max_timestamp
-            && get_window_for(_options, *ms_meta.min_timestamp) == get_window_for(_options, *ms_meta.max_timestamp)) {
-        return end_consumer;
-    }
-    return [options = _options, end_consumer = std::move(end_consumer)] (flat_mutation_reader rd) mutable -> future<> {
-        return mutation_writer::segregate_by_timestamp(
-                std::move(rd),
-                classify_by_timestamp(std::move(options)),
-                std::move(end_consumer));
-    };
 }
 
 } // namespace sstables
@@ -843,7 +423,7 @@ date_tiered_manifest::get_next_sstables(column_family& cf, std::vector<sstables:
     auto expired = get_fully_expired_sstables(cf, uncompacting, gc_before);
 
     if (!expired.empty()) {
-        auto is_expired = [&] (const sstables::shared_sstable& s) { return expired.find(s) != expired.end(); };
+        auto is_expired = [&] (const sstables::shared_sstable& s) { return expired.contains(s); };
         uncompacting.erase(boost::remove_if(uncompacting, is_expired), uncompacting.end());
     }
 
@@ -929,9 +509,9 @@ date_tiered_manifest::filter_old_sstables(std::vector<sstables::shared_sstable> 
     }
     int64_t cutoff = now - max_sstable_age;
 
-    sstables.erase(std::remove_if(sstables.begin(), sstables.end(), [cutoff] (auto& sst) {
+    std::erase_if(sstables, [cutoff] (auto& sst) {
         return sst->get_stats_metadata().max_timestamp < cutoff;
-    }), sstables.end());
+    });
 
     return sstables;
 }
@@ -944,6 +524,28 @@ date_tiered_manifest::create_sst_and_min_timestamp_pairs(const std::vector<sstab
         sstable_min_timestamp_pairs.emplace_back(sst, sst->get_stats_metadata().min_timestamp);
     }
     return sstable_min_timestamp_pairs;
+}
+
+date_tiered_compaction_strategy_options::date_tiered_compaction_strategy_options(const std::map<sstring, sstring>& options) {
+    using namespace cql3::statements;
+
+    auto tmp_value = sstables::compaction_strategy_impl::get_value(options, TIMESTAMP_RESOLUTION_KEY);
+    auto target_unit = tmp_value ? tmp_value.value() : DEFAULT_TIMESTAMP_RESOLUTION;
+
+    tmp_value = sstables::compaction_strategy_impl::get_value(options, MAX_SSTABLE_AGE_KEY);
+    auto fractional_days = property_definitions::to_double(MAX_SSTABLE_AGE_KEY, tmp_value, DEFAULT_MAX_SSTABLE_AGE_DAYS);
+    int64_t max_sstable_age_in_hours = std::lround(fractional_days * 24);
+    max_sstable_age = duration_conversor::convert(target_unit, std::chrono::hours(max_sstable_age_in_hours));
+
+    tmp_value = sstables::compaction_strategy_impl::get_value(options, BASE_TIME_KEY);
+    auto base_time_seconds = property_definitions::to_long(BASE_TIME_KEY, tmp_value, DEFAULT_BASE_TIME_SECONDS);
+    base_time = duration_conversor::convert(target_unit, std::chrono::seconds(base_time_seconds));
+}
+
+date_tiered_compaction_strategy_options::date_tiered_compaction_strategy_options() {
+    auto max_sstable_age_in_hours = int64_t(DEFAULT_MAX_SSTABLE_AGE_DAYS * 24);
+    max_sstable_age = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::hours(max_sstable_age_in_hours)).count();
+    base_time = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::seconds(DEFAULT_BASE_TIME_SECONDS)).count();
 }
 
 namespace sstables {
@@ -961,7 +563,7 @@ date_tiered_compaction_strategy::date_tiered_compaction_strategy(const std::map<
     // - with time series workloads, it's usually better to wait for whole sstable to be expired rather than
     // compacting a single sstable when it's more than 20% (default value) expired.
     // For more details, see CASSANDRA-9234
-    if (!options.count(TOMBSTONE_COMPACTION_INTERVAL_OPTION) && !options.count(TOMBSTONE_THRESHOLD_OPTION)) {
+    if (!options.contains(TOMBSTONE_COMPACTION_INTERVAL_OPTION) && !options.contains(TOMBSTONE_THRESHOLD_OPTION)) {
         _disable_tombstone_compaction = true;
         date_tiered_manifest::logger.debug("Disabling tombstone compactions for DTCS");
     } else {
@@ -977,7 +579,7 @@ compaction_descriptor date_tiered_compaction_strategy::get_sstables_for_compacti
 
     if (!sstables.empty()) {
         date_tiered_manifest::logger.debug("datetiered: Compacting {} out of {} sstables", sstables.size(), candidates.size());
-        return sstables::compaction_descriptor(std::move(sstables));
+        return sstables::compaction_descriptor(std::move(sstables), cfs.get_sstable_set(), service::get_local_compaction_priority());
     }
 
     // filter out sstables which droppable tombstone ratio isn't greater than the defined threshold.
@@ -993,7 +595,7 @@ compaction_descriptor date_tiered_compaction_strategy::get_sstables_for_compacti
     auto it = std::min_element(candidates.begin(), candidates.end(), [] (auto& i, auto& j) {
         return i->get_stats_metadata().min_timestamp < j->get_stats_metadata().min_timestamp;
     });
-    return sstables::compaction_descriptor({ *it });
+    return sstables::compaction_descriptor({ *it }, cfs.get_sstable_set(), service::get_local_compaction_priority());
 }
 
 size_tiered_compaction_strategy::size_tiered_compaction_strategy(const std::map<sstring, sstring>& options)
@@ -1027,10 +629,6 @@ compaction_descriptor compaction_strategy::get_major_compaction_job(column_famil
     return _compaction_strategy_impl->get_major_compaction_job(cf, std::move(candidates));
 }
 
-std::vector<resharding_descriptor> compaction_strategy::get_resharding_jobs(column_family& cf, std::vector<sstables::shared_sstable> candidates) {
-    return _compaction_strategy_impl->get_resharding_jobs(cf, std::move(candidates));
-}
-
 void compaction_strategy::notify_completion(const std::vector<shared_sstable>& removed, const std::vector<shared_sstable>& added) {
     _compaction_strategy_impl->notify_completion(removed, added);
 }
@@ -1047,16 +645,13 @@ bool compaction_strategy::use_clustering_key_filter() const {
     return _compaction_strategy_impl->use_clustering_key_filter();
 }
 
-sstable_set
-compaction_strategy::make_sstable_set(schema_ptr schema) const {
-    return sstable_set(
-            _compaction_strategy_impl->make_sstable_set(schema),
-            schema,
-            make_lw_shared<sstable_list>());
-}
-
 compaction_backlog_tracker& compaction_strategy::get_backlog_tracker() {
     return _compaction_strategy_impl->get_backlog_tracker();
+}
+
+sstables::compaction_descriptor
+compaction_strategy::get_reshaping_job(std::vector<shared_sstable> input, schema_ptr schema, const ::io_priority_class& iop, reshape_mode mode) {
+    return _compaction_strategy_impl->get_reshaping_job(std::move(input), schema, iop, mode);
 }
 
 uint64_t compaction_strategy::adjust_partition_estimate(const mutation_source_metadata& ms_meta, uint64_t partition_estimate) {
@@ -1067,24 +662,28 @@ reader_consumer compaction_strategy::make_interposer_consumer(const mutation_sou
     return _compaction_strategy_impl->make_interposer_consumer(ms_meta, std::move(end_consumer));
 }
 
+bool compaction_strategy::use_interposer_consumer() const {
+    return _compaction_strategy_impl->use_interposer_consumer();
+}
+
 compaction_strategy make_compaction_strategy(compaction_strategy_type strategy, const std::map<sstring, sstring>& options) {
     ::shared_ptr<compaction_strategy_impl> impl;
 
-    switch(strategy) {
+    switch (strategy) {
     case compaction_strategy_type::null:
-        impl = make_shared<null_compaction_strategy>(null_compaction_strategy());
+        impl = ::make_shared<null_compaction_strategy>();
         break;
     case compaction_strategy_type::size_tiered:
-        impl = make_shared<size_tiered_compaction_strategy>(size_tiered_compaction_strategy(options));
+        impl = ::make_shared<size_tiered_compaction_strategy>(options);
         break;
     case compaction_strategy_type::leveled:
-        impl = make_shared<leveled_compaction_strategy>(leveled_compaction_strategy(options));
+        impl = ::make_shared<leveled_compaction_strategy>(options);
         break;
     case compaction_strategy_type::date_tiered:
-        impl = make_shared<date_tiered_compaction_strategy>(date_tiered_compaction_strategy(options));
+        impl = ::make_shared<date_tiered_compaction_strategy>(options);
         break;
     case compaction_strategy_type::time_window:
-        impl = make_shared<time_window_compaction_strategy>(time_window_compaction_strategy(options));
+        impl = ::make_shared<time_window_compaction_strategy>(options);
         break;
     case compaction_strategy_type::in_memory:
         impl = make_shared<in_memory_compaction_strategy>(in_memory_compaction_strategy(options));
@@ -1100,7 +699,7 @@ compaction_strategy make_compaction_strategy(compaction_strategy_type strategy, 
 }
 
 std::unique_ptr<sstable_set_impl> incremental_compaction_strategy::make_sstable_set(schema_ptr schema) const {
-    return make_partitioned_sstable_set(std::move(schema), false);
+    return std::make_unique<partitioned_sstable_set>(std::move(schema), false);
 }
 
 }

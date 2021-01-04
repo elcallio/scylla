@@ -4,7 +4,7 @@
  * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
-#include <seastarx.hh>
+#include "seastarx.hh"
 #include "cql3/statements/create_service_level_statement.hh"
 #include "service/qos/service_level_controller.hh"
 #include "transport/messages/result_message.hh"
@@ -29,7 +29,7 @@ void create_service_level_statement::validate(service::storage_proxy &, const se
 }
 
 future<> create_service_level_statement::check_access(service::storage_proxy& sp, const service::client_state &state) const {
-    return state.ensure_has_permission(auth::permission::CREATE, auth::root_service_level_resource());
+    return state.ensure_has_permission(auth::command_desc{.permission = auth::permission::CREATE, .resource = auth::root_service_level_resource()});
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>

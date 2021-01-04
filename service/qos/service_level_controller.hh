@@ -16,6 +16,7 @@
 #include "auth/service.hh"
 #include "service/storage_service.hh"
 #include <map>
+#include <stack>
 #include <unordered_set>
 #include "qos_common.hh"
 
@@ -81,8 +82,9 @@ private:
     std::pair<const sstring*, service_level*> _sl_lookup[max_scheduling_groups()];
     service_level _default_service_level;
     service_level_distributed_data_accessor_ptr _sl_data_accessor;
+    sharded<auth::service>& _auth_service;
 public:
-    service_level_controller(service_level_options default_service_level_config);
+    service_level_controller(sharded<auth::service>& auth_service, service_level_options default_service_level_config);
 
     /**
      * this function must be called *once* from any shard before any other functions are called.
@@ -130,7 +132,7 @@ public:
     template <typename Ret>
     futurize_t<Ret> with_user_service_level(const std::optional<auth::authenticated_user>& usr, noncopyable_function<Ret()> func) {
         if (usr) {
-            auth::service& ser = service::get_local_storage_service().get_local_auth_service();
+            auth::service& ser = _auth_service.local();
             return auth::get_roles(ser, *usr).then([this] (auth::role_set roles) {
                 return find_service_level(roles);
             }).then([this, func = std::move(func)] (sstring service_level_name) mutable {
@@ -205,6 +207,17 @@ public:
     future<> drop_distributed_service_level(sstring name, bool if_exists);
     future<service_levels_info> get_distributed_service_levels();
     future<service_levels_info> get_distributed_service_level(sstring service_level_name);
+
+    /**
+     * Returns true if `service_level_name` is recognised as a
+     * service level name and false otherwise.
+     *
+     * @param service_level_name - the service level name to test.
+     **/
+     bool has_service_level(sstring service_level_name) {
+         return _service_levels_db.contains(service_level_name);
+     }
+
 
 private:
     /**

@@ -131,6 +131,23 @@ SEASTAR_TEST_CASE(test_decimal_to_bigint) {
     });
 }
 
+SEASTAR_TEST_CASE(test_decimal_to_float) {
+    return do_with_cql_env_thread([&](auto& e) {
+        e.execute_cql("CREATE TABLE test (key text primary key, value decimal)").get();
+        e.execute_cql("INSERT INTO test (key, value) VALUES ('k1', 10)").get();
+        e.execute_cql("INSERT INTO test (key, value) VALUES ('k2', 1e1)").get();
+        e.execute_cql("INSERT INTO test (key, value) VALUES ('k3', 100e-1)").get();
+        e.execute_cql("INSERT INTO test (key, value) VALUES ('k4', -1e1)").get();
+        auto v = e.execute_cql("SELECT key, CAST(value as float) from test").get0();
+        assert_that(v).is_rows().with_rows_ignore_order({
+            {{serialized("k1")}, {serialized(float(10))}},
+            {{serialized("k2")}, {serialized(float(10))}},
+            {{serialized("k3")}, {serialized(float(10))}},
+            {{serialized("k4")}, {serialized(float(-10))}},
+        });
+    });
+}
+
 SEASTAR_TEST_CASE(test_varint_to_bigint) {
     return do_with_cql_env_thread([&](auto& e) {
         e.execute_cql("CREATE TABLE test (key text primary key, value varint)").get();
@@ -326,14 +343,14 @@ SEASTAR_TEST_CASE(test_numeric_casts_in_selection_clause) {
                 auto row = dynamic_cast<cql_transport::messages::result_message::rows&>(*msg).rs().result_set().rows().front();
                 BOOST_CHECK(!row[index]);
             };
-            cmp(0, 1.d);
-            cmp(1, 2.d);
-            cmp(2, 3.d);
-            cmp(3, 4.d);
-            cmp(4, 5.2d);
-            cmp(5, 6.3d);
-            cmp(6, 7.3d);
-            cmp(7, 8.d);
+            cmp(0, 1.);
+            cmp(1, 2.);
+            cmp(2, 3.);
+            cmp(3, 4.);
+            cmp(4, 5.2);
+            cmp(5, 6.3);
+            cmp(6, 7.3);
+            cmp(7, 8.);
             cmp_null(8);
         }
         {
@@ -357,14 +374,14 @@ SEASTAR_TEST_CASE(test_numeric_casts_in_selection_clause) {
                 auto row = dynamic_cast<cql_transport::messages::result_message::rows&>(*msg).rs().result_set().rows().front();
                 BOOST_CHECK(!row[index]);
             };
-            cmp(0, 1.d);
-            cmp(1, 2.d);
-            cmp(2, 3.d);
-            cmp(3, 4.d);
-            cmp(4, 5.2d);
-            cmp(5, 6.3d);
-            cmp(6, 7.3d);
-            cmp(7, 8.d);
+            cmp(0, 1.);
+            cmp(1, 2.);
+            cmp(2, 3.);
+            cmp(3, 4.);
+            cmp(4, 5.2);
+            cmp(5, 6.3);
+            cmp(6, 7.3);
+            cmp(7, 8.);
             cmp_null(8);
         }
         {
@@ -565,6 +582,39 @@ SEASTAR_TEST_CASE(test_casts_with_revrsed_order_in_selection_clause) {
             assert_that(msg).is_rows().with_size(1).with_row({{ascii_type->from_string("1")},
                                                               {ascii_type->from_string("2")},
                                                               {ascii_type->from_string("6.3")}});
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(test_identity_casts) {
+    return do_with_cql_env_thread([&] (auto& e) {
+        const std::pair<data_type, const char*> type_value_pairs[] = {
+                {ascii_type, "'val'"},
+                {long_type, "0"},
+                {bytes_type, "0x0000000000000003"},
+                {boolean_type, "true"},
+                {double_type, "0.0"},
+                {float_type, "0.0"},
+                {int32_type, "0"},
+                {short_type, "0"},
+                {utf8_type, "'val'"},
+                {timestamp_type, "'2011-02-03 04:05+0000'"},
+                {byte_type, "0"},
+                {uuid_type, "123e4567-e89b-12d3-a456-426655440000"},
+                {timeuuid_type, "123e4567-e89b-12d3-a456-426655440000"},
+                {simple_date_type, "'2011-02-03'"},
+                {time_type, "'08:12:54.123456789'"},
+                {inet_addr_type, "'192.168.1.1'"},
+                {varint_type, "0"},
+                {decimal_type, "0.0"},
+                {duration_type, "5h23m10s"},
+        };
+
+        for (const auto [type, value] : type_value_pairs) {
+            const auto type_name = type->cql3_type_name();
+            cquery_nofail(e, format("create table t_{} (pk int primary key, v {})", type_name, type_name));
+            cquery_nofail(e, format("insert into t_{} (pk, v) values (0, {})", type_name, value));
+            cquery_nofail(e, format("select cast(v as {}) from t_{} where pk = 0", type_name, type_name, value));
         }
     });
 }

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "querier.hh"
@@ -113,6 +102,7 @@ private:
     Querier make_querier(const dht::partition_range& range) {
         return Querier(_mutation_source,
             _s.schema(),
+            _sem.make_permit(_s.schema().get(), "make-querier"),
             range,
             _s.schema()->full_slice(),
             service::get_local_sstable_query_read_priority(),
@@ -151,7 +141,7 @@ public:
         unsigned key;
         dht::partition_range original_range;
         query::partition_slice original_slice;
-        uint32_t row_limit;
+        uint64_t row_limit;
         size_t memory_usage;
 
         dht::partition_range expected_range;
@@ -160,10 +150,10 @@ public:
 
     test_querier_cache(const noncopyable_function<sstring(size_t)>& external_make_value, std::chrono::seconds entry_ttl = 24h, size_t cache_size = 100000)
         : _sem(reader_concurrency_semaphore::no_limits{})
-        , _cache(_sem, cache_size, entry_ttl)
+        , _cache(cache_size, entry_ttl)
         , _mutations(make_mutations(_s, external_make_value))
-        , _mutation_source([this] (schema_ptr, reader_permit, const dht::partition_range& range) {
-            auto rd = flat_mutation_reader_from_mutations(_mutations, range);
+        , _mutation_source([this] (schema_ptr, reader_permit permit, const dht::partition_range& range) {
+            auto rd = flat_mutation_reader_from_mutations(std::move(permit), _mutations, range);
             rd.set_max_buffer_size(max_reader_buffer_size);
             return rd;
         }) {
@@ -208,12 +198,14 @@ public:
 
     template <typename Querier>
     entry_info produce_first_page_and_save_querier(unsigned key, const dht::partition_range& range,
-            const query::partition_slice& slice, uint32_t row_limit) {
+            const query::partition_slice& slice, uint64_t row_limit) {
         const auto cache_key = make_cache_key(key);
 
         auto querier = make_querier<Querier>(range);
-        auto [dk, ck] = querier.consume_page(dummy_result_builder{}, row_limit, std::numeric_limits<uint32_t>::max(),
-                gc_clock::now(), db::no_timeout, std::numeric_limits<uint64_t>::max()).get0();
+        auto dk_ck = querier.consume_page(dummy_result_builder{}, row_limit, std::numeric_limits<uint32_t>::max(),
+                gc_clock::now(), db::no_timeout, query::max_result_size(std::numeric_limits<uint64_t>::max())).get0();
+        auto&& dk = dk_ck.first;
+        auto&& ck = dk_ck.second;
         const auto memory_usage = querier.memory_usage();
         _cache.insert(cache_key, std::move(querier), nullptr);
 
@@ -254,16 +246,16 @@ public:
     }
 
     entry_info produce_first_page_and_save_data_querier(unsigned key, const dht::partition_range& range,
-            const query::partition_slice& slice, uint32_t row_limit = 5) {
+            const query::partition_slice& slice, uint64_t row_limit = 5) {
         return produce_first_page_and_save_querier<query::data_querier>(key, range, slice, row_limit);
     }
 
-    entry_info produce_first_page_and_save_data_querier(unsigned key, const dht::partition_range& range, uint32_t row_limit = 5) {
+    entry_info produce_first_page_and_save_data_querier(unsigned key, const dht::partition_range& range, uint64_t row_limit = 5) {
         return produce_first_page_and_save_data_querier(key, range, make_default_slice(), row_limit);
     }
 
     // Singular overload
-    entry_info produce_first_page_and_save_data_querier(unsigned key, std::size_t i, uint32_t row_limit = 5) {
+    entry_info produce_first_page_and_save_data_querier(unsigned key, std::size_t i, uint64_t row_limit = 5) {
         return produce_first_page_and_save_data_querier(key, make_singular_partition_range(i), _s.schema()->full_slice(), row_limit);
     }
 
@@ -278,16 +270,16 @@ public:
     }
 
     entry_info produce_first_page_and_save_mutation_querier(unsigned key, const dht::partition_range& range,
-            const query::partition_slice& slice, uint32_t row_limit = 5) {
+            const query::partition_slice& slice, uint64_t row_limit = 5) {
         return produce_first_page_and_save_querier<query::mutation_querier>(key, range, slice, row_limit);
     }
 
-    entry_info produce_first_page_and_save_mutation_querier(unsigned key, const dht::partition_range& range, uint32_t row_limit = 5) {
+    entry_info produce_first_page_and_save_mutation_querier(unsigned key, const dht::partition_range& range, uint64_t row_limit = 5) {
         return produce_first_page_and_save_mutation_querier(key, range, make_default_slice(), row_limit);
     }
 
     // Singular overload
-    entry_info produce_first_page_and_save_mutation_querier(unsigned key, std::size_t i, uint32_t row_limit = 5) {
+    entry_info produce_first_page_and_save_mutation_querier(unsigned key, std::size_t i, uint64_t row_limit = 5) {
         return produce_first_page_and_save_mutation_querier(key, make_singular_partition_range(i), _s.schema()->full_slice(), row_limit);
     }
 
@@ -567,19 +559,20 @@ SEASTAR_THREAD_TEST_CASE(test_time_based_cache_eviction) {
 
     // There should be no inactive reads, the querier_cache should unregister
     // the expired queriers.
-    BOOST_REQUIRE_EQUAL(t.get_semaphore().get_inactive_read_stats().population, 0);
+    BOOST_REQUIRE_EQUAL(t.get_semaphore().get_stats().inactive_reads, 0);
 }
 
 sstring make_string_blob(size_t size) {
     const char* const letters = "abcdefghijklmnoqprsuvwxyz";
-    std::random_device rd;
+    static thread_local std::random_device rd;
+    static thread_local std::default_random_engine re(rd());
     std::uniform_int_distribution<size_t> dist(0, 25);
 
     sstring s;
     s.resize(size);
 
     for (size_t i = 0; i < size; ++i) {
-        s[i] = letters[dist(rd)];
+        s[i] = letters[dist(re)];
     }
 
     return s;
@@ -602,7 +595,7 @@ SEASTAR_THREAD_TEST_CASE(test_memory_based_cache_eviction) {
         t.produce_first_page_and_save_data_querier(i);
     }
 
-    const auto pop_before = t.get_semaphore().get_inactive_read_stats().population;
+    const auto pop_before = t.get_semaphore().get_stats().inactive_reads;
 
     // Should overflow the limit and trigger the eviction of the oldest entry.
     t.produce_first_page_and_save_data_querier(queriers_needed_to_fill_cache);
@@ -614,7 +607,7 @@ SEASTAR_THREAD_TEST_CASE(test_memory_based_cache_eviction) {
 
     // Since the last insert should have evicted an existing entry, we should
     // have the same number of registered inactive reads.
-    BOOST_REQUIRE_EQUAL(t.get_semaphore().get_inactive_read_stats().population, pop_before);
+    BOOST_REQUIRE_EQUAL(t.get_semaphore().get_stats().inactive_reads, pop_before);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_resources_based_cache_eviction) {
@@ -656,55 +649,55 @@ SEASTAR_THREAD_TEST_CASE(test_resources_based_cache_eviction) {
         auto s = cf.schema();
 
         cf.flush().get();
+        auto slice = s->full_slice();
+        slice.options.set<query::partition_slice::option::allow_short_read>();
 
         auto cmd1 = query::read_command(s->id(),
                 s->version(),
-                s->full_slice(),
+                slice,
                 1,
                 gc_clock::now(),
                 std::nullopt,
                 1,
-                utils::make_random_uuid());
+                utils::make_random_uuid(),
+                query::is_first_page::yes,
+                query::max_result_size(1024 * 1024),
+                0);
 
         // Should save the querier in cache.
         db.query_mutations(s,
                 cmd1,
                 query::full_partition_range,
-                db.get_result_memory_limiter().new_mutation_read(1024 * 1024).get0(),
                 nullptr,
                 db::no_timeout).get();
 
-        auto& semaphore = cf.read_concurrency_semaphore();
+        auto& semaphore = db.get_reader_concurrency_semaphore();
 
         BOOST_CHECK_EQUAL(db.get_querier_cache_stats().resource_based_evictions, 0);
 
         // Drain all resources of the semaphore
-        std::vector<reader_permit> permits;
-        const auto resources = semaphore.available_resources();
-        permits.reserve(resources.count);
-        const auto per_permit_memory  = resources.memory / resources.count;
-
-        for (int i = 0; i < resources.count; ++i) {
-            permits.emplace_back(semaphore.wait_admission(per_permit_memory, db::no_timeout).get0());
-        }
-
-        BOOST_CHECK_EQUAL(semaphore.available_resources().count, 0);
-        BOOST_CHECK(semaphore.available_resources().memory < per_permit_memory);
+        const auto available_resources = semaphore.available_resources();
+        semaphore.consume(available_resources);
+        auto release_resources = defer([&semaphore, available_resources] {
+            semaphore.signal(available_resources);
+        });
 
         auto cmd2 = query::read_command(s->id(),
                 s->version(),
-                s->full_slice(),
+                slice,
                 1,
                 gc_clock::now(),
                 std::nullopt,
                 1,
-                utils::make_random_uuid());
+                utils::make_random_uuid(),
+                query::is_first_page::no,
+                query::max_result_size(1024 * 1024),
+                0);
 
         // Should evict the already cached querier.
         db.query_mutations(s,
                 cmd2,
                 query::full_partition_range,
-                db.get_result_memory_limiter().new_mutation_read(1024 * 1024).get0(),
                 nullptr,
                 db::no_timeout).get();
 
@@ -716,12 +709,12 @@ SEASTAR_THREAD_TEST_CASE(test_resources_based_cache_eviction) {
         // as that sadly leads to use-after-free as the database's
         // resource_concurrency_semaphore will be destroyed before some
         // of the tracked buffers.
-        cmd2.row_limit = query::max_rows;
+        cmd2.set_row_limit(query::max_rows);
         cmd2.partition_limit = query::max_partitions;
+        cmd2.max_result_size.emplace(query::result_memory_limiter::unlimited_result_size);
         db.query_mutations(s,
                 cmd2,
                 query::full_partition_range,
-                db.get_result_memory_limiter().new_mutation_read(1024 * 1024 * 1024 * 1024).get0(),
                 nullptr,
                 db::no_timeout).get();
         return make_ready_future<>();
@@ -747,12 +740,16 @@ SEASTAR_THREAD_TEST_CASE(test_immediate_evict_on_insert) {
     test_querier_cache t;
 
     auto& sem = t.get_semaphore();
+    auto permit1 = sem.make_permit(t.get_schema().get(), get_name());
+    auto permit2 = sem.make_permit(t.get_schema().get(), get_name());
 
-    auto permit1 = sem.consume_resources(reader_concurrency_semaphore::resources(sem.available_resources().count, 0));
+    permit1.wait_admission(0, db::no_timeout).get();
+
+    auto resources = permit1.consume_resources(reader_resources(sem.available_resources().count, 0));
 
     BOOST_CHECK_EQUAL(sem.available_resources().count, 0);
 
-    auto permit2_fut = sem.wait_admission(1, db::no_timeout);
+    auto fut = permit2.wait_admission(1, db::no_timeout);
 
     BOOST_CHECK_EQUAL(sem.waiters(), 1);
 
@@ -762,7 +759,31 @@ SEASTAR_THREAD_TEST_CASE(test_immediate_evict_on_insert) {
         .no_drops()
         .resource_based_evictions();
 
-    permit1.release();
+    resources.reset();
 
-    permit2_fut.get();
+    fut.get();
+}
+
+namespace {
+
+class inactive_read : public reader_concurrency_semaphore::inactive_read {
+public:
+    virtual void evict() override {
+    }
+};
+
+}
+
+SEASTAR_THREAD_TEST_CASE(test_unique_inactive_read_handle) {
+    reader_concurrency_semaphore sem1(reader_concurrency_semaphore::no_limits{}, "sem1");
+    reader_concurrency_semaphore sem2(reader_concurrency_semaphore::no_limits{}, ""); // to see the message for an unnamed semaphore
+
+    auto sem1_h1 = sem1.register_inactive_read(std::make_unique<inactive_read>());
+    auto sem2_h1 = sem2.register_inactive_read(std::make_unique<inactive_read>());
+
+    // Sanity check that lookup still works with empty handle.
+    BOOST_REQUIRE(!sem1.unregister_inactive_read(reader_concurrency_semaphore::inactive_read_handle{}));
+
+    BOOST_REQUIRE_THROW(sem1.unregister_inactive_read(std::move(sem2_h1)), std::runtime_error);
+    BOOST_REQUIRE_THROW(sem2.unregister_inactive_read(std::move(sem1_h1)), std::runtime_error);
 }

@@ -49,6 +49,7 @@
 #include "service/priority_manager.hh"
 #include "db/extensions.hh"
 #include "utils/fragmented_temporary_buffer.hh"
+#include "validation.hh"
 
 static logging::logger rlogger("commitlog_replayer");
 
@@ -179,7 +180,7 @@ future<> db::commitlog_replayer::impl::init() {
         // have data for it, assume we must set global pos to zero.
         for (auto&p : _db.local().get_column_families()) {
             for (auto&p1 : _rpm) { // for each shard
-                if (!p1.second.count(p.first)) {
+                if (!p1.second.contains(p.first)) {
                     _min_pos[p1.first] = replay_position();
                 }
             }
@@ -229,7 +230,8 @@ db::commitlog_replayer::impl::recover(sstring file, const sstring& fname_prefix)
 }
 
 future<> db::commitlog_replayer::impl::process(stats* s, commitlog::buffer_and_replay_position buf_rp) const {
-    auto&& [buf, rp] = buf_rp;
+    auto&& buf = buf_rp.buffer;
+    auto&& rp = buf_rp.position;
     try {
 
         commitlog_entry_reader cer(buf);
@@ -273,6 +275,10 @@ future<> db::commitlog_replayer::impl::process(stats* s, commitlog::buffer_and_r
                 rlogger.debug("replaying at {} v={} {}:{} at {}", fm.column_family_id(), fm.schema_version(),
                         cf.schema()->ks_name(), cf.schema()->cf_name(), rp);
             }
+            if (const auto err = validation::is_cql_key_invalid(*cf.schema(), fm.key()); err) {
+                throw std::runtime_error(fmt::format("found entry with invalid key {} at {} v={} {}:{} at {}: {}.", fm.key(), fm.column_family_id(),
+                        fm.schema_version(), cf.schema()->ks_name(), cf.schema()->cf_name(), rp, *err));
+            }
             // Removed forwarding "new" RP. Instead give none/empty.
             // This is what origin does, and it should be fine.
             // The end result should be that once sstables are flushed out
@@ -280,15 +286,12 @@ future<> db::commitlog_replayer::impl::process(stats* s, commitlog::buffer_and_r
             // lower than anything the new session will produce.
             if (cf.schema()->version() != fm.schema_version()) {
                 auto& local_cm = _column_mappings.local().map;
-                auto cm_it = local_cm.find(fm.schema_version());
-                if (cm_it == local_cm.end()) {
-                    cm_it = local_cm.emplace(fm.schema_version(), src_cm).first;
-                }
+                auto cm_it = local_cm.try_emplace(fm.schema_version(), src_cm).first;
                 const column_mapping& cm = cm_it->second;
                 mutation m(cf.schema(), fm.decorated_key(*cf.schema()));
                 converting_mutation_partition_applier v(cm, *cf.schema(), m.partition());
                 fm.partition().accept(cm, v);
-                return do_with(std::move(m), [&db, &cf] (mutation m) {
+                return do_with(std::move(m), [&db, &cf] (const mutation& m) {
                     return db.apply_in_memory(m, cf, db::rp_handle(), db::no_timeout);
                 });
             } else {

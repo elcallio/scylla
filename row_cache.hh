@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -31,21 +20,21 @@
 
 #include "mutation_reader.hh"
 #include "mutation_partition.hh"
-#include "utils/logalloc.hh"
 #include "utils/phased_barrier.hh"
 #include "utils/histogram.hh"
 #include "partition_version.hh"
 #include "utils/estimated_histogram.hh"
 #include "tracing/trace_state.hh"
 #include <seastar/core/metrics_registration.hh>
-#include "flat_mutation_reader.hh"
 #include "mutation_cleaner.hh"
+#include "utils/double-decker.hh"
 
 namespace bi = boost::intrusive;
 
 class row_cache;
 class memtable_entry;
 class cache_tracker;
+class flat_mutation_reader;
 
 namespace cache {
 
@@ -61,11 +50,6 @@ class lsa_manager;
 //
 // TODO: Make memtables use this format too.
 class cache_entry {
-    // We need auto_unlink<> option on the _cache_link because when entry is
-    // evicted from cache via LRU we don't have a reference to the container
-    // and don't want to store it with each entry.
-    using cache_link_type = bi::set_member_hook<bi::link_mode<bi::auto_unlink>>;
-
     schema_ptr _schema;
     dht::decorated_key _key;
     partition_entry _pe;
@@ -73,8 +57,10 @@ class cache_entry {
     struct {
         bool _continuous : 1;
         bool _dummy_entry : 1;
+        bool _head : 1;
+        bool _tail : 1;
+        bool _train : 1;
     } _flags{};
-    cache_link_type _cache_link;
     friend class size_calculator;
 
     flat_mutation_reader do_read(row_cache&, cache::read_context& reader);
@@ -82,8 +68,14 @@ public:
     friend class row_cache;
     friend class cache_tracker;
 
+    bool is_head() const noexcept { return _flags._head; }
+    void set_head(bool v) noexcept { _flags._head = v; }
+    bool is_tail() const noexcept { return _flags._tail; }
+    void set_tail(bool v) noexcept { _flags._tail = v; }
+    bool with_train() const noexcept { return _flags._train; }
+    void set_train(bool v) noexcept { _flags._train = v; }
+
     struct dummy_entry_tag{};
-    struct incomplete_tag{};
     struct evictable_tag{};
 
     cache_entry(dummy_entry_tag)
@@ -91,11 +83,6 @@ public:
     {
         _flags._dummy_entry = true;
     }
-
-    // Creates an entry which is fully discontinuous, except for the partition tombstone.
-    cache_entry(incomplete_tag, schema_ptr s, const dht::decorated_key& key, tombstone t)
-        : cache_entry(s, key, mutation_partition::make_incomplete(*s, t))
-    { }
 
     cache_entry(schema_ptr s, const dht::decorated_key& key, const mutation_partition& p)
         : _schema(std::move(s))
@@ -130,55 +117,26 @@ public:
     // The caller is still responsible for unlinking and destroying this entry.
     void evict(cache_tracker&) noexcept;
 
-    const dht::decorated_key& key() const { return _key; }
-    dht::ring_position_view position() const {
+    const dht::decorated_key& key() const noexcept { return _key; }
+    dht::ring_position_view position() const noexcept {
         if (is_dummy_entry()) {
             return dht::ring_position_view::max();
         }
         return _key;
     }
-    const partition_entry& partition() const { return _pe; }
+
+    friend dht::ring_position_view ring_position_view_to_compare(const cache_entry& ce) noexcept { return ce.position(); }
+
+    const partition_entry& partition() const noexcept { return _pe; }
     partition_entry& partition() { return _pe; }
-    const schema_ptr& schema() const { return _schema; }
-    schema_ptr& schema() { return _schema; }
+    const schema_ptr& schema() const noexcept { return _schema; }
+    schema_ptr& schema() noexcept { return _schema; }
     flat_mutation_reader read(row_cache&, cache::read_context&);
     flat_mutation_reader read(row_cache&, cache::read_context&, utils::phased_barrier::phase_type);
-    bool continuous() const { return _flags._continuous; }
-    void set_continuous(bool value) { _flags._continuous = value; }
+    bool continuous() const noexcept { return _flags._continuous; }
+    void set_continuous(bool value) noexcept { _flags._continuous = value; }
 
-    bool is_dummy_entry() const { return _flags._dummy_entry; }
-
-    struct compare {
-        dht::ring_position_less_comparator _c;
-
-        compare(schema_ptr s)
-            : _c(*s)
-        {}
-
-        bool operator()(const dht::decorated_key& k1, const cache_entry& k2) const {
-            return _c(k1, k2.position());
-        }
-
-        bool operator()(dht::ring_position_view k1, const cache_entry& k2) const {
-            return _c(k1, k2.position());
-        }
-
-        bool operator()(const cache_entry& k1, const cache_entry& k2) const {
-            return _c(k1.position(), k2.position());
-        }
-
-        bool operator()(const cache_entry& k1, const dht::decorated_key& k2) const {
-            return _c(k1.position(), k2);
-        }
-
-        bool operator()(const cache_entry& k1, dht::ring_position_view k2) const {
-            return _c(k1.position(), k2);
-        }
-
-        bool operator()(dht::ring_position_view k1, dht::ring_position_view k2) const {
-            return _c(k1, k2);
-        }
-    };
+    bool is_dummy_entry() const noexcept { return _flags._dummy_entry; }
 
     friend std::ostream& operator<<(std::ostream&, cache_entry&);
 };
@@ -186,10 +144,7 @@ public:
 // Tracks accesses and performs eviction of cache entries.
 class cache_tracker final {
 public:
-    using lru_type = bi::list<rows_entry,
-        bi::member_hook<rows_entry, rows_entry::lru_link_type, &rows_entry::_lru_link>,
-        bi::constant_time_size<false>>; // we need this to have bi::auto_unlink on hooks.
-public:
+    using lru_type = rows_entry::lru_type;
     friend class row_cache;
     friend class cache::read_context;
     friend class cache::autoupdating_underlying_reader;
@@ -247,29 +202,28 @@ public:
     void insert(partition_version&) noexcept;
     void insert(rows_entry&) noexcept;
     void on_remove(rows_entry&) noexcept;
-    void unlink(rows_entry&) noexcept;
-    void clear_continuity(cache_entry& ce);
-    void on_partition_erase();
-    void on_partition_merge();
-    void on_partition_hit();
-    void on_partition_miss();
-    void on_partition_eviction();
-    void on_row_eviction();
-    void on_row_hit();
-    void on_row_miss();
-    void on_miss_already_populated();
-    void on_mispopulate();
-    void on_row_processed_from_memtable() { ++_stats.rows_processed_from_memtable; }
-    void on_row_dropped_from_memtable() { ++_stats.rows_dropped_from_memtable; }
-    void on_row_merged_from_memtable() { ++_stats.rows_merged_from_memtable; }
-    void pinned_dirty_memory_overload(uint64_t bytes);
-    allocation_strategy& allocator();
-    logalloc::region& region();
-    const logalloc::region& region() const;
-    mutation_cleaner& cleaner() { return _garbage; }
-    mutation_cleaner& memtable_cleaner() { return _memtable_cleaner; }
-    uint64_t partitions() const { return _stats.partitions; }
-    const stats& get_stats() const { return _stats; }
+    void clear_continuity(cache_entry& ce) noexcept;
+    void on_partition_erase() noexcept;
+    void on_partition_merge() noexcept;
+    void on_partition_hit() noexcept;
+    void on_partition_miss() noexcept;
+    void on_partition_eviction() noexcept;
+    void on_row_eviction() noexcept;
+    void on_row_hit() noexcept;
+    void on_row_miss() noexcept;
+    void on_miss_already_populated() noexcept;
+    void on_mispopulate() noexcept;
+    void on_row_processed_from_memtable() noexcept { ++_stats.rows_processed_from_memtable; }
+    void on_row_dropped_from_memtable() noexcept { ++_stats.rows_dropped_from_memtable; }
+    void on_row_merged_from_memtable() noexcept { ++_stats.rows_merged_from_memtable; }
+    void pinned_dirty_memory_overload(uint64_t bytes) noexcept;
+    allocation_strategy& allocator() noexcept;
+    logalloc::region& region() noexcept;
+    const logalloc::region& region() const noexcept;
+    mutation_cleaner& cleaner() noexcept { return _garbage; }
+    mutation_cleaner& memtable_cleaner() noexcept { return _memtable_cleaner; }
+    uint64_t partitions() const noexcept { return _stats.partitions; }
+    const stats& get_stats() const noexcept { return _stats; }
     void set_compaction_scheduling_group(seastar::scheduling_group);
 };
 
@@ -315,10 +269,10 @@ void cache_tracker::insert(partition_entry& pe) noexcept {
 class row_cache final {
 public:
     using phase_type = utils::phased_barrier::phase_type;
-    using partitions_type = bi::set<cache_entry,
-        bi::member_hook<cache_entry, cache_entry::cache_link_type, &cache_entry::_cache_link>,
-        bi::constant_time_size<false>, // we need this to have bi::auto_unlink on hooks
-        bi::compare<cache_entry::compare>>;
+    using partitions_type = double_decker<int64_t, cache_entry,
+                            dht::raw_token_less_comparator, dht::ring_position_comparator,
+                            16, bplus::key_search::linear>;
+    static_assert(bplus::SimpleLessCompare<int64_t, dht::raw_token_less_comparator>);
     friend class cache::autoupdating_underlying_reader;
     friend class single_partition_populating_reader;
     friend class cache_entry;
@@ -333,7 +287,33 @@ public:
     // All invocations of external_updater on given cache instance are serialized internally.
     // Must have strong exception guarantees. If throws, the underlying mutation source
     // must be left in the state in which it was before the call.
-    using external_updater = seastar::noncopyable_function<void()>;
+    class external_updater_impl {
+    public:
+        virtual ~external_updater_impl() {}
+        virtual future<> prepare() { return make_ready_future<>(); }
+        // FIXME: make execute() noexcept, that will require every updater to make execution exception safe,
+        // also change function signature.
+        virtual void execute() = 0;
+    };
+
+    class external_updater {
+        class non_prepared : public external_updater_impl {
+            using Func = seastar::noncopyable_function<void()>;
+            Func _func;
+        public:
+            explicit non_prepared(Func func) : _func(std::move(func)) {}
+            virtual void execute() override {
+                _func();
+            }
+        };
+        std::unique_ptr<external_updater_impl> _impl;
+    public:
+        external_updater(seastar::noncopyable_function<void()> f) : _impl(std::make_unique<non_prepared>(std::move(f))) {}
+        external_updater(std::unique_ptr<external_updater_impl> impl) : _impl(std::move(impl)) {}
+
+        future<> prepare() { return _impl->prepare(); }
+        void execute() { _impl->execute(); }
+    };
 public:
     struct stats {
         utils::timed_rate_moving_average hits;
@@ -398,7 +378,6 @@ private:
     void on_mispopulate();
     void upgrade_entry(cache_entry&);
     void invalidate_locked(const dht::decorated_key&);
-    void invalidate_unwrapped(const dht::partition_range&);
     void clear_now() noexcept;
 
     struct previous_entry_pointer {
@@ -411,11 +390,10 @@ private:
     };
 
     template<typename CreateEntry, typename VisitEntry>
-    //requires requires(CreateEntry create, VisitEntry visit, partitions_type::iterator it) {
-    //        { create(it) } -> partitions_type::iterator;
-    //        { visit(it) } -> void;
-    //    }
-    //
+    requires requires(CreateEntry create, VisitEntry visit, partitions_type::iterator it, partitions_type::bound_hint hint) {
+        { create(it, hint) } -> std::same_as<partitions_type::iterator>;
+        { visit(it) } -> std::same_as<void>;
+    }
     // Must be run under reclaim lock
     cache_entry& do_find_or_create_entry(const dht::decorated_key& key, const previous_entry_pointer* previous,
                                  CreateEntry&& create_entry, VisitEntry&& visit_entry);
@@ -427,7 +405,11 @@ private:
     // The entry which is returned will have the tombstone applied to it.
     //
     // Must be run under reclaim lock
-    cache_entry& find_or_create(const dht::decorated_key& key, tombstone t, row_cache::phase_type phase, const previous_entry_pointer* previous = nullptr);
+    cache_entry& find_or_create_incomplete(const partition_start& ps, row_cache::phase_type phase, const previous_entry_pointer* previous = nullptr);
+
+    // Creates (or touches) a cache entry for missing partition so that sstables are not
+    // poked again for it.
+    cache_entry& find_or_create_missing(const dht::decorated_key& key);
 
     partitions_type::iterator partitions_end() {
         return std::prev(_partitions.end());
@@ -491,6 +473,7 @@ public:
     // as long as the reader is used.
     // The range must not wrap around.
     flat_mutation_reader make_reader(schema_ptr,
+                                     reader_permit permit,
                                      const dht::partition_range&,
                                      const query::partition_slice&,
                                      const io_priority_class& = default_priority_class(),
@@ -498,9 +481,9 @@ public:
                                      streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                      mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no);
 
-    flat_mutation_reader make_reader(schema_ptr s, const dht::partition_range& range = query::full_partition_range) {
+    flat_mutation_reader make_reader(schema_ptr s, reader_permit permit, const dht::partition_range& range = query::full_partition_range) {
         auto& full_slice = s->full_slice();
-        return make_reader(std::move(s), range, full_slice);
+        return make_reader(std::move(s), std::move(permit), range, full_slice);
     }
 
     const stats& stats() const { return _stats; }
@@ -509,6 +492,10 @@ public:
     // Intended to be used only in tests.
     // Can only be called prior to any reads.
     void populate(const mutation& m, const previous_entry_pointer* previous = nullptr);
+
+    // Finds the entry in cache for a given key.
+    // Intended to be used only in tests.
+    cache_entry& lookup(const dht::decorated_key& key);
 
     // Synchronizes cache with the underlying data source from a memtable which
     // has just been flushed to the underlying data source.
@@ -557,9 +544,6 @@ public:
     // If it did, use invalidate() instead.
     void evict();
 
-    size_t partitions() const {
-        return _partitions.size();
-    }
     const cache_tracker& get_cache_tracker() const {
         return _tracker;
     }

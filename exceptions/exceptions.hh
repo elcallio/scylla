@@ -57,10 +57,6 @@ enum class exception_code : int32_t {
     WRITE_FAILURE   = 0x1500,
     CDC_WRITE_FAILURE = 0x1600,
 
-    // Scylla-specific codes
-    // Allocated backwards from 0x1aff-0x1a01 to minimize the chance of collision with Cassandra.
-    OVERFLOW_ERROR  = 0x1aff,
-
     // 2xx: problem validating the request
     SYNTAX_ERROR    = 0x2000,
     UNAUTHORIZED    = 0x2100,
@@ -69,6 +65,8 @@ enum class exception_code : int32_t {
     ALREADY_EXISTS  = 0x2400,
     UNPREPARED      = 0x2500
 };
+
+const std::unordered_map<exception_code, sstring>& exception_map();
 
 class cassandra_exception : public std::exception {
 private:
@@ -186,6 +184,14 @@ protected:
         , failures{failures_}
         , block_for{block_for_}
     {}
+
+    request_failure_exception(exception_code code, const sstring& msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_) noexcept
+        : cassandra_exception{code, msg}
+        , consistency{consistency_}
+        , received{received_}
+        , failures{failures_}
+        , block_for{block_for_}
+    {}
 };
 
 struct mutation_write_failure_exception : public request_failure_exception {
@@ -203,17 +209,18 @@ struct read_failure_exception : public request_failure_exception {
         : request_failure_exception{exception_code::READ_FAILURE, ks, cf, consistency_, received_, failures_, block_for_}
         , data_present{data_present_}
     { }
-};
 
-class overflow_error_exception: public cassandra_exception {
-public:
-    overflow_error_exception(sstring msg) noexcept
-        : cassandra_exception(exception_code::OVERFLOW_ERROR, std::move(msg)) {}
+    read_failure_exception(const sstring& msg, db::consistency_level consistency_, int32_t received_, int32_t failures_, int32_t block_for_, bool data_present_) noexcept
+        : request_failure_exception{exception_code::READ_FAILURE, msg, consistency_, received_, failures_, block_for_}
+        , data_present{data_present_}
+    { }
 };
 
 struct overloaded_exception : public cassandra_exception {
-    overloaded_exception(size_t c) noexcept :
+    explicit overloaded_exception(size_t c) noexcept :
         cassandra_exception(exception_code::OVERLOADED, prepare_message("Too many in flight hints: %lu", c)) {}
+    explicit overloaded_exception(sstring msg) noexcept :
+        cassandra_exception(exception_code::OVERLOADED, std::move(msg)) {}
 };
 
 class request_validation_exception : public cassandra_exception {
@@ -253,6 +260,13 @@ class keyspace_not_defined_exception : public invalid_request_exception {
 public:
     keyspace_not_defined_exception(std::string cause) noexcept
         : invalid_request_exception(std::move(cause))
+    { }
+};
+
+class overflow_error_exception : public invalid_request_exception {
+public:
+    overflow_error_exception(std::string msg) noexcept
+        : invalid_request_exception(std::move(msg))
     { }
 };
 

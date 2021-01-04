@@ -25,18 +25,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -58,27 +47,23 @@
 #include "utils/estimated_histogram.hh"
 #include "tracing/trace_state.hh"
 #include <seastar/core/metrics.hh>
-#include "frozen_mutation.hh"
 #include "storage_proxy_stats.hh"
 #include "cache_temperature.hh"
-#include "mutation_query.hh"
 #include "service_permit.hh"
-#include "service/paxos/proposal.hh"
 #include "service/client_state.hh"
-#include "service/paxos/prepare_summary.hh"
 #include "cdc/stats.hh"
+#include "locator/token_metadata.hh"
+#include "db/hints/host_filter.hh"
+#include "db/config.hh"
 
+class reconcilable_result;
+class frozen_mutation_and_schema;
+class frozen_mutation;
 
 namespace seastar::rpc {
 
 template <typename... T>
 class tuple;
-
-}
-
-namespace locator {
-
-class token_metadata;
 
 }
 
@@ -94,11 +79,17 @@ namespace cdc {
 
 namespace service {
 
+namespace paxos {
+    class prepare_summary;
+    class proposal;
+}
+
 class abstract_write_response_handler;
 class paxos_response_handler;
 class abstract_read_executor;
 class mutation_holder;
 class view_update_write_response_handler;
+struct hint_wrapper;
 
 using replicas_per_token_range = std::unordered_map<dht::token_range, std::vector<utils::UUID>>;
 
@@ -112,15 +103,6 @@ struct view_update_backlog_timestamped {
     api::timestamp_type ts;
 };
 
-// A helper structure for differentiating hints from mutations in overload resolution
-struct hint_wrapper {
-    mutation mut;
-};
-
-inline std::ostream& operator<<(std::ostream& os, const hint_wrapper& h) {
-    return os << "hint_wrapper{" << h.mut << "}";
-}
-
 struct allow_hints_tag {};
 using allow_hints = bool_class<allow_hints_tag>;
 
@@ -130,10 +112,10 @@ class query_ranges_to_vnodes_generator {
     dht::partition_range_vector _ranges;
     dht::partition_range_vector::iterator _i; // iterator to current range in _ranges
     bool _local;
-    locator::token_metadata& _tm;
+    const locator::token_metadata_ptr _tmptr;
     void process_one_range(size_t n, dht::partition_range_vector& ranges);
 public:
-    query_ranges_to_vnodes_generator(locator::token_metadata& tm, schema_ptr s, dht::partition_range_vector ranges, bool local = false);
+    query_ranges_to_vnodes_generator(const locator::token_metadata_ptr tmptr, schema_ptr s, dht::partition_range_vector ranges, bool local = false);
     query_ranges_to_vnodes_generator(const query_ranges_to_vnodes_generator&) = delete;
     query_ranges_to_vnodes_generator(query_ranges_to_vnodes_generator&&) = default;
     // generate next 'n' vnodes, may return less than requested number of ranges
@@ -145,26 +127,34 @@ public:
 };
 
 // An instance of this class is passed as an argument to storage_proxy::cas().
-// The apply() method, which must be defined by the implementation, is supposed
-// to apply update operations to the rows fetched from the database and return
-// mutations corresponding to the update. If the update is impossible, because
-// the fetched rows doesn't match the values expected by the request, it must
-// return an empty optional object, which will signal cas() to return immediately.
+// The apply() method, which must be defined by the implementation. It can
+// either return a mutation that will be used as a value for paxos 'propose'
+// stage or it can return an empty option in which case an empty mutation will
+// be used
 class cas_request {
 public:
     virtual ~cas_request() = default;
-    virtual std::optional<mutation> apply(query::result& qr,
+    // it is safe to dereference and use the qr foreign pointer, the result was
+    // created by a foreign shard but no longer used by it.
+    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
             const query::partition_slice& slice, api::timestamp_type ts) = 0;
 };
 
 class storage_proxy : public seastar::async_sharded_service<storage_proxy>, public peering_sharded_service<storage_proxy>, public service::endpoint_lifecycle_subscriber  {
 public:
+    enum class error : uint8_t {
+        NONE,
+        TIMEOUT,
+        FAILURE,
+    };
     using clock_type = lowres_clock;
     struct config {
-        std::optional<std::vector<sstring>> hinted_handoff_enabled = {};
+        db::config::hinted_handoff_enabled_type hinted_handoff_enabled = {};
+        db::hints::directory_initializer hints_directory_initializer;
         size_t available_memory;
         smp_service_group read_smp_service_group = default_smp_service_group();
         smp_service_group write_smp_service_group = default_smp_service_group();
+        smp_service_group hints_write_smp_service_group = default_smp_service_group();
         // Write acknowledgments might not be received on the correct shard, and
         // they need a separate smp_service_group to prevent an ABBA deadlock
         // with writes.
@@ -247,14 +237,16 @@ public:
 
     const gms::feature_service& features() const { return _features; }
 
-    const locator::token_metadata& get_token_metadata() const { return _token_metadata; }
-    locator::token_metadata& get_token_metadata() { return _token_metadata; }
+    locator::token_metadata_ptr get_token_metadata_ptr() const noexcept;
+
+    query::max_result_size get_max_result_size(const query::partition_slice& slice) const;
 
 private:
     distributed<database>& _db;
-    locator::token_metadata& _token_metadata;
+    const locator::shared_token_metadata& _shared_token_metadata;
     smp_service_group _read_smp_service_group;
     smp_service_group _write_smp_service_group;
+    smp_service_group _hints_write_smp_service_group;
     smp_service_group _write_ack_smp_service_group;
     response_id_type _next_response_id;
     response_handlers_map _response_handlers;
@@ -267,11 +259,13 @@ private:
     // just skip an entry if request no longer exists.
     circular_buffer<response_id_type> _throttled_writes;
     db::hints::resource_manager _hints_resource_manager;
-    std::optional<db::hints::manager> _hints_manager;
+    db::hints::manager _hints_manager;
+    db::hints::directory_initializer _hints_directory_initializer;
     db::hints::manager _hints_for_views_manager;
     scheduling_group_key _stats_key;
     storage_proxy_stats::global_stats _global_stats;
     gms::feature_service& _features;
+    netw::messaging_service& _messaging;
     static constexpr float CONCURRENT_SUBREQUESTS_MARGIN = 0.10;
     // for read repair chance calculation
     std::default_random_engine _urandom;
@@ -295,10 +289,24 @@ private:
     class view_update_handlers_list;
     std::unique_ptr<view_update_handlers_list> _view_update_handlers_list;
 
+    /* This is a pointer to the shard-local part of the sharded cdc_service:
+     * storage_proxy needs access to cdc_service to augument mutations.
+     *
+     * It is a pointer and not a reference since cdc_service must be initialized after storage_proxy,
+     * because it uses storage_proxy to perform pre-image queries, for one thing.
+     * Therefore, at the moment of initializing storage_proxy, we don't have access to cdc_service yet.
+     *
+     * Furthermore, storage_proxy must keep the service object alive while augmenting mutations
+     * (storage_proxy is never deintialized, and even if it would be, it would be after deinitializing cdc_service).
+     * Thus cdc_service inherits from enable_shared_from_this and storage_proxy code must remember to call
+     * shared_from_this().
+     *
+     * Eventual deinitialization of cdc_service is enabled by cdc_service::stop setting this pointer to nullptr.
+     */
     cdc::cdc_service* _cdc = nullptr;
+
     cdc_stats _cdc_stats;
 private:
-    future<> uninit_messaging_service();
     future<coordinator_query_result> query_singular(lw_shared_ptr<query::read_command> cmd,
             dht::partition_range_vector&& partition_ranges,
             db::consistency_level cl,
@@ -307,7 +315,7 @@ private:
     void remove_response_handler(response_id_type id);
     void remove_response_handler_entry(response_handlers_map::iterator entry);
     void got_response(response_id_type id, gms::inet_address from, std::optional<db::view::update_backlog> backlog);
-    void got_failure_response(response_id_type id, gms::inet_address from, size_t count, std::optional<db::view::update_backlog> backlog);
+    void got_failure_response(response_id_type id, gms::inet_address from, size_t count, std::optional<db::view::update_backlog> backlog, error err);
     future<> response_wait(response_id_type id, clock_type::time_point timeout);
     ::shared_ptr<abstract_write_response_handler>& get_write_response_handler(storage_proxy::response_id_type id);
     response_id_type create_write_response_handler_helper(schema_ptr s, const dht::token& token,
@@ -318,9 +326,9 @@ private:
     response_id_type create_write_response_handler(const mutation&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit);
     response_id_type create_write_response_handler(const hint_wrapper&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit);
     response_id_type create_write_response_handler(const std::unordered_map<gms::inet_address, std::optional<mutation>>&, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit);
-    response_id_type create_write_response_handler(const std::tuple<paxos::proposal, schema_ptr, shared_ptr<paxos_response_handler>, dht::token>& proposal,
+    response_id_type create_write_response_handler(const std::tuple<lw_shared_ptr<paxos::proposal>, schema_ptr, shared_ptr<paxos_response_handler>, dht::token>& proposal,
             db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit);
-    response_id_type create_write_response_handler(const std::tuple<paxos::proposal, schema_ptr, dht::token, std::unordered_set<gms::inet_address>>& meta,
+    response_id_type create_write_response_handler(const std::tuple<lw_shared_ptr<paxos::proposal>, schema_ptr, dht::token, std::unordered_set<gms::inet_address>>& meta,
             db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit);
     void register_cdc_operation_result_tracker(const std::vector<storage_proxy::unique_response_handler>& ids, lw_shared_ptr<cdc::operation_result_tracker> tracker);
     void send_to_live_endpoints(response_id_type response_id, clock_type::time_point timeout);
@@ -347,13 +355,11 @@ private:
     future<rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>> query_result_local(schema_ptr, lw_shared_ptr<query::read_command> cmd, const dht::partition_range& pr,
                                                                            query::result_options opts,
                                                                            tracing::trace_state_ptr trace_state,
-                                                                           clock_type::time_point timeout,
-                                                                           uint64_t max_size = query::result_memory_limiter::maximum_result_size);
+                                                                           clock_type::time_point timeout);
     future<rpc::tuple<query::result_digest, api::timestamp_type, cache_temperature>> query_result_local_digest(schema_ptr, lw_shared_ptr<query::read_command> cmd, const dht::partition_range& pr,
                                                                                                    tracing::trace_state_ptr trace_state,
                                                                                                    clock_type::time_point timeout,
-                                                                                                   query::digest_algorithm da,
-                                                                                                   uint64_t max_size  = query::result_memory_limiter::maximum_result_size);
+                                                                                                   query::digest_algorithm da);
     future<coordinator_query_result> query_partition_key_range(lw_shared_ptr<query::read_command> cmd,
             dht::partition_range_vector partition_ranges,
             db::consistency_level cl,
@@ -366,7 +372,7 @@ private:
             query_ranges_to_vnodes_generator&& ranges_to_vnodes,
             int concurrency_factor,
             tracing::trace_state_ptr trace_state,
-            uint32_t remaining_row_count,
+            uint64_t remaining_row_count,
             uint32_t remaining_partition_count,
             replicas_per_token_range preferred_replicas,
             service_permit permit);
@@ -385,7 +391,7 @@ private:
     future<std::vector<unique_response_handler>> mutate_prepare(Range&& mutations, db::consistency_level cl, db::write_type type, service_permit permit, CreateWriteHandler handler);
     template<typename Range>
     future<std::vector<unique_response_handler>> mutate_prepare(Range&& mutations, db::consistency_level cl, db::write_type type, tracing::trace_state_ptr tr_state, service_permit permit);
-    future<> mutate_begin(std::vector<unique_response_handler> ids, db::consistency_level cl, std::optional<clock_type::time_point> timeout_opt = { });
+    future<> mutate_begin(std::vector<unique_response_handler> ids, db::consistency_level cl, tracing::trace_state_ptr trace_state, std::optional<clock_type::time_point> timeout_opt = { });
     future<> mutate_end(future<> mutate_result, utils::latency_counter, write_stats& stats, tracing::trace_state_ptr trace_state);
     future<> schedule_repair(std::unordered_map<dht::token, std::unordered_map<gms::inet_address, std::optional<mutation>>> diffs, db::consistency_level cl, tracing::trace_state_ptr trace_state, service_permit permit);
     bool need_throttle_writes() const;
@@ -395,7 +401,7 @@ private:
     future<> mutate_internal(Range mutations, db::consistency_level cl, bool counter_write, tracing::trace_state_ptr tr_state, service_permit permit, std::optional<clock_type::time_point> timeout_opt = { }, lw_shared_ptr<cdc::operation_result_tracker> cdc_tracker = { });
     future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_nonsingular_mutations_locally(
             schema_ptr s, lw_shared_ptr<query::read_command> cmd, const dht::partition_range_vector&& pr, tracing::trace_state_ptr trace_state,
-            uint64_t max_size, clock_type::time_point timeout);
+            clock_type::time_point timeout);
 
     future<> mutate_counters_on_leader(std::vector<frozen_mutation_and_schema> mutations, db::consistency_level cl, clock_type::time_point timeout,
                                        tracing::trace_state_ptr trace_state, service_permit permit);
@@ -411,6 +417,7 @@ private:
             gms::inet_address target,
             std::vector<gms::inet_address> pending_endpoints,
             db::write_type type,
+            tracing::trace_state_ptr tr_state,
             write_stats& stats,
             allow_hints allow_hints = allow_hints::yes);
 
@@ -422,15 +429,23 @@ private:
 
     template<typename Range>
     future<> mutate_counters(Range&& mutations, db::consistency_level cl, tracing::trace_state_ptr tr_state, service_permit permit, clock_type::time_point timeout);
+
+    void retire_view_response_handlers(noncopyable_function<bool(const abstract_write_response_handler&)> filter_fun);
 public:
     storage_proxy(distributed<database>& db, config cfg, db::view::node_update_backlog& max_view_update_backlog,
-            scheduling_group_key stats_key, gms::feature_service& feat, locator::token_metadata& tokens);
+            scheduling_group_key stats_key, gms::feature_service& feat, const locator::shared_token_metadata& stm, netw::messaging_service& ms);
     ~storage_proxy();
     const distributed<database>& get_db() const {
         return _db;
     }
     distributed<database>& get_db() {
         return _db;
+    }
+    const database& local_db() const noexcept {
+        return _db.local();
+    }
+    database& local_db() noexcept {
+        return _db.local();
     }
 
     void set_cdc_service(cdc::cdc_service* cdc) {
@@ -452,19 +467,36 @@ public:
         return next;
     }
     void init_messaging_service();
+    future<> uninit_messaging_service();
 
+private:
     // Applies mutation on this node.
     // Resolves with timed_out_error when timeout is reached.
-    future<> mutate_locally(const mutation& m, clock_type::time_point timeout = clock_type::time_point::max());
+    future<> mutate_locally(const mutation& m, tracing::trace_state_ptr tr_state, db::commitlog::force_sync sync, clock_type::time_point timeout, smp_service_group smp_grp);
     // Applies mutation on this node.
     // Resolves with timed_out_error when timeout is reached.
-    future<> mutate_locally(const schema_ptr&, const frozen_mutation& m, db::commitlog::force_sync sync, clock_type::time_point timeout = clock_type::time_point::max());
+    future<> mutate_locally(const schema_ptr&, const frozen_mutation& m, tracing::trace_state_ptr tr_state, db::commitlog::force_sync sync, clock_type::time_point timeout,
+            smp_service_group smp_grp);
     // Applies mutations on this node.
     // Resolves with timed_out_error when timeout is reached.
-    future<> mutate_locally(std::vector<mutation> mutation, clock_type::time_point timeout = clock_type::time_point::max());
+    future<> mutate_locally(std::vector<mutation> mutation, tracing::trace_state_ptr tr_state, clock_type::time_point timeout, smp_service_group smp_grp);
 
-    future<> mutate_hint(const schema_ptr&, const frozen_mutation& m, clock_type::time_point timeout = clock_type::time_point::max());
-    future<> mutate_streaming_mutation(const schema_ptr&, utils::UUID plan_id, const frozen_mutation& m, bool fragmented);
+public:
+    // Applies mutation on this node.
+    // Resolves with timed_out_error when timeout is reached.
+    future<> mutate_locally(const mutation& m, tracing::trace_state_ptr tr_state, db::commitlog::force_sync sync, clock_type::time_point timeout = clock_type::time_point::max()) {
+        return mutate_locally(m, tr_state, sync, timeout, _write_smp_service_group);
+    }
+    // Applies mutation on this node.
+    // Resolves with timed_out_error when timeout is reached.
+    future<> mutate_locally(const schema_ptr& s, const frozen_mutation& m, tracing::trace_state_ptr tr_state, db::commitlog::force_sync sync, clock_type::time_point timeout = clock_type::time_point::max()) {
+        return mutate_locally(s, m, tr_state, sync, timeout, _write_smp_service_group);
+    }
+    // Applies mutations on this node.
+    // Resolves with timed_out_error when timeout is reached.
+    future<> mutate_locally(std::vector<mutation> mutation, tracing::trace_state_ptr tr_state, clock_type::time_point timeout = clock_type::time_point::max());
+
+    future<> mutate_hint(const schema_ptr&, const frozen_mutation& m, tracing::trace_state_ptr tr_state, clock_type::time_point timeout = clock_type::time_point::max());
 
     /**
     * Use this method to have these Mutations applied
@@ -505,8 +537,10 @@ public:
     // Inspired by Cassandra's StorageProxy.sendToHintedEndpoints but without
     // hinted handoff support, and just one target. See also
     // send_to_live_endpoints() - another take on the same original function.
-    future<> send_to_endpoint(frozen_mutation_and_schema fm_a_s, gms::inet_address target, std::vector<gms::inet_address> pending_endpoints, db::write_type type, write_stats& stats, allow_hints allow_hints = allow_hints::yes);
-    future<> send_to_endpoint(frozen_mutation_and_schema fm_a_s, gms::inet_address target, std::vector<gms::inet_address> pending_endpoints, db::write_type type, allow_hints allow_hints = allow_hints::yes);
+    future<> send_to_endpoint(frozen_mutation_and_schema fm_a_s, gms::inet_address target, std::vector<gms::inet_address> pending_endpoints, db::write_type type,
+            tracing::trace_state_ptr tr_state, write_stats& stats, allow_hints allow_hints = allow_hints::yes);
+    future<> send_to_endpoint(frozen_mutation_and_schema fm_a_s, gms::inet_address target, std::vector<gms::inet_address> pending_endpoints, db::write_type type,
+            tracing::trace_state_ptr tr_state, allow_hints allow_hints = allow_hints::yes);
 
     // Send a mutation to a specific remote target as a hint.
     // Unlike regular mutations during write operations, hints are sent on the streaming connection
@@ -544,31 +578,31 @@ public:
     future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_mutations_locally(
         schema_ptr, lw_shared_ptr<query::read_command> cmd, const dht::partition_range&,
         clock_type::time_point timeout,
-        tracing::trace_state_ptr trace_state = nullptr,
-        uint64_t max_size = query::result_memory_limiter::maximum_result_size);
+        tracing::trace_state_ptr trace_state = nullptr);
 
 
     future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_mutations_locally(
         schema_ptr, lw_shared_ptr<query::read_command> cmd, const ::compat::one_or_two_partition_ranges&,
         clock_type::time_point timeout,
-        tracing::trace_state_ptr trace_state = nullptr,
-        uint64_t max_size = query::result_memory_limiter::maximum_result_size);
+        tracing::trace_state_ptr trace_state = nullptr);
 
     future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>> query_mutations_locally(
             schema_ptr s, lw_shared_ptr<query::read_command> cmd, const dht::partition_range_vector& pr,
             clock_type::time_point timeout,
-            tracing::trace_state_ptr trace_state = nullptr,
-            uint64_t max_size = query::result_memory_limiter::maximum_result_size);
+            tracing::trace_state_ptr trace_state = nullptr);
 
     future<bool> cas(schema_ptr schema, shared_ptr<cas_request> request, lw_shared_ptr<query::read_command> cmd,
-            dht::partition_range_vector&& partition_ranges, coordinator_query_options query_options,
+            dht::partition_range_vector partition_ranges, coordinator_query_options query_options,
             db::consistency_level cl_for_paxos, db::consistency_level cl_for_learn,
-            clock_type::time_point write_timeout, clock_type::time_point cas_timeout);
+            clock_type::time_point write_timeout, clock_type::time_point cas_timeout, bool write = true);
 
     future<> stop();
     future<> start_hints_manager(shared_ptr<gms::gossiper> gossiper_ptr, shared_ptr<service::storage_service> ss_ptr);
     void allow_replaying_hints() noexcept;
     future<> drain_on_shutdown();
+
+    future<> change_hints_host_filter(db::hints::host_filter new_filter);
+    const db::hints::host_filter& get_hints_host_filter() const;
 
     const stats& get_stats() const {
         return scheduling_group_get_specific<storage_proxy_stats::stats>(_stats_key);
@@ -635,11 +669,6 @@ private:
     db::consistency_level _cl_for_learn;
     // Live endpoints, as per get_paxos_participants()
     std::vector<gms::inet_address> _live_endpoints;
-    // True if there are dead endpoints
-    // We don't include endpoints known to be unavailable in pending
-    // endpoints list, but need to be aware of them to avoid pruning
-    // system.paxos data if some endpoint is missing a Paxos write.
-    bool _has_dead_endpoints;
     // How many endpoints need to respond favourably for the protocol to progress to the next step.
     size_t _required_participants;
     // A deadline when the entire CAS operation timeout expires, derived from write_request_timeout_in_ms
@@ -650,6 +679,8 @@ private:
     dht::decorated_key _key;
     // service permit from admission control
     service_permit _permit;
+    // how many replicas replied to learn
+    uint64_t _learned = 0;
 
     // Unique request id generator.
     static thread_local uint64_t next_id;
@@ -683,9 +714,15 @@ public:
         storage_proxy::paxos_participants pp = _proxy->get_paxos_participants(_schema->ks_name(), _key.token(), _cl_for_paxos);
         _live_endpoints = std::move(pp.endpoints);
         _required_participants = pp.required_participants;
-        _has_dead_endpoints = pp.has_dead_endpoints;
         tracing::trace(tr_state, "Create paxos_response_handler for token {} with live: {} and required participants: {}",
                 _key.token(), _live_endpoints, _required_participants);
+        _proxy->get_stats().cas_foreground++;
+        _proxy->get_stats().cas_total_running++;
+        _proxy->get_stats().cas_total_operations++;
+    }
+
+    ~paxos_response_handler() {
+        _proxy->get_stats().cas_total_running--;
     }
 
     // Result of PREPARE step, i.e. begin_and_repair_paxos().
@@ -699,8 +736,8 @@ public:
     // Steps of the Paxos protocol
     future<ballot_and_data> begin_and_repair_paxos(client_state& cs, unsigned& contentions, bool is_write);
     future<paxos::prepare_summary> prepare_ballot(utils::UUID ballot);
-    future<bool> accept_proposal(const paxos::proposal& proposal, bool timeout_if_partially_accepted = true);
-    future<> learn_decision(paxos::proposal decision, bool allow_hints = false);
+    future<bool> accept_proposal(lw_shared_ptr<paxos::proposal> proposal, bool timeout_if_partially_accepted = true);
+    future<> learn_decision(lw_shared_ptr<paxos::proposal> proposal, bool allow_hints = false);
     void prune(utils::UUID ballot);
     uint64_t id() const {
         return _id;
@@ -708,6 +745,18 @@ public:
     size_t block_for() const {
         return _required_participants;
     }
+    schema_ptr schema() const {
+        return _schema;
+    }
+    const partition_key& key() const {
+        return _key.key();
+    }
+    void set_cl_for_learn(db::consistency_level cl) {
+        _cl_for_learn = cl;
+    }
+    // this is called with an id of a replica that replied to learn request
+    // adn returns true when quorum of such requests are accumulated
+    bool learned(gms::inet_address ep);
 };
 
 extern distributed<storage_proxy> _the_storage_proxy;
@@ -723,8 +772,5 @@ inline storage_proxy& get_local_storage_proxy() {
 inline shared_ptr<storage_proxy> get_local_shared_storage_proxy() {
     return _the_storage_proxy.local_shared();
 }
-
-dht::partition_range_vector get_restricted_ranges(locator::token_metadata&,
-    const schema&, dht::partition_range);
 
 }

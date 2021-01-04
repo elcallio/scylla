@@ -6,18 +6,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -26,7 +15,6 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/util/optimized_optional.hh>
-#include <seastar/util/gcc6-concepts.hh>
 
 #include "shared_sstable.hh"
 #include "row.hh"
@@ -64,9 +52,7 @@ data_consume_rows(const schema&, shared_sstable, typename DataConsumeRowsContext
 // Moreover, the sstable object used for the sstable::data_consume_rows()
 // call which created this data_consume_context, must also be kept alive.
 template <typename DataConsumeRowsContext>
-GCC6_CONCEPT(
-    requires ConsumeRowsContext<DataConsumeRowsContext>()
-)
+requires ConsumeRowsContext<DataConsumeRowsContext>
 class data_consume_context {
     shared_sstable _sst;
     std::unique_ptr<DataConsumeRowsContext> _ctx;
@@ -108,7 +94,7 @@ public:
     }
 
     future<> skip_to(indexable_element el, uint64_t begin) {
-        sstlog.trace("data_consume_rows_context {}: skip_to({} -> {}, el={})", _ctx.get(), _ctx->position(), begin, static_cast<int>(el));
+        sstlog.trace("data_consume_rows_context {}: skip_to({} -> {}, el={})", fmt::ptr(_ctx.get()), _ctx->position(), begin, static_cast<int>(el));
         if (begin <= _ctx->position()) {
             return make_ready_future<>();
         }

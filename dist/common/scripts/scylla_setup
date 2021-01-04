@@ -7,18 +7,7 @@
 #
 # This file is part of Scylla.
 #
-# Scylla is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Scylla is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+# See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
 
 import os
 import sys
@@ -27,7 +16,9 @@ import glob
 import shutil
 import io
 import stat
+import distro
 from scylla_util import *
+from subprocess import run, DEVNULL
 
 interactive = False
 HOUSEKEEPING_TIMEOUT = 60
@@ -58,7 +49,7 @@ def print_non_interactive_suggestion_message(args):
     base_string = "    scylla_setup"
     outlines = [ base_string ]
     for key,value in vars(args).items():
-        if not value:
+        if not value and type(value) != int:
             continue
         x = ' --{}'.format(key.replace('_','-'))
         if type(value) != bool:
@@ -69,7 +60,7 @@ def print_non_interactive_suggestion_message(args):
         outlines[-1] += x
 
     print(' \\\n'.join(outlines))
-    if args.no_io_setup == False:
+    if args.io_setup:
         print('\nAlso, to avoid the time-consuming I/O tuning you can add --no-io-setup and copy the contents of /etc/scylla.d/io*')
         print('Only do that if you are moving the files into machines with the exact same hardware')
 
@@ -88,11 +79,39 @@ def interactive_choose_nic():
             if is_valid_nic(n):
                 return n
 
+def interactive_ask_rsyslog_server():
+    print("Please input rsyslog remote server, use ip:port format.")
+    return input('ip:port> ').strip()
+
+def interactive_choose_swap_directory():
+    print('Please input swapfile directory:')
+    while True:
+        d = input('> ')
+        if not os.path.isdir(d):
+            print('{} is not valid directory, input again')
+        else:
+            return d
+
+def interactive_choose_swap_size():
+    print('Please input swap size in GB:')
+    while True:
+        s = input('> ')
+        try:
+            return int(s)
+        except Exception as e:
+            print(f'"{s}" is not valid number, input again')
+
+pkg_files = {
+        'scylla-jmx': scylladir_p() / 'jmx/scylla-jmx',
+        'scylla-tools': scylladir_p() / 'share/cassandra/bin/cqlsh'
+        }
 def do_verify_package(pkg):
-    if is_debian_variant():
-        res = run('dpkg -s {}'.format(pkg), silent=True, exception=False)
+    if is_offline():
+        res = 0 if pkg_files[pkg].exists() else 1
+    elif is_debian_variant():
+        res = run('dpkg -s {}'.format(pkg), shell=True, stdout=DEVNULL, stderr=DEVNULL).returncode
     elif is_redhat_variant():
-        res = run('rpm -q {}'.format(pkg), silent=True, exception=False)
+        res = run('rpm -q {}'.format(pkg), shell=True, stdout=DEVNULL, stderr=DEVNULL).returncode
     elif is_gentoo_variant():
         res = 0 if len(glob.glob('/var/db/pkg/*/{}-*'.format(pkg))) else 1
     else:
@@ -104,9 +123,9 @@ def do_verify_package(pkg):
 
 def list_block_devices():
     devices = []
-    s = out('lsblk --help')
+    s = run('lsblk --help', shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
     if re.search(r'\s*-p', s, flags=re.MULTILINE):
-        s = out('lsblk -pnr')
+        s = run('lsblk -pnr', shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
         res = re.findall(r'^(\S+) \S+ \S+ \S+ \S+ (\S+)', s, flags=re.MULTILINE)
         for r in res:
             if r[1] != 'rom' and r[1] != 'loop':
@@ -128,13 +147,9 @@ def get_unused_disks():
         unused.append(dev)
     return unused
 
-def swap_exists():
-    swaps = out('swapon --noheadings --raw')
-    return True if swaps != '' else False
-
 def run_setup_script(name, script):
     global interactive
-    res = run('{}/{}'.format(scriptsdir(), script), exception=False)
+    res = run('{}/{}'.format(scriptsdir(), script), shell=True).returncode
     if res != 0:
         if interactive:
             colorprint('{red}{name} setup failed. Press any key to continue...{nocolor}', name=name)
@@ -144,20 +159,70 @@ def run_setup_script(name, script):
             sys.exit(1)
     return res
 
+def warn_offline(setup):
+    colorprint('{red}{setup} is disabled by default, since the installation is offline mode.{nocolor}', setup=setup)
+
+def warn_offline_missing_pkg(setup, pkg):
+    colorprint('{red}{setup} disabled by default, since {pkg} not available.{nocolor}', setup=setup, pkg=pkg)
+
+def current_umask():
+    current = os.umask(0)
+    os.umask(current)
+    return current
+
 if __name__ == '__main__':
     if not is_nonroot() and os.getuid() > 0:
         print('Requires root permission.')
         sys.exit(1)
+
+    default_no_ntp_setup = False
+    default_no_node_exporter = False
+    default_no_kernel_check = False
+    default_no_raid_setup = False
+    default_no_coredump_setup = False
+    default_no_cpuscaling_setup = False
+
+    if is_offline() and not is_nonroot():
+        default_no_ntp_setup = True
+        warn_offline('ntp setup')
+        if not shutil.which('mkfs.xfs'):
+            default_no_kernel_check = True
+            default_no_raid_setup = True
+            warn_offline_missing_pkg('kernel version check', 'xfsprogs')
+            warn_offline_missing_pkg('RAID setup', 'xfsprogs')
+
+        if not default_no_raid_setup and not shutil.which('mdadm'):
+            default_no_raid_setup = True
+            warn_offline_missing_pkg('RAID setup', 'mdadm')
+
+        if not shutil.which('coredumpctl'):
+            default_no_coredump_setup = True
+            warn_offline_missing_pkg('coredump setup', 'systemd-coredump')
+
+        if is_debian_variant() and not shutil.which('cpufreq-set'):
+            default_no_cpuscaling_setup = True
+            warn_offline_missing_pkg('cpuscaling setup', 'cpufrequtils')
+        elif not shutil.which('cpupower'):
+            default_no_cpuscaling_setup = True
+            warn_offline_missing_pkg('cpuscaling setup', 'cpupower')
+
+        print()
+
     parser = argparse.ArgumentParser(description='Configure environment for Scylla.')
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--disks',
                         help='specify disks for RAID')
-    group.add_argument('--no-raid-setup', action='store_true', default=False,
+    group.add_argument('--no-raid-setup', action='store_true',
+                        default=default_no_raid_setup,
                         help='skip raid setup')
     parser.add_argument('--nic',
                         help='specify NIC')
     parser.add_argument('--ntp-domain',
-                        help='specify NTP domain')
+                        help='specify subdomain of pool.ntp.org (ex: centos, fedora or amazon)')
+    parser.add_argument('--swap-directory',
+                        help='specify swapfile directory (ex: /)')
+    parser.add_argument('--swap-size', type=int,
+                        help='specify swapfile size in GB')
     parser.add_argument('--ami', action='store_true', default=False,
                         help='setup AMI instance')
     parser.add_argument('--setup-nic-and-disks', action='store_true', default=False,
@@ -166,7 +231,8 @@ if __name__ == '__main__':
                         help='enable developer mode')
     parser.add_argument('--no-ec2-check', action='store_true', default=False,
                         help='skip EC2 configuration check')
-    parser.add_argument('--no-kernel-check', action='store_true', default=False,
+    parser.add_argument('--no-kernel-check', action='store_true',
+                        default=default_no_kernel_check,
                         help='skip kernel version check')
     parser.add_argument('--no-verify-package', action='store_true', default=False,
                         help='skip verifying packages')
@@ -177,22 +243,36 @@ if __name__ == '__main__':
                             help='skip selinux setup')
     parser.add_argument('--no-bootparam-setup', action='store_true', default=False,
                         help='skip bootparam setup')
-    parser.add_argument('--no-ntp-setup', action='store_true', default=False,
+    parser.add_argument('--no-ntp-setup', action='store_true',
+                        default=default_no_ntp_setup,
                         help='skip ntp setup')
-    parser.add_argument('--no-coredump-setup', action='store_true', default=False,
+    parser.add_argument('--no-coredump-setup', action='store_true',
+                        default=default_no_coredump_setup,
                         help='skip coredump setup')
     parser.add_argument('--no-sysconfig-setup', action='store_true', default=False,
                         help='skip sysconfig setup')
-    parser.add_argument('--no-io-setup', action='store_true', default=False,
+    parser.add_argument('--io-setup', default=1, choices=[0, 1], dest='io_setup', type=int,
+                        help='Run I/O configuration setup (i.e. iotune). Defaults to 1.')
+    parser.add_argument('--no-io-setup', dest='io_setup', action='store_const', const=0,
                         help='skip IO configuration setup')
     parser.add_argument('--no-version-check', action='store_true', default=False,
                         help='skip daily version check')
-    parser.add_argument('--no-node-exporter', action='store_true', default=False,
-                        help='do not install the node exporter')
-    parser.add_argument('--no-cpuscaling-setup', action='store_true', default=False,
+    parser.add_argument('--no-node-exporter', action='store_true',
+                        default=default_no_node_exporter,
+                        help='do not enable the node exporter')
+    parser.add_argument('--no-cpuscaling-setup', action='store_true',
+                        default=default_no_cpuscaling_setup,
                         help='skip cpu scaling setup')
     parser.add_argument('--no-fstrim-setup', action='store_true', default=False,
                         help='skip fstrim setup')
+    parser.add_argument('--no-memory-setup', action='store_true', default=False,
+                        help='skip memory setup')
+    parser.add_argument('--no-swap-setup', action='store_true', default=False,
+                        help='skip swap setup')
+    parser.add_argument('--no-rsyslog-setup', action='store_true', default=False,
+                        help='skip rsyslog setup')
+    parser.add_argument('--rsyslog-server',
+                        help='specify a remote rsyslog server to send Scylla logs to. Use ip:port format, if no port is given, Scylla-Monitoring rsyslog will be used')
     if len(sys.argv) == 1:
         interactive = True
         group.required = False # interactive mode: no option is required.
@@ -215,6 +295,8 @@ if __name__ == '__main__':
     disks = args.disks
     nic = args.nic
     set_nic_and_disks = args.setup_nic_and_disks
+    swap_directory = args.swap_directory
+    swap_size = args.swap_size
     ec2_check = not args.no_ec2_check
     kernel_check = not args.no_kernel_check
     verify_package = not args.no_verify_package
@@ -226,11 +308,15 @@ if __name__ == '__main__':
     raid_setup = not args.no_raid_setup
     coredump_setup = not args.no_coredump_setup
     sysconfig_setup = not args.no_sysconfig_setup
-    io_setup = not args.no_io_setup
+    io_setup = args.io_setup
     version_check = not args.no_version_check
     node_exporter = not args.no_node_exporter
     cpuscaling_setup = not args.no_cpuscaling_setup
     fstrim_setup = not args.no_fstrim_setup
+    memory_setup = not args.no_memory_setup
+    swap_setup = not args.no_swap_setup
+    rsyslog_setup = not args.no_rsyslog_setup
+    rsyslog_server = args.rsyslog_server
     selinux_reboot_required = False
     set_clocksource = False
 
@@ -251,14 +337,14 @@ if __name__ == '__main__':
         args.no_ec2_check = not ec2_check
         if ec2_check:
             if interactive:
-                nic = interactive_choose_nic()
-            run('{}/scylla_ec2_check --nic {}'.format(scriptsdir(), nic))
+                args.nic = interactive_choose_nic()
+            run('{}/scylla_ec2_check --nic {}'.format(scriptsdir(), args.nic), shell=True, check=True)
 
     if not is_nonroot():
         kernel_check = interactive_ask_service('Do you want to run check your kernel version?', 'Yes - runs a  script to verify that the kernel for this instance qualifies to run Scylla. No - skips the kernel check.', kernel_check)
         args.no_kernel_check = not kernel_check
         if kernel_check:
-            run('{}/scylla_kernel_check'.format(scriptsdir()))
+            run('{}/scylla_kernel_check'.format(scriptsdir()), shell=True, check=True)
 
         verify_package = interactive_ask_service('Do you want to verify the ScyllaDB packages are installed?', 'Yes - runs a script to confirm that ScyllaDB is installed. No - skips the installation check.', verify_package)
         args.no_verify_package = not verify_package
@@ -269,10 +355,7 @@ if __name__ == '__main__':
     enable_service = interactive_ask_service('Do you want the Scylla server service to automatically start when the Scylla node boots?', 'Yes - Scylla server service automatically starts on Scylla node boot. No - skips this step. Note you will have to start the Scylla Server service manually.', enable_service)
     args.no_enable_service = not enable_service
     if enable_service:
-        if is_systemd():
-            systemd_unit('scylla-server.service').enable()
-        elif is_gentoo_variant():
-            run('rc-update add scylla-server default')
+        systemd_unit('scylla-server.service').enable()
 
     if not is_nonroot():
         if not os.path.exists('/etc/scylla.d/housekeeping.cfg'):
@@ -281,33 +364,31 @@ if __name__ == '__main__':
             if version_check:
                 with open('/etc/scylla.d/housekeeping.cfg', 'w') as f:
                     f.write('[housekeeping]\ncheck-version: True\n')
-                if is_systemd():
-                    systemd_unit('scylla-housekeeping-daily.timer').unmask()
-                    systemd_unit('scylla-housekeeping-restart.timer').unmask()
+                systemd_unit('scylla-housekeeping-daily.timer').unmask()
+                systemd_unit('scylla-housekeeping-restart.timer').unmask()
             else:
                 with open('/etc/scylla.d/housekeeping.cfg', 'w') as f:
                     f.write('[housekeeping]\ncheck-version: False\n')
-                if is_systemd():
-                    hk_daily = systemd_unit('scylla-housekeeping-daily.timer')
-                    hk_daily.mask()
-                    hk_daily.stop()
-                    hk_restart = systemd_unit('scylla-housekeeping-restart.timer')
-                    hk_restart.mask()
-                    hk_restart.stop()
+                hk_daily = systemd_unit('scylla-housekeeping-daily.timer')
+                hk_daily.mask()
+                hk_daily.stop()
+                hk_restart = systemd_unit('scylla-housekeeping-restart.timer')
+                hk_restart.mask()
+                hk_restart.stop()
 
-        cur_version=out('scylla --version', exception=False)
+        cur_version=run('scylla --version', shell=True, capture_output=True, encoding='utf-8').stdout.strip()
         if len(cur_version) > 0:
             if is_debian_variant():
-                new_version=out('sudo -u scylla {}/scylla-housekeeping --uuid-file /var/lib/scylla-housekeeping/housekeeping.uuid --repo-files \'/etc/apt/sources.list.d/scylla*.list\' version --version {} --mode i'.format(scriptsdir(), cur_version), shell=True, exception=False, timeout=HOUSEKEEPING_TIMEOUT)
+                new_version=run('sudo -u scylla {}/scylla-housekeeping --uuid-file /var/lib/scylla-housekeeping/housekeeping.uuid --repo-files \'/etc/apt/sources.list.d/scylla*.list\' version --version {} --mode i'.format(scriptsdir(), cur_version), shell=True, capture_output=True, encoding='utf-8', timeout=HOUSEKEEPING_TIMEOUT).stdout.strip()
             else:
-                new_version=out('sudo -u scylla {}/scylla-housekeeping --uuid-file /var/lib/scylla-housekeeping/housekeeping.uuid --repo-files \'/etc/yum.repos.d/scylla*.repo\' version --version {} --mode i'.format(scriptsdir(), cur_version), shell=True, exception=False, timeout=HOUSEKEEPING_TIMEOUT)
+                new_version=run('sudo -u scylla {}/scylla-housekeeping --uuid-file /var/lib/scylla-housekeeping/housekeeping.uuid --repo-files \'/etc/yum.repos.d/scylla*.repo\' version --version {} --mode i'.format(scriptsdir(), cur_version), shell=True, capture_output=True, encoding='utf-8', timeout=HOUSEKEEPING_TIMEOUT).stdout.strip()
             if len(new_version) > 0:
                 print(new_version)
         else:
             if is_debian_variant():
-                new_version=out('sudo -u scylla {}/scylla-housekeeping --uuid-file /var/lib/scylla-housekeeping/housekeeping.uuid --repo-files \'/etc/apt/sources.list.d/scylla*.list\' version --version unknown --mode u'.format(scriptsdir()), shell=True, exception=False, timeout=HOUSEKEEPING_TIMEOUT)
+                new_version=run('sudo -u scylla {}/scylla-housekeeping --uuid-file /var/lib/scylla-housekeeping/housekeeping.uuid --repo-files \'/etc/apt/sources.list.d/scylla*.list\' version --version unknown --mode u'.format(scriptsdir()), shell=True, capture_output=True, encoding='utf-8', timeout=HOUSEKEEPING_TIMEOUT).stdout.strip()
             else:
-                new_version=out('sudo -u scylla {}/scylla-housekeeping --uuid-file /var/lib/scylla-housekeeping/housekeeping.uuid --repo-files \'/etc/yum.repos.d/scylla*.repo\' version --version unknown --mode u'.format(scriptsdir()), shell=True, exception=False, timeout=HOUSEKEEPING_TIMEOUT)
+                new_version=run('sudo -u scylla {}/scylla-housekeeping --uuid-file /var/lib/scylla-housekeeping/housekeeping.uuid --repo-files \'/etc/yum.repos.d/scylla*.repo\' version --version unknown --mode u'.format(scriptsdir()), shell=True, capture_output=True, encoding='utf-8', timeout=HOUSEKEEPING_TIMEOUT)
             print('A Scylla executable was not found, please check your installation {}'.format(new_version))
 
         if is_redhat_variant():
@@ -337,21 +418,24 @@ if __name__ == '__main__':
             raid_setup = interactive_ask_service('Are you sure you want to setup RAID0 and XFS?', 'If you choose Yes, the selected drive will be reformated, erasing all existing data in the process.', raid_setup)
         else:
             raid_setup = False
-        if res and raid_setup and not disks:
+        if res and raid_setup and os.path.exists('/etc/systemd/system/var-lib-scylla.mount'):
+            colorprint('{red}/etc/systemd/system/var-lib-scylla.mount already exists, skipping RAID setup.{nocolor}')
+            raid_setup = False
+        elif res and raid_setup and not disks:
             devices = get_unused_disks()
             if len(devices) == 0:
                 print('No free disks were detected, abort RAID/XFS setup. Disks must be unmounted before proceeding.\n')
                 raid_setup = False
             else:
-                print('Please select unmounted disks from the following list: {}'.format(devices))
+                print('Please select unmounted disks from the following list: {}'.format(', '.join(devices)))
             selected = []
             dsklist = []
-            while True:
-                print('type \'cancel\' to cancel RAID/XFS setup.')
-                print('type \'done\' to finish selection. Selected: {}'.format(selected))
+            while raid_setup:
                 if len(dsklist) > 0:
                     dsk = dsklist.pop(0)
                 else:
+                    print('type \'cancel\' to cancel RAID/XFS setup.')
+                    print('type \'done\' to finish selection. Selected: {}'.format(', '.join(selected)))
                     dsk = input('> ')
                 if dsk == 'cancel':
                     raid_setup = 0
@@ -371,6 +455,9 @@ if __name__ == '__main__':
                 if not stat.S_ISBLK(os.stat(dsk).st_mode):
                     print('{} is not block device'.format(dsk))
                     continue
+                if dsk in selected:
+                    print(f'{dsk} is already added')
+                    continue
                 selected.append(dsk)
                 devices.remove(dsk)
             disks = ','.join(selected)
@@ -378,7 +465,7 @@ if __name__ == '__main__':
 
         args.no_raid_setup = not raid_setup
         if raid_setup:
-            run_setup_script('RAID', 'scylla_raid_setup --disks {} --update-fstab'.format(disks))
+            run_setup_script('RAID', f'scylla_raid_setup --disks {disks} --enable-on-nextboot')
 
         coredump_setup = interactive_ask_service('Do you want to enable coredumps?', 'Yes - sets up coredump to allow a post-mortem analysis of the Scylla state just prior to a crash. No - skips this step.', coredump_setup)
         args.no_coredump_setup = not coredump_setup
@@ -394,22 +481,32 @@ if __name__ == '__main__':
             set_nic_and_disks = interactive_ask_service('Do you want to enable Network Interface Card (NIC) and disk(s) optimization?', 'Yes - optimize the NIC queue and disks settings. Selecting Yes greatly improves performance. No - skip this step.', set_nic_and_disks)
             setup_args = '--setup-nic-and-disks' if set_nic_and_disks else ''
             if interactive:
-                nic = interactive_choose_nic()
+                args.nic = interactive_choose_nic()
 
             set_clocksource = interactive_ask_service('The clocksource is the physical device that Linux uses to take time measurements. In most cases Linux chooses the fastest available clocksource device as long as it is accurate. In some situations, however, Linux errs in the side of caution and does not choose the fastest available clocksource despite it being accurate enough. If you know your hardware''s fast clocksource is stable enough, choose "yes" here. The safest is the choose "no" (the default)', 'Yes - enforce clocksource setting. No - keep current configuration.', set_clocksource)
             setup_args += ' --set-clocksource' if set_clocksource else ''
 
-            run_setup_script('Performance Tuning', 'scylla_sysconfig_setup --nic {nic} {setup_args}'.format(nic=nic, setup_args=setup_args))
+            run_setup_script('Performance Tuning', 'scylla_sysconfig_setup --nic {nic} {setup_args}'.format(nic=args.nic, setup_args=setup_args))
 
-    io_setup = interactive_ask_service('Do you want IOTune to study your disks IO profile and adapt Scylla to it? (*WARNING* Saying NO here means the node will not boot in production mode unless you configure the I/O Subsystem manually!)', 'Yes - let iotune study my disk(s). Note that this action will take a few minutes. No - skip this step.', io_setup)
-    args.no_io_setup = not io_setup
-    if io_setup:
-        run_setup_script('IO configuration', 'scylla_io_setup')
+    if is_nonroot():
+        params = run('systemctl --no-pager show user@1000.service', shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+        res = re.findall(r'^LimitNOFILE=(.*)$', params, flags=re.MULTILINE)
+        if res and int(res[0]) < 10000:
+            colorprint('{red}NOFILE hard limit is too low, enabling developer mode{nocolor}')
+            args.developer_mode = True
 
-    node_exporter = interactive_ask_service('Do you want to install node exporter to export Prometheus data from the node? Note that the Scylla monitoring stack uses this data', 'Yes - install node exporter. No - skip this  step.', node_exporter)
+    if not args.developer_mode:
+        io_setup = interactive_ask_service('Do you want IOTune to study your disks IO profile and adapt Scylla to it? (*WARNING* Saying NO here means the node will not boot in production mode unless you configure the I/O Subsystem manually!)', 'Yes - let iotune study my disk(s). Note that this action will take a few minutes. No - skip this step.', io_setup)
+        args.io_setup = 1 if io_setup else 0
+        if io_setup:
+            run_setup_script('IO configuration', 'scylla_io_setup')
+
+    node_exporter = interactive_ask_service('Do you want to enable node exporter to export Prometheus data from the node? Note that the Scylla monitoring stack uses this data', 'Yes - enable node exporter. No - skip this  step.', node_exporter)
     args.no_node_exporter = not node_exporter
     if node_exporter:
-        run_setup_script('node exporter', 'node_exporter_install')
+        node_exporter_unit = systemd_unit('scylla-node-exporter')
+        node_exporter_unit.enable()
+        node_exporter_unit.start()
 
     if args.developer_mode:
         run_setup_script('developer mode', 'scylla_dev_mode_setup --developer-mode 1')
@@ -425,8 +522,41 @@ if __name__ == '__main__':
         if fstrim_setup:
             run_setup_script('fstrim', 'scylla_fstrim_setup')
 
+        memory_setup = interactive_ask_service('Will Scylla be the only service on this host?', 'Answer yes to lock all memory to Scylla, to prevent swapout. Answer no to do nothing.', memory_setup)
+        args.no_memory_setup = not memory_setup
+        if memory_setup:
+            run_setup_script('memory', 'scylla_memory_setup --lock-memory')
+
         if not swap_exists():
             colorprint('{red}No swap is configured, it is highly recommended to setup swap on Scylla node.{nocolor}')
+            swap_setup = interactive_ask_service('Do you want to configure swapfile?', 'Answer yes to setup swapfile to Scylla, Answer no to do nothing.', swap_setup)
+            args.no_swap_setup = not swap_setup
+            if swap_setup:
+                options = ""
+                if interactive:
+                    skip_choose_swap_directory = interactive_ask_service('Do you want to create swapfile on root directory?', 'Anser yes to create swapfile on /, no to choose swap directory.', True)
+                    if not skip_choose_swap_directory:
+                        args.swap_directory = swap_directory = interactive_choose_swap_directory()
+
+                    skip_choose_swap_size = interactive_ask_service('Do you want to auto configure swap size?', 'Anser yes to auto configure, no to manually configure swap size.', True)
+                    if not skip_choose_swap_size:
+                        args.swap_size = swap_size = interactive_choose_swap_size()
+
+                if swap_directory:
+                    options += f' --swap-directory {swap_directory}'
+                if swap_size:
+                    options += f' --swap-size {swap_size}'
+
+                run_setup_script('swap', 'scylla_swap_setup' + options)
+
+        if os.path.isdir('/etc/rsyslog.d'):
+            rsyslog_setup = interactive_ask_service('Do you want to configure rsyslog to send log to a remote repository?', 'Answer yes to setup rsyslog to a remote server, Answer no to do nothing.', rsyslog_setup)
+            args.no_rsyslog_setup = not rsyslog_setup
+            if rsyslog_setup:
+                if interactive:
+                    rsyslog_server = interactive_ask_rsyslog_server()
+                if rsyslog_server:
+                    run_setup_script('rsyslog', 'scylla_rsyslog_setup --remote-server ' + rsyslog_server)
 
     print('ScyllaDB setup finished.')
 
@@ -437,6 +567,3 @@ if __name__ == '__main__':
         if selinux_reboot_required:
             print('Please restart your machine before using ScyllaDB, as you have disabled')
             print(' SELinux.')
-
-        if dist_name() == 'Ubuntu':
-            run('apt-get install -y hugepages')

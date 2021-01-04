@@ -32,7 +32,6 @@
 #include "cache_hitrate_calculator.hh"
 #include "db/system_keyspace.hh"
 #include "gms/application_state.hh"
-#include "service/storage_service.hh"
 #include "service/storage_proxy.hh"
 #include "service/view_update_backlog_broker.hh"
 #include "database.hh"
@@ -106,9 +105,8 @@ void load_broadcaster::start_broadcasting() {
             }
             return res;
         }, int64_t(0), std::plus<int64_t>()).then([this] (int64_t size) {
-            gms::versioned_value::factory value_factory;
             return _gossiper.add_local_application_state(gms::application_state::LOAD,
-                value_factory.load(size)).then([this] {
+                gms::versioned_value::load(size)).then([this] {
                 _timer.arm(BROADCAST_INTERVAL);
                 return make_ready_future<>();
             });
@@ -202,9 +200,8 @@ future<lowres_clock::duration> cache_hitrate_calculator::recalculate_hitrates() 
         });
     }).then([this] {
         auto& g = gms::get_local_gossiper();
-        auto& ss = get_local_storage_service();
         _slen = _gstate.size();
-        return g.add_local_application_state(gms::application_state::CACHE_HITRATES, ss.value_factory.cache_hitrates(_gstate)).then([this] {
+        return g.add_local_application_state(gms::application_state::CACHE_HITRATES, gms::versioned_value::cache_hitrates(_gstate)).then([this] {
             // if max difference during this round is big schedule next recalculate earlier
             if (_diff < 0.01) {
                 return std::chrono::milliseconds(2000);
@@ -238,14 +235,20 @@ future<> view_update_backlog_broker::start() {
         // Gossiper runs only on shard 0, and there's no API to add multiple, per-shard application states.
         // Also, right now we aggregate all backlogs, since the coordinator doesn't keep per-replica shard backlogs.
         _started = seastar::async([this] {
+            std::optional<db::view::update_backlog> backlog_published;
             while (!_as.abort_requested()) {
                 auto backlog = _sp.local().get_view_update_backlog();
+                if (backlog_published && *backlog_published == backlog) {
+                    sleep_abortable(gms::gossiper::INTERVAL, _as).get();
+                    continue;
+                }
                 auto now = api::timestamp_type(std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count());
                 //FIXME: discarded future.
                 (void)_gossiper.add_local_application_state(
                         gms::application_state::VIEW_BACKLOG,
                         gms::versioned_value(seastar::format("{}:{}:{}", backlog.current, backlog.max, now)));
+                backlog_published = backlog;
                 sleep_abortable(gms::gossiper::INTERVAL, _as).get();
             }
         }).handle_exception_type([] (const seastar::sleep_aborted& ignored) { });

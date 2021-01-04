@@ -144,7 +144,14 @@ struct compression {
         uint64_t at(std::size_t i, state& s) const;
         void push_back(uint64_t offset, state& s);
     public:
-        class const_iterator : public std::iterator<std::random_access_iterator_tag, const uint64_t> {
+        class const_iterator {
+        public:
+            using iterator_category = std::random_access_iterator_tag;
+            using value_type = const uint64_t;
+            using difference_type = std::ptrdiff_t;
+            using pointer = const uint64_t*;
+            using reference = const uint64_t&;
+        private:
             friend class segmented_offsets;
             struct end_tag {};
 
@@ -368,8 +375,7 @@ input_stream<char> make_compressed_file_k_l_format_input_stream(file f,
                 sstables::compression* cm, uint64_t offset, size_t len,
                 class file_input_stream_options options);
 
-output_stream<char> make_compressed_file_k_l_format_output_stream(file f,
-                file_output_stream_options options,
+output_stream<char> make_compressed_file_k_l_format_output_stream(output_stream<char> out,
                 sstables::compression* cm,
                 const compression_parameters& cp);
 
@@ -377,8 +383,7 @@ input_stream<char> make_compressed_file_m_format_input_stream(file f,
                 sstables::compression* cm, uint64_t offset, size_t len,
                 class file_input_stream_options options);
 
-output_stream<char> make_compressed_file_m_format_output_stream(file f,
-                file_output_stream_options options,
+output_stream<char> make_compressed_file_m_format_output_stream(output_stream<char> out,
                 sstables::compression* cm,
                 const compression_parameters& cp);
 

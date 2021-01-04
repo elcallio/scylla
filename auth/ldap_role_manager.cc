@@ -164,14 +164,14 @@ future<> ldap_role_manager::reconnect() {
 void ldap_role_manager::reset_connection() {
     if (_conn) {
         auto p = _conn.release();
-        mylog.trace("reset_connection({})", p);
+        mylog.trace("reset_connection({})", static_cast<const void*>(p));
         // OK to drop the continuation, which frees all its resources and holds no potentially dangling
         // references.  There is no infinite spawning because this code is gated on retry_limit.
         (void) p->close().then_wrapped([p] (future<>) {
-            mylog.trace("reset_connection() deleting {}", p);
+            mylog.trace("reset_connection() deleting {}", static_cast<const void*>(p));
             delete p;
         });
-        mylog.trace("reset_connection({}) done", p);
+        mylog.trace("reset_connection({}) done", static_cast<const void*>(p));
     }
 }
 
@@ -218,7 +218,7 @@ future<role_set> ldap_role_manager::query_granted(std::string_view grantee_name,
                     mylog.trace("query_granted: got search results");
                     const auto mtype = ldap_msgtype(res.get());
                     if (mtype != LDAP_RES_SEARCH_ENTRY && mtype != LDAP_RES_SEARCH_RESULT) {
-                        mylog.error("ldap search yielded result {} of type {}", res.get(), ldap_msgtype(res.get()));
+                        mylog.error("ldap search yielded result {} of type {}", static_cast<const void*>(res.get()), ldap_msgtype(res.get()));
                         throw std::runtime_error("ldap_role_manager: search result has wrong type");
                     }
                     return do_with(

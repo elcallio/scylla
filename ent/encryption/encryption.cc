@@ -56,6 +56,8 @@
 
 static seastar::logger logg{"encryption"};
 
+sharded<cql3::query_processor>* hack_query_processor_for_encryption;
+
 namespace encryption {
 
 static const std::set<sstring> keywords = { KEY_PROVIDER,
@@ -153,13 +155,15 @@ future<temporary_buffer<char>> read_text_file_fully(const sstring& filename) {
 
 future<> write_text_file_fully(const sstring& filename, temporary_buffer<char> buf) {
     return open_file_dma(filename, open_flags::wo|open_flags::create).then([buf = std::move(buf)](file f) mutable {
-        return do_with(make_file_output_stream(f), [buf = std::move(buf)](output_stream<char>& out) mutable {
+      return make_file_output_stream(f).then([buf = std::move(buf)] (output_stream<char> out) mutable {
+        return do_with(std::move(out), [buf = std::move(buf)](output_stream<char>& out) mutable {
             auto p = buf.get();
             auto s = buf.size();
             return out.write(p, s).finally([&out, buf = std::move(buf)] {
                 return out.close();
             });
         });
+      });
     });
 }
 
@@ -249,7 +253,7 @@ public:
         }
     }
     shared_ptr<key_provider> get_cached_provider(const sstring& id) const override {
-        auto& cache = _per_thread_provider_cache[engine().cpu_id()];
+        auto& cache = _per_thread_provider_cache[this_shard_id()];
         auto i = cache.find(id);
         if (i != cache.end()) {
             return i->second;
@@ -257,11 +261,11 @@ public:
         return {};
     }
     void cache_provider(const sstring& id, shared_ptr<key_provider> p) override {
-        _per_thread_provider_cache[engine().cpu_id()][id] = std::move(p);
+        _per_thread_provider_cache[this_shard_id()][id] = std::move(p);
     }
 
     shared_ptr<system_key> get_system_key(const sstring& name) override {
-        auto& cache = _per_thread_system_key_cache[engine().cpu_id()];
+        auto& cache = _per_thread_system_key_cache[this_shard_id()];
         auto i = cache.find(name);
         if (i != cache.end()) {
             return i->second;
@@ -283,7 +287,7 @@ public:
     }
 
     shared_ptr<kmip_host> get_kmip_host(const sstring& host) override {
-        auto& cache = _per_thread_kmip_host_cache[engine().cpu_id()];
+        auto& cache = _per_thread_kmip_host_cache[this_shard_id()];
         auto i = cache.find(host);
         if (i != cache.end()) {
             return i->second;
@@ -311,7 +315,7 @@ public:
         });
     }
     distributed<cql3::query_processor>& get_query_processor() const override {
-        return cql3::get_query_processor();
+        return *hack_query_processor_for_encryption;
     }
     distributed<service::storage_service>& get_storage_service() const override {
         return service::get_storage_service();
@@ -585,7 +589,7 @@ public:
     }
 };
 
-namespace bfs = boost::filesystem;
+namespace bfs = std::filesystem;
 
 class encryption_commitlog_file_extension : public db::commitlog_file_extension {
     const ::shared_ptr<encryption_context> _ctxt;
@@ -603,7 +607,7 @@ public:
         bfs::path p(filename);
         auto dir = p.parent_path();
         auto file = p.filename();
-        return (dir / ("." + file.string())).string();
+        return (dir / bfs::path("." + file.string())).string();
     }
     future<file> wrap_file(const sstring& filename, file f, open_flags flags) override {
         auto cfg_file = config_name(filename);
@@ -638,7 +642,8 @@ public:
             auto provider = _ctxt->get_provider(_opts);
 
             return provider->key(get_key_info(_opts)).then([f, this, cfg_file, filename, &provider = *provider](std::tuple<shared_ptr<symmetric_key>, opt_bytes> k_id) {
-                auto&& [k, id] = k_id;
+                auto&& k = std::get<0>(k_id);
+                auto&& id = std::get<1>(k_id);
                 std::ostringstream ss;
                 for (auto&p : _opts) {
                     ss << p.first << "=" << p.second << std::endl;
@@ -700,10 +705,10 @@ future<> register_extensions(const db::config&, const encryption_config& cfg, db
         // them all.
         // Since we are in pre-init phase, this should be safe.
         f = f.then([opts, &exts] {
-            return smp::invoke_on_all([opts, &exts] {
+            return smp::invoke_on_all([opts = make_lw_shared<options>(opts), &exts] () mutable {
                 auto& f = exts.schema_extensions().at(encryption_attribute);
                 for (auto& s : { db::system_keyspace::paxos(), db::system_keyspace::batchlog() }) {
-                    exts.add_extension_to_schema(s, encryption_attribute, f(opts));
+                    exts.add_extension_to_schema(s, encryption_attribute, f(*opts));
                 }
             });
         });

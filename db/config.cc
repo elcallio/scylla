@@ -20,6 +20,7 @@
 #include <seastar/core/print.hh>
 #include <seastar/util/log.hh>
 
+#include "cdc/cdc_extension.hh"
 #include "config.hh"
 #include "extensions.hh"
 #include "log.hh"
@@ -54,6 +55,12 @@ static
 json::json_return_type
 seed_provider_to_json(const db::seed_provider_type& spt) {
     return value_to_json("seed_provider_type");
+}
+
+static
+json::json_return_type
+hinted_handoff_enabled_to_json(const db::config::hinted_handoff_enabled_type& h) {
+    return value_to_json(h.to_configuration_string());
 }
 
 template <>
@@ -105,6 +112,9 @@ template <>
 const config_type config_type_for<std::vector<enum_option<db::experimental_features_t>>> = config_type(
         "experimental features", value_to_json<std::vector<sstring>>);
 
+template <>
+const config_type config_type_for<db::config::hinted_handoff_enabled_type> = config_type("hinted handoff enabled", hinted_handoff_enabled_to_json);
+
 }
 
 namespace YAML {
@@ -146,6 +156,18 @@ struct convert<db::config::seed_provider_type> {
                 }
             }
         }
+        return true;
+    }
+};
+
+template<>
+struct convert<db::config::hinted_handoff_enabled_type> {
+    static bool decode(const Node& node, db::config::hinted_handoff_enabled_type& rhs) {
+        std::string opt;
+        if (!convert<std::string>::decode(node, opt)) {
+            return false;
+        }
+        rhs = db::hints::host_filter::parse_from_config_string(std::move(opt));
         return true;
     }
 };
@@ -216,7 +238,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The directory in which Scylla will put all its subdirectories. The location of individual subdirs can be overriden by the respective *_directory options.")
     , commitlog_directory(this, "commitlog_directory", value_status::Used, "",
         "The directory where the commit log is stored. For optimal write performance, it is recommended the commit log be on a separate disk partition (ideally, a separate physical device) from the data file directories.")
-    , data_file_directories(this, "data_file_directories", value_status::Used, { },
+    , data_file_directories(this, "data_file_directories", "datadir", value_status::Used, { },
         "The directory location where table data (SSTables) is stored")
     , hints_directory(this, "hints_directory", value_status::Used, "",
         "The directory where hints files are stored if hinted handoff is enabled.")
@@ -507,9 +529,9 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , streaming_socket_timeout_in_ms(this, "streaming_socket_timeout_in_ms", value_status::Unused, 0,
         "Enable or disable socket timeout for streaming operations. When a timeout occurs during streaming, streaming is retried from the start of the current file. Avoid setting this value too low, as it can result in a significant amount of data re-streaming.")
     /* Native transport (CQL Binary Protocol) */
-    , start_native_transport(this, "start_native_transport", value_status::Unused, true,
+    , start_native_transport(this, "start_native_transport", value_status::Used, true,
         "Enable or disable the native transport server. Uses the same address as the rpc_address, but the port is different from the rpc_port. See native_transport_port.")
-    , native_transport_port(this, "native_transport_port", value_status::Used, 9042,
+    , native_transport_port(this, "native_transport_port", "cql_port", value_status::Used, 9042,
         "Port on which the CQL native transport listens for clients.")
     , native_transport_port_ssl(this, "native_transport_port_ssl", value_status::Used, 9142,
         "Port on which the CQL TLS native transport listens for clients."
@@ -517,6 +539,10 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "for native_transport_port. Setting native_transport_port_ssl to a different value"
         "from native_transport_port will use encryption for native_transport_port_ssl while"
         "keeping native_transport_port unencrypted")
+    , native_shard_aware_transport_port(this, "native_shard_aware_transport_port", value_status::Used, 19042,
+        "Like native_transport_port, but clients-side port number (modulo smp) is used to route the connection to the specific shard.")
+    , native_shard_aware_transport_port_ssl(this, "native_shard_aware_transport_port_ssl", value_status::Used, 19142,
+        "Like native_transport_port_ssl, but clients-side port number (modulo smp) is used to route the connection to the specific shard.")
     , native_transport_max_threads(this, "native_transport_max_threads", value_status::Invalid, 128,
         "The maximum number of thread handling requests. The meaning is the same as rpc_max_threads.\n"
         "Default is different (128 versus unlimited).\n"
@@ -528,7 +554,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     /* Settings for configuring and tuning client connections. */
     , broadcast_rpc_address(this, "broadcast_rpc_address", value_status::Used, {/* unset */},
         "RPC address to broadcast to drivers and other Scylla nodes. This cannot be set to 0.0.0.0. If blank, it is set to the value of the rpc_address or rpc_interface. If rpc_address or rpc_interfaceis set to 0.0.0.0, this property must be set.\n")
-    , rpc_port(this, "rpc_port", value_status::Used, 9160,
+    , rpc_port(this, "rpc_port", "thrift_port", value_status::Used, 9160,
         "Thrift port for client connections.")
     , start_rpc(this, "start_rpc", value_status::Used, true,
         "Starts the Thrift RPC server")
@@ -559,7 +585,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Time interval in milliseconds to reset all node scores, which allows a bad node to recover.")
     , dynamic_snitch_update_interval_in_ms(this, "dynamic_snitch_update_interval_in_ms", value_status::Unused, 100,
         "The time interval for how often the snitch calculates node scores. Because score calculation is CPU intensive, be careful when reducing this interval.")
-    , hinted_handoff_enabled(this, "hinted_handoff_enabled", value_status::Used, "true",
+    , hinted_handoff_enabled(this, "hinted_handoff_enabled", value_status::Used, db::config::hinted_handoff_enabled_type(db::config::hinted_handoff_enabled_type::enabled_for_all_tag()),
         "Enable or disable hinted handoff. To enable per data center, add data center list. For example: hinted_handoff_enabled: DC1,DC2. A hint indicates that the write needs to be replayed to an unavailable node. "
         "Related information: About hinted handoff writes")
     , hinted_handoff_throttle_in_kb(this, "hinted_handoff_throttle_in_kb", value_status::Unused, 1024,
@@ -601,8 +627,10 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "\n"
         "\torg.apache.cassandra.auth.AllowAllAuthenticator : Disables authentication; no checks are performed.\n"
         "\torg.apache.cassandra.auth.PasswordAuthenticator : Authenticates users with user names and hashed passwords stored in the system_auth.credentials table. If you use the default, 1, and the node with the lone replica goes down, you will not be able to log into the cluster because the system_auth keyspace was not replicated.\n"
+        "\tcom.scylladb.auth.TransitionalAuthenticator : Wraps around the PasswordAuthenticator, logging them in if username/password pair provided is correct and treating them as anonymous users otherwise.\n"
+        "\tcom.scylladb.auth.SaslauthdAuthenticator : Use saslauthd for authentication.\n"
         "Related information: Internal authentication"
-        , {"AllowAllAuthenticator", "PasswordAuthenticator", "org.apache.cassandra.auth.PasswordAuthenticator", "org.apache.cassandra.auth.AllowAllAuthenticator", "com.scylladb.auth.TransitionalAuthenticator"})
+        , {"AllowAllAuthenticator", "PasswordAuthenticator", "org.apache.cassandra.auth.PasswordAuthenticator", "org.apache.cassandra.auth.AllowAllAuthenticator", "com.scylladb.auth.TransitionalAuthenticator", "com.scylladb.auth.SaslauthdAuthenticator"})
     , internode_authenticator(this, "internode_authenticator", value_status::Unused, "enabled",
         "Internode authentication backend. It implements org.apache.cassandra.auth.AllowAllInternodeAuthenticator to allows or disallow connections from peer nodes.")
     , authorizer(this, "authorizer", value_status::Used, "org.apache.cassandra.auth.AllowAllAuthorizer",
@@ -610,12 +638,14 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "\n"
         "\tAllowAllAuthorizer : Disables authorization; allows any action to any user.\n"
         "\tCassandraAuthorizer : Stores permissions in system_auth.permissions table. If you use the default, 1, and the node with the lone replica goes down, you will not be able to log into the cluster because the system_auth keyspace was not replicated.\n"
+        "\tcom.scylladb.auth.TransitionalAuthorizer : Wraps around the CassandraAuthorizer, which is used to authorize permission management. Other actions are allowed for all users.\n"
         "Related information: Object permissions"
         , {"AllowAllAuthorizer", "CassandraAuthorizer", "org.apache.cassandra.auth.AllowAllAuthorizer", "org.apache.cassandra.auth.CassandraAuthorizer", "com.scylladb.auth.TransitionalAuthorizer"})
     , role_manager(this, "role_manager", value_status::Used, "org.apache.cassandra.auth.CassandraRoleManager",
         "The role-management backend, used to maintain grantts and memberships between roles.\n"
         "The available role-managers are:\n"
-        "\tCassandraRoleManager : Stores role data in the system_auth keyspace.")
+        "\torg.apache.cassandra.auth.CassandraRoleManager : Stores role data in the system_auth keyspace;\n"
+        "\tcom.scylladb.auth.LDAPRoleManager : Fetches role data from an LDAP server;")
     , permissions_validity_in_ms(this, "permissions_validity_in_ms", value_status::Used, 10000,
         "How long permissions in cache remain valid. Depending on the authorizer, such as CassandraAuthorizer, fetching permissions can be resource intensive. Permissions caching is disabled when this property is set to 0 or when AllowAllAuthorizer is used. The cached value is considered valid as long as both its value is not older than the permissions_validity_in_ms "
         "and the cached value has been read at least once during the permissions_validity_in_ms time frame. If any of these two conditions doesn't hold the cached value is going to be evicted from the cache.\n"
@@ -654,6 +684,15 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "\tpriority_string : GnuTLS priority string controlling TLS algorithms used/allowed.\n"
         "\trequire_client_auth : (Default: false ) Enables or disables certificate authentication.\n"
         "Related information: Client-to-node encryption")
+    , alternator_encryption_options(this, "alternator_encryption_options", value_status::Used, {/*none*/},
+        "When Alternator via HTTPS is enabled with alternator_https_port, where to take the key and certificate. The available options are:\n"
+        "\n"
+        "\tcertificate: (Default: conf/scylla.crt) The location of a PEM-encoded x509 certificate used to identify and encrypt the client/server communication.\n"
+        "\tkeyfile: (Default: conf/scylla.key) PEM Key file associated with certificate.\n"
+        "\n"
+        "The advanced settings are:\n"
+        "\n"
+        "\tpriority_string : GnuTLS priority string controlling TLS algorithms used/allowed.")
     , ssl_storage_port(this, "ssl_storage_port", value_status::Used, 7001,
         "The SSL port for encrypted communication. Unused unless enabled in encryption_options.")
     , enable_in_memory_data_store(this, "enable_in_memory_data_store", value_status::Used, false, "Enable in memory mode (system tables are always persisted)")
@@ -673,7 +712,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , replace_address(this, "replace_address", value_status::Used, "", "The listen_address or broadcast_address of the dead node to replace. Same as -Dcassandra.replace_address.")
     , replace_address_first_boot(this, "replace_address_first_boot", value_status::Used, "", "Like replace_address option, but if the node has been bootstrapped successfully it will be ignored. Same as -Dcassandra.replace_address_first_boot.")
     , override_decommission(this, "override_decommission", value_status::Used, false, "Set true to force a decommissioned node to join the cluster")
-    , enable_repair_based_node_ops(this, "enable_repair_based_node_ops", liveness::LiveUpdate, value_status::Used, true, "Set true to use enable repair based node operations instead of streaming based")
+    , enable_repair_based_node_ops(this, "enable_repair_based_node_ops", liveness::LiveUpdate, value_status::Used, false, "Set true to use enable repair based node operations instead of streaming based")
     , ring_delay_ms(this, "ring_delay_ms", value_status::Used, 30 * 1000, "Time a node waits to hear from other nodes before joining the ring in milliseconds. Same as -Dcassandra.ring_delay_ms in cassandra.")
     , shadow_round_ms(this, "shadow_round_ms", value_status::Used, 300 * 1000, "The maximum gossip shadow round time. Can be used to reduce the gossip feature check time during node boot up.")
     , fd_max_interval_ms(this, "fd_max_interval_ms", value_status::Used, 2 * 1000, "The maximum failure_detector interval time in milliseconds. Interval larger than the maximum will be ignored. Larger cluster may need to increase the default.")
@@ -703,6 +742,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , cpu_scheduler(this, "cpu_scheduler", value_status::Used, true, "Enable cpu scheduling")
     , view_building(this, "view_building", value_status::Used, true, "Enable view building; should only be set to false when the node is experience issues due to view building")
     , enable_sstables_mc_format(this, "enable_sstables_mc_format", value_status::Used, true, "Enable SSTables 'mc' format to be used as the default file format")
+    , enable_sstables_md_format(this, "enable_sstables_md_format", value_status::Used, true, "Enable SSTables 'md' format to be used as the default file format (requires enable_sstables_mc_format)")
     , enable_dangerous_direct_import_of_cassandra_counters(this, "enable_dangerous_direct_import_of_cassandra_counters", value_status::Used, false, "Only turn this option on if you want to import tables from Cassandra containing counters, and you are SURE that no counters in that table were created in a version earlier than Cassandra 2.1."
         " It is not enough to have ever since upgraded to newer versions of Cassandra. If you EVER used a version earlier than 2.1 in the cluster where these SSTables come from, DO NOT TURN ON THIS OPTION! You will corrupt your data. You have been warned.")
     , enable_shard_aware_drivers(this, "enable_shard_aware_drivers", value_status::Used, true, "Enable native transport drivers to use connection-per-shard for better performance")
@@ -714,8 +754,14 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , max_clustering_key_restrictions_per_query(this, "max_clustering_key_restrictions_per_query", liveness::LiveUpdate, value_status::Used, 100,
             "Maximum number of distinct clustering key restrictions per query. This limit places a bound on the size of IN tuples, "
             "especially when multiple clustering key columns have IN restrictions. Increasing this value can result in server instability.")
-    , max_memory_for_unlimited_query(this, "max_memory_for_unlimited_query", liveness::LiveUpdate, value_status::Used, size_t(1) << 20,
-            "Maximum amount of memory a query, whose memory consumption is not naturally limited, is allowed to consume, e.g. non-paged and reverse queries.")
+    , max_memory_for_unlimited_query_soft_limit(this, "max_memory_for_unlimited_query_soft_limit", liveness::LiveUpdate, value_status::Used, uint64_t(1) << 20,
+            "Maximum amount of memory a query, whose memory consumption is not naturally limited, is allowed to consume, e.g. non-paged and reverse queries. "
+            "This is the soft limit, there will be a warning logged for queries violating this limit.")
+    , max_memory_for_unlimited_query_hard_limit(this, "max_memory_for_unlimited_query_hard_limit", "max_memory_for_unlimited_query", liveness::LiveUpdate, value_status::Used, (uint64_t(100) << 20),
+            "Maximum amount of memory a query, whose memory consumption is not naturally limited, is allowed to consume, e.g. non-paged and reverse queries. "
+            "This is the hard limit, queries violating this limit will be aborted.")
+    , initial_sstable_loading_concurrency(this, "initial_sstable_loading_concurrency", value_status::Used, 4u,
+            "Maximum amount of sstables to load in parallel during initialization. A higher number can lead to more memory consumption. You should not need to touch this")
     , enable_3_1_0_compatibility_mode(this, "enable_3_1_0_compatibility_mode", value_status::Used, false,
         "Set to true if the cluster was initially installed from 3.1.0. If it was upgraded from an earlier version,"
         " or installed from a later version, leave this set to false. This adjusts the communication protocol to"
@@ -724,10 +770,18 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , user_defined_function_time_limit_ms(this, "user_defined_function_time_limit_ms", value_status::Used, 10, "The time limit for each UDF invocation")
     , user_defined_function_allocation_limit_bytes(this, "user_defined_function_allocation_limit_bytes", value_status::Used, 1024*1024, "How much memory each UDF invocation can allocate")
     , user_defined_function_contiguous_allocation_limit_bytes(this, "user_defined_function_contiguous_allocation_limit_bytes", value_status::Used, 1024*1024, "How much memory each UDF invocation can allocate in one chunk")
+    , schema_registry_grace_period(this, "schema_registry_grace_period", value_status::Used, 1,
+        "Time period in seconds after which unused schema versions will be evicted from the local schema registry cache. Default is 1 second.")
+    , max_concurrent_requests_per_shard(this, "max_concurrent_requests_per_shard",liveness::LiveUpdate, value_status::Used, std::numeric_limits<uint32_t>::max(),
+        "Maximum number of concurrent requests a single shard can handle before it starts shedding extra load. By default, no requests will be shed.")
     , alternator_port(this, "alternator_port", value_status::Used, 0, "Alternator API port")
     , alternator_https_port(this, "alternator_https_port", value_status::Used, 0, "Alternator API HTTPS port")
     , alternator_address(this, "alternator_address", value_status::Used, "0.0.0.0", "Alternator API listening address")
     , alternator_enforce_authorization(this, "alternator_enforce_authorization", value_status::Used, false, "Enforce checking the authorization header for every request in Alternator")
+    , alternator_write_isolation(this, "alternator_write_isolation", value_status::Used, "", "Default write isolation policy for Alternator")
+    , alternator_streams_time_window_s(this, "alternator_streams_time_window_s", value_status::Used, 10, "CDC query confidence window for alternator streams")
+    , alternator_timeout_in_ms(this, "alternator_timeout_in_ms", value_status::Used, 10000,
+        "The server-side timeout for completing Alternator API requests.")
     , abort_on_ebadf(this, "abort_on_ebadf", value_status::Used, true, "Abort the server on incorrect file descriptor access. Throws exception when disabled.")
     , redis_port(this, "redis_port", value_status::Used, 0, "Port on which the REDIS transport listens for clients.")
     , redis_ssl_port(this, "redis_ssl_port", value_status::Used, 0, "Port on which the REDIS TLS native transport listens for clients.")
@@ -756,6 +810,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , ldap_attr_role(this, "ldap_attr_role", value_status::Used, "", "LDAP attribute containing Scylla role.")
     , ldap_bind_dn(this, "ldap_bind_dn", value_status::Used, "", "Distinguished name used by LDAPRoleManager for binding to LDAP server.")
     , ldap_bind_passwd(this, "ldap_bind_passwd", value_status::Used, "", "Password used by LDAPRoleManager for binding to LDAP server.")
+    , saslauthd_socket_path(this, "saslauthd_socket_path", value_status::Used, "", "UNIX domain socket on which saslauthd is listening.")
 
     , default_log_level(this, "default_log_level", value_status::Used)
     , logger_log_level(this, "logger_log_level", value_status::Used)
@@ -770,6 +825,10 @@ db::config::config()
 
 db::config::~config()
 {}
+
+void db::config::add_cdc_extension() {
+    _extensions->add_schema_extension<cdc::cdc_extension>(cdc::cdc_extension::NAME);
+}
 
 void db::config::setup_directories() {
     maybe_in_workdir(commitlog_directory, "commitlog");
@@ -809,37 +868,25 @@ namespace utils {
 
 template<>
 void config_file::named_value<db::config::seed_provider_type>::add_command_line_option(
-                boost::program_options::options_description_easy_init& init,
-                const std::string_view& name, const std::string_view& desc) {
-    init((hyphenate(name) + "-class-name").data(),
+                boost::program_options::options_description_easy_init& init) {
+    init((hyphenate(name()) + "-class-name").data(),
                     value_ex<sstring>()->notifier(
                                     [this](sstring new_class_name) {
                                         auto old_seed_provider = operator()();
                                         old_seed_provider.class_name = new_class_name;
                                         set(std::move(old_seed_provider), config_source::CommandLine);
                                     }),
-                    desc.data());
-    init((hyphenate(name) + "-parameters").data(),
+                    desc().data());
+    init((hyphenate(name()) + "-parameters").data(),
                     value_ex<std::unordered_map<sstring, sstring>>()->notifier(
                                     [this](std::unordered_map<sstring, sstring> new_parameters) {
                                         auto old_seed_provider = operator()();
                                         old_seed_provider.parameters = new_parameters;
                                         set(std::move(old_seed_provider), config_source::CommandLine);
                                     }),
-                    desc.data());
+                    desc().data());
 }
 
-}
-
-boost::program_options::options_description_easy_init&
-db::config::add_options(boost::program_options::options_description_easy_init& init) {
-    config_file::add_options(init);
-
-    data_file_directories.add_command_line_option(init, "datadir", "alias for 'data-file-directories'");
-    rpc_port.add_command_line_option(init, "thrift-port", "alias for 'rpc-port'");
-    native_transport_port.add_command_line_option(init, "cql-port", "alias for 'native-transport-port'");
-
-    return init;
 }
 
 db::fs::path db::config::get_conf_dir() {
@@ -865,7 +912,7 @@ db::fs::path db::config::get_conf_sub(db::fs::path sub) {
 }
 
 bool db::config::check_experimental(experimental_features_t::feature f) const {
-    if (experimental() && f != experimental_features_t::UNUSED) {
+    if (experimental() && f != experimental_features_t::UNUSED && f != experimental_features_t::UNUSED_CDC) {
         return true;
     }
     const auto& optval = experimental_features();
@@ -919,11 +966,13 @@ std::unordered_map<sstring, db::experimental_features_t::feature> db::experiment
     // https://github.com/scylladb/scylla/pull/5369#discussion_r353614807
     // Lightweight transactions are no longer experimental. Map them
     // to UNUSED switch for a while, then remove altogether.
-    return {{"lwt", UNUSED}, {"udf", UDF}, {"cdc", CDC}};
+    // Change Data Capture is no longer experimental. Map it
+    // to UNUSED_CDC switch for a while, then remove altogether.
+    return {{"lwt", UNUSED}, {"udf", UDF}, {"cdc", UNUSED_CDC}, {"alternator-streams", ALTERNATOR_STREAMS}};
 }
 
 std::vector<enum_option<db::experimental_features_t>> db::experimental_features_t::all() {
-    return {UDF, CDC};
+    return {UDF, ALTERNATOR_STREAMS};
 }
 
 template struct utils::config_file::named_value<seastar::log_level>;

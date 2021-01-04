@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #pragma once
@@ -32,9 +21,7 @@ namespace utils {
 
 // Facilitates transparently reading from a fragmented range.
 template<typename T, typename Exception = std::runtime_error>
-GCC6_CONCEPT(
-    requires FragmentRange<T>
-)
+requires FragmentRange<T>
 class linearizing_input_stream {
     using iterator = typename T::iterator;
     using fragment_type = typename T::fragment_type;
@@ -111,9 +98,7 @@ public:
     }
 
     template <typename Type>
-    GCC6_CONCEPT(
-        requires std::is_trivial_v<Type>
-    )
+    requires std::is_trivial_v<Type>
     Type read_trivial() {
         auto [bv, linearized] = do_read(sizeof(Type));
         auto ret = net::ntoh(*reinterpret_cast<const net::packed<Type>*>(bv.begin()));

@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include <lz4.h>
@@ -205,7 +194,7 @@ void compression_parameters::validate_options(const std::map<sstring, sstring>& 
         ckw = _compressor->option_names();
     }
     for (auto&& opt : options) {
-        if (!keywords.count(opt.first) && !ckw.count(opt.first)) {
+        if (!keywords.contains(opt.first) && !ckw.contains(opt.first)) {
             throw exceptions::configuration_exception(format("Unknown compression option '{}'.", opt.first));
         }
     }

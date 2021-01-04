@@ -5,18 +5,7 @@
 /*
  * This file is part of Scylla.
  *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
+ * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 
 #include "alternator/error.hh"
@@ -66,8 +55,9 @@ static std::string format_time_point(db_clock::time_point tp) {
     time_t time_point_repr = db_clock::to_time_t(tp);
     std::string time_point_str;
     time_point_str.resize(17);
+    ::tm time_buf;
     // strftime prints the terminating null character as well
-    std::strftime(time_point_str.data(), time_point_str.size(), "%Y%m%dT%H%M%SZ", std::gmtime(&time_point_repr));
+    std::strftime(time_point_str.data(), time_point_str.size(), "%Y%m%dT%H%M%SZ", ::gmtime_r(&time_point_repr, &time_buf));
     time_point_str.resize(16);
     return time_point_str;
 }
@@ -77,12 +67,12 @@ void check_expiry(std::string_view signature_date) {
     std::string expiration_str = format_time_point(db_clock::now() - 15min);
     std::string validity_str = format_time_point(db_clock::now() + 15min);
     if (signature_date < expiration_str) {
-        throw api_error("InvalidSignatureException",
+        throw api_error::invalid_signature(
                 fmt::format("Signature expired: {} is now earlier than {} (current time - 15 min.)",
                 signature_date, expiration_str));
     }
     if (signature_date > validity_str) {
-        throw api_error("InvalidSignatureException",
+        throw api_error::invalid_signature(
                 fmt::format("Signature not yet current: {} is still later than {} (current time + 15 min.)",
                 signature_date, validity_str));
     }
@@ -93,13 +83,13 @@ std::string get_signature(std::string_view access_key_id, std::string_view secre
         std::string_view body_content, std::string_view region, std::string_view service, std::string_view query_string) {
     auto amz_date_it = signed_headers_map.find("x-amz-date");
     if (amz_date_it == signed_headers_map.end()) {
-        throw api_error("InvalidSignatureException", "X-Amz-Date header is mandatory for signature verification");
+        throw api_error::invalid_signature("X-Amz-Date header is mandatory for signature verification");
     }
     std::string_view amz_date = amz_date_it->second;
     check_expiry(amz_date);
     std::string_view datestamp = amz_date.substr(0, 8);
     if (datestamp != orig_datestamp) {
-        throw api_error("InvalidSignatureException",
+        throw api_error::invalid_signature(
                 format("X-Amz-Date date does not match the provided datestamp. Expected {}, got {}",
                         orig_datestamp, datestamp));
     }
@@ -125,19 +115,19 @@ std::string get_signature(std::string_view access_key_id, std::string_view secre
 
 future<std::string> get_key_from_roles(cql3::query_processor& qp, std::string username) {
     static const sstring query = format("SELECT salted_hash FROM {} WHERE {} = ?",
-            auth::meta::roles_table::qualified_name(), auth::meta::roles_table::role_col_name);
+            auth::meta::roles_table::qualified_name, auth::meta::roles_table::role_col_name);
 
     auto cl = auth::password_authenticator::consistency_for_user(username);
-    auto timeout = auth::internal_distributed_timeout_config();
+    auto& timeout = auth::internal_distributed_timeout_config();
     return qp.execute_internal(query, cl, timeout, {sstring(username)}, true).then_wrapped([username = std::move(username)] (future<::shared_ptr<cql3::untyped_result_set>> f) {
         auto res = f.get0();
         auto salted_hash = std::optional<sstring>();
         if (res->empty()) {
-            throw api_error("UnrecognizedClientException", fmt::format("User not found: {}", username));
+            throw api_error::unrecognized_client(fmt::format("User not found: {}", username));
         }
         salted_hash = res->one().get_opt<sstring>("salted_hash");
         if (!salted_hash) {
-            throw api_error("UnrecognizedClientException", fmt::format("No password found for user: {}", username));
+            throw api_error::unrecognized_client(fmt::format("No password found for user: {}", username));
         }
         return make_ready_future<std::string>(*salted_hash);
     });

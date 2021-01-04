@@ -28,6 +28,7 @@
 #include "utils/fragmented_temporary_buffer.hh"
 #include "service_permit.hh"
 #include <seastar/core/sharded.hh>
+#include "utils/updateable_value.hh"
 #include "service/qos/service_level_controller.hh"
 
 namespace scollectd {
@@ -37,6 +38,7 @@ class registrations;
 }
 
 class database;
+enum class client_type;
 struct client_data;
 
 namespace cql_transport {
@@ -94,14 +96,39 @@ struct cql_query_state {
 struct cql_server_config {
     ::timeout_config timeout_config;
     size_t max_request_size;
+    std::function<utils::updateable_value<uint32_t> ()> get_max_concurrent_requests_updateable_value;
     std::function<semaphore& ()> get_service_memory_limiter_semaphore;
     sstring partitioner_name;
     unsigned sharding_ignore_msb;
+    std::optional<uint16_t> shard_aware_transport_port;
+    std::optional<uint16_t> shard_aware_transport_port_ssl;
     bool allow_shard_aware_drivers = true;
     smp_service_group bounce_request_smp_service_group = default_smp_service_group();
 };
 
 class cql_server : public seastar::peering_sharded_service<cql_server> {
+private:
+    struct transport_stats {
+        // server stats
+        uint64_t connects;
+        uint64_t connections;
+        uint64_t requests_served;
+        uint32_t requests_serving;
+        uint64_t requests_blocked_memory;
+        uint64_t requests_shed;
+
+        // cql message stats
+        uint64_t startups;
+        uint64_t auth_responses;
+        uint64_t options_requests;
+        uint64_t query_requests;
+        uint64_t prepare_requests;
+        uint64_t execute_requests;
+        uint64_t batch_requests;
+        uint64_t register_requests;
+
+        std::unordered_map<exceptions::exception_code, uint64_t> errors;
+    };
 private:
     class event_notifier;
 
@@ -111,15 +138,12 @@ private:
     distributed<cql3::query_processor>& _query_processor;
     cql_server_config _config;
     size_t _max_request_size;
+    utils::updateable_value<uint32_t> _max_concurrent_requests;
     semaphore& _memory_available;
     seastar::metrics::metric_groups _metrics;
     std::unique_ptr<event_notifier> _notifier;
 private:
-    uint64_t _connects = 0;
-    uint64_t _connections = 0;
-    uint64_t _requests_served = 0;
-    uint64_t _requests_serving = 0;
-    uint64_t _requests_blocked_memory = 0;
+    transport_stats _stats = {};
     auth::service& _auth_service;
     qos::service_level_controller& _sl_controller;
 public:
@@ -127,7 +151,7 @@ public:
             service::migration_notifier& mn,
             cql_server_config config,
             qos::service_level_controller& sl_controller);
-    future<> listen(socket_address addr, std::shared_ptr<seastar::tls::credentials_builder> = {}, bool keepalive = false);
+    future<> listen(socket_address addr, std::shared_ptr<seastar::tls::credentials_builder> = {}, bool is_shard_aware = false, bool keepalive = false);
     future<> do_accepts(int which, bool keepalive, socket_address server_addr);
     future<> stop();
 public:
@@ -176,6 +200,7 @@ private:
         future<> process();
         future<> process_request();
         future<> shutdown();
+        static std::tuple<net::inet_address, int, client_type> make_client_key(const service::client_state& cli_state);
         client_data make_client_data() const;
         const service::client_state& get_client_state() const { return _client_state; }
     private:
@@ -261,6 +286,12 @@ class cql_server::event_notifier : public service::migration_listener,
     std::unordered_map<gms::inet_address, event::status_change::status_type> _last_status_change;
     service::migration_notifier& _mnotifier;
     bool _stopped = false;
+
+    // We want to delay sending NEW_NODE CQL event to clients until the new node
+    // has started listening for CQL requests.
+    std::unordered_set<gms::inet_address> _endpoints_pending_joined_notification;
+
+    void send_join_cluster(const gms::inet_address& endpoint);
 public:
     future<> stop();
     event_notifier(service::migration_notifier& mn);

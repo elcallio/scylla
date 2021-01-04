@@ -17,12 +17,13 @@
 #include <boost/range/irange.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/reader_permit.hh"
 #include <seastar/core/reactor.hh>
 
 using namespace sstables;
 using namespace std::chrono_literals;
 
-std::vector<sstring> do_make_keys(unsigned n, const schema_ptr& s, size_t min_key_size, local_shard_only lso) {
+std::vector<sstring> do_make_keys(unsigned n, const schema_ptr& s, size_t min_key_size, std::optional<shard_id> shard) {
     std::vector<std::pair<sstring, dht::decorated_key>> p;
     p.reserve(n);
 
@@ -33,8 +34,8 @@ std::vector<sstring> do_make_keys(unsigned n, const schema_ptr& s, size_t min_ke
         std::copy_n(reinterpret_cast<int8_t*>(&key_id), sizeof(key_id), raw_key.begin());
         auto dk = dht::decorate_key(*s, partition_key::from_single_value(*s, to_bytes(raw_key)));
         key_id++;
-        if (lso) {
-            if (engine_is_ready() && this_shard_id() != shard_of(*s, dk.token())) {
+        if (shard) {
+            if (*shard != shard_of(*s, dk.token())) {
                 continue;
             }
         }
@@ -45,6 +46,10 @@ std::vector<sstring> do_make_keys(unsigned n, const schema_ptr& s, size_t min_ke
         return p1.second.less_compare(*s, p2.second);
     });
     return boost::copy_range<std::vector<sstring>>(p | boost::adaptors::map_keys);
+}
+
+std::vector<sstring> do_make_keys(unsigned n, const schema_ptr& s, size_t min_key_size, local_shard_only lso) {
+    return do_make_keys(n, s, min_key_size, lso ? std::optional(this_shard_id()) : std::nullopt);
 }
 
 sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, std::vector<mutation> muts) {
@@ -77,7 +82,7 @@ sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_
     }
 
     // validate the sstable
-    auto rd = assert_that(sst->as_mutation_source().make_reader(s));
+    auto rd = assert_that(sst->as_mutation_source().make_reader(s, tests::make_permit()));
     for (auto&& m : merged) {
         rd.produces(m);
     }
@@ -102,7 +107,7 @@ shared_sstable make_sstable(sstables::test_env& env, schema_ptr s, sstring dir, 
         mt->apply(m);
     }
 
-    sst->write_components(mt->make_flat_reader(s), mutations.size(), s, cfg, mt->get_encoding_stats()).get();
+    sst->write_components(mt->make_flat_reader(s, tests::make_permit()), mutations.size(), s, cfg, mt->get_encoding_stats()).get();
     sst->load().get();
 
     return sst;
@@ -137,7 +142,7 @@ token_generation_for_shard(unsigned tokens_to_generate, unsigned shard,
     return key_and_token_pair;
 }
 
-future<compaction_info> compact_sstables(sstables::compaction_descriptor descriptor, column_family& cf, std::function<shared_sstable()> creator, replacer_fn replacer) {
+future<compaction_info> compact_sstables(sstables::compaction_descriptor descriptor, column_family& cf, std::function<shared_sstable()> creator, compaction_sstable_replacer_fn replacer) {
     descriptor.creator = [creator = std::move(creator)] (shard_id dummy) mutable {
         return creator();
     };
