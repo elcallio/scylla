@@ -445,6 +445,9 @@ schema::schema(const schema& o)
     rebuild();
     if (o.is_view()) {
         _view_info = std::make_unique<::view_info>(*this, o.view_info()->raw());
+        if (o.view_info()->base_info()) {
+            _view_info->set_base_info(o.view_info()->base_info());
+        }
     }
 }
 
@@ -922,6 +925,11 @@ schema_builder& schema_builder::with_partitioner(sstring name) {
 
 schema_builder& schema_builder::with_sharder(unsigned shard_count, unsigned sharding_ignore_msb_bits) {
     _raw._sharder = get_sharder(shard_count, sharding_ignore_msb_bits);
+    return *this;
+}
+
+schema_builder& schema_builder::with_null_sharder() {
+    _raw._sharder = get_sharder(1, 0);
     return *this;
 }
 

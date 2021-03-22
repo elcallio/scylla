@@ -22,6 +22,7 @@
 #include "cql3/column_identifier.hh"
 #include "cql3/functions/functions.hh"
 #include <seastar/core/seastar.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/rwlock.hh>
@@ -82,6 +83,7 @@
 #include "user_types_metadata.hh"
 #include <seastar/core/shared_ptr_incomplete.hh>
 #include <seastar/util/memory_diagnostics.hh>
+#include <seastar/core/coroutine.hh>
 
 #include "schema_builder.hh"
 
@@ -366,7 +368,6 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
     , _version(empty_version)
     , _compaction_manager(make_compaction_manager(_cfg, dbcfg, as))
     , _enable_incremental_backups(cfg.incremental_backups())
-    , _querier_cache(dbcfg.available_memory * 0.04)
     , _large_data_handler(std::make_unique<db::cql_table_large_data_handler>(_cfg.compaction_large_partition_warning_threshold_mb()*1024*1024,
               _cfg.compaction_large_row_warning_threshold_mb()*1024*1024,
               _cfg.compaction_large_cell_warning_threshold_mb()*1024*1024,
@@ -387,8 +388,6 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
     setup_metrics();
 
     _row_cache_tracker.set_compaction_scheduling_group(dbcfg.memory_compaction_scheduling_group);
-
-    dblog.debug("Row: max_vector_size: {}, internal_count: {}", size_t(row::max_vector_size), size_t(row::internal_count));
 
     _infinite_bound_range_deletions_reg = _feat.cluster_supports_unbounded_range_tombstones().when_enabled([this] {
         dblog.debug("Enabling infinite bound range deletions");
@@ -578,10 +577,6 @@ database::setup_metrics() {
         sm::make_derive("querier_cache_resource_based_evictions", _querier_cache.get_stats().resource_based_evictions,
                        sm::description("Counts querier cache entries that were evicted to free up resources "
                                        "(limited by reader concurency limits) necessary to create new readers.")),
-
-        sm::make_derive("querier_cache_memory_based_evictions", _querier_cache.get_stats().memory_based_evictions,
-                       sm::description("Counts querier cache entries that were evicted because the memory usage "
-                                       "of the cached queriers were above the limit.")),
 
         sm::make_gauge("querier_cache_population", _querier_cache.get_stats().population,
                        sm::description("The number of entries currently in the querier cache.")),
@@ -802,7 +797,7 @@ future<> database::parse_system_tables(distributed<service::storage_proxy>& prox
     using namespace db::schema_tables;
     return do_parse_schema_tables(proxy, db::schema_tables::KEYSPACES, [this] (schema_result_value_type &v) {
         auto ksm = create_keyspace_from_schema_partition(v);
-        return create_keyspace(ksm, true /* bootstrap. do not mark populated yet */);
+        return create_keyspace(ksm, true /* bootstrap. do not mark populated yet */, system_keyspace::no);
     }).then([&proxy, this] {
         return do_parse_schema_tables(proxy, db::schema_tables::TYPES, [this, &proxy] (schema_result_value_type &v) {
             auto& ks = this->find_keyspace(v.first);
@@ -839,11 +834,22 @@ future<> database::parse_system_tables(distributed<service::storage_proxy>& prox
             });
     }).then([&proxy, &mm, this] {
         return do_parse_schema_tables(proxy, db::schema_tables::VIEWS, [this, &proxy, &mm] (schema_result_value_type &v) {
-            return create_views_from_schema_partition(proxy, v.second).then([this, &mm] (std::vector<view_ptr> views) {
-                return parallel_for_each(views.begin(), views.end(), [this, &mm] (auto&& v) {
-                    return this->add_column_family_and_make_directory(v).then([this, &mm, v] {
-                        return maybe_update_legacy_secondary_index_mv_schema(mm.local(), *this, v);
-                    });
+            return create_views_from_schema_partition(proxy, v.second).then([this, &mm, &proxy] (std::vector<view_ptr> views) {
+                return parallel_for_each(views.begin(), views.end(), [this, &mm, &proxy] (auto&& v) {
+                    // TODO: Remove once computed columns are guaranteed to be featured in the whole cluster.
+                    // we fix here the schema in place in oreder to avoid races (write commands comming from other coordinators).
+                    view_ptr fixed_v = maybe_fix_legacy_secondary_index_mv_schema(*this, v, nullptr, preserve_version::yes);
+                    view_ptr v_to_add = fixed_v ? fixed_v : v;
+                    future<> f = this->add_column_family_and_make_directory(v_to_add);
+                    if (bool(fixed_v)) {
+                        v_to_add = fixed_v;
+                        auto&& keyspace = find_keyspace(v->ks_name()).metadata();
+                        auto mutations = db::schema_tables::make_update_view_mutations(keyspace, view_ptr(v), fixed_v, api::new_timestamp(), true);
+                        f = f.then([this, &proxy, mutations = std::move(mutations)] {
+                            return db::schema_tables::merge_schema(proxy, _feat, std::move(mutations));
+                        });
+                    }
+                    return f;
                 });
             });
         });
@@ -861,7 +867,7 @@ database::init_commitlog() {
                 return;
             }
             // Initiate a background flush. Waited upon in `stop()`.
-            (void)_column_families[id]->flush();
+            (void)_column_families[id]->flush(pos);
         }).release(); // we have longer life time than CL. Ignore reg anchor
     });
 }
@@ -880,14 +886,7 @@ database::shard_of(const frozen_mutation& m) {
     return dht::shard_of(*schema, dht::get_token(*schema, m.key()));
 }
 
-void database::add_keyspace(sstring name, keyspace k) {
-    if (auto [ignored, added] = _keyspaces.try_emplace(std::move(name), std::move(k)); !added) {
-        throw std::invalid_argument("Keyspace " + name + " already exists");
-    }
-}
-
-future<> database::update_keyspace(const sstring& name) {
-    auto& proxy = service::get_storage_proxy();
+future<> database::update_keyspace(sharded<service::storage_proxy>& proxy, const sstring& name) {
     return db::schema_tables::read_schema_partition_for_keyspace(proxy, db::schema_tables::KEYSPACES, name).then([this, name](db::schema_tables::schema_result_value_type&& v) {
         auto& ks = find_keyspace(name);
 
@@ -967,7 +966,7 @@ bool database::update_column_family(schema_ptr new_schema) {
     return columns_changed;
 }
 
-void database::remove(const column_family& cf) {
+future<> database::remove(const column_family& cf) noexcept {
     auto s = cf.schema();
     auto& ks = find_keyspace(s->ks_name());
     _querier_cache.evict_all_for_table(s->id());
@@ -981,15 +980,16 @@ void database::remove(const column_family& cf) {
             // Drop view mutations received after base table drop.
         }
     }
+    co_return;
 }
 
 future<> database::drop_column_family(const sstring& ks_name, const sstring& cf_name, timestamp_func tsf, bool snapshot) {
+    auto& ks = find_keyspace(ks_name);
     auto uuid = find_uuid(ks_name, cf_name);
     auto cf = _column_families.at(uuid);
-    remove(*cf);
+    co_await remove(*cf);
     cf->clear_views();
-    auto& ks = find_keyspace(ks_name);
-    return cf->await_pending_ops().then([this, &ks, cf, tsf = std::move(tsf), snapshot] {
+    co_return co_await cf->await_pending_ops().then([this, &ks, cf, tsf = std::move(tsf), snapshot] {
         return truncate(ks, *cf, std::move(tsf), snapshot).finally([this, cf] {
             return cf->stop();
         });
@@ -1008,7 +1008,7 @@ const utils::UUID& database::find_uuid(const schema_ptr& schema) const {
     return find_uuid(schema->ks_name(), schema->cf_name());
 }
 
-keyspace& database::find_keyspace(const sstring& name) {
+keyspace& database::find_keyspace(std::string_view name) {
     try {
         return _keyspaces.at(name);
     } catch (...) {
@@ -1016,7 +1016,7 @@ keyspace& database::find_keyspace(const sstring& name) {
     }
 }
 
-const keyspace& database::find_keyspace(const sstring& name) const {
+const keyspace& database::find_keyspace(std::string_view name) const {
     try {
         return _keyspaces.at(name);
     } catch (...) {
@@ -1197,7 +1197,7 @@ keyspace::make_directory_for_column_family(const sstring& name, utils::UUID uuid
     });
 }
 
-no_such_keyspace::no_such_keyspace(const sstring& ks_name)
+no_such_keyspace::no_such_keyspace(std::string_view ks_name)
     : runtime_error{format("Can't find a keyspace {}", ks_name)}
 {
 }
@@ -1310,24 +1310,31 @@ std::vector<view_ptr> database::get_views() const {
             | boost::adaptors::transformed([] (auto& cf) { return view_ptr(cf->schema()); }));
 }
 
-void database::create_in_memory_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm) {
-    keyspace ks(ksm, std::move(make_keyspace_config(*ksm)));
+void database::create_in_memory_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm, system_keyspace system) {
+    auto kscfg = make_keyspace_config(*ksm);
+    if (system == system_keyspace::yes) {
+        kscfg.enable_disk_reads = kscfg.enable_disk_writes = kscfg.enable_commitlog = !_cfg.volatile_system_keyspace_for_testing();
+        kscfg.enable_cache = _cfg.enable_cache();
+        // don't make system keyspace writes wait for user writes (if under pressure)
+        kscfg.dirty_memory_manager = &_system_dirty_memory_manager;
+    }
+    keyspace ks(ksm, std::move(kscfg));
     ks.create_replication_strategy(get_shared_token_metadata(), ksm->strategy_options());
     _keyspaces.emplace(ksm->name(), std::move(ks));
 }
 
 future<>
 database::create_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm) {
-    return create_keyspace(ksm, false);
+    return create_keyspace(ksm, false, system_keyspace::no);
 }
 
 future<>
-database::create_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm, bool is_bootstrap) {
+database::create_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm, bool is_bootstrap, system_keyspace system) {
     if (_keyspaces.contains(ksm->name())) {
         return make_ready_future<>();
     }
 
-    create_in_memory_keyspace(ksm);
+    create_in_memory_keyspace(ksm, system);
     auto& ks = _keyspaces.at(ksm->name());
     auto& datadir = ks.datadir();
 
@@ -1342,6 +1349,16 @@ database::create_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm, bool is_b
     } else {
         return make_ready_future<>();
     }
+}
+
+future<>
+database::drop_caches() const {
+    std::unordered_map<utils::UUID, lw_shared_ptr<column_family>> tables = get_column_families();
+    for (auto&& e : tables) {
+        table& t = *e.second;
+        co_await t.get_row_cache().invalidate(row_cache::external_updater([] {}));
+    }
+    co_return;
 }
 
 std::set<sstring>

@@ -10,6 +10,7 @@
 
 #include "test/lib/test_services.hh"
 #include "test/lib/reader_permit.hh"
+#include "cdc/generation_service.hh"
 #include "db/config.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "db/view/view_update_generator.hh"
@@ -32,6 +33,7 @@ class storage_service_for_tests::impl {
     sharded<db::system_distributed_keyspace> _sys_dist_ks;
     sharded<db::view::view_update_generator> _view_update_generator;
     sharded<netw::messaging_service> _messaging;
+    sharded<cdc::generation_service> _cdc_generation_service;
     sharded<auth::service> _auth_service;
     sharded<qos::service_level_controller> _sl_controller;
 public:
@@ -50,12 +52,14 @@ public:
         _gossiper.start(std::ref(_abort_source), std::ref(_feature_service), std::ref(_token_metadata), std::ref(_messaging), std::ref(_cfg)).get();
         service::storage_service_config sscfg;
         sscfg.available_memory = memory::stats().total_memory();
-        service::get_storage_service().start(std::ref(_abort_source), std::ref(_db), std::ref(_gossiper), std::ref(_sys_dist_ks), std::ref(_view_update_generator), std::ref(_feature_service), sscfg, std::ref(_mnotif), std::ref(_token_metadata), std::ref(_messaging), std::ref(_sl_controller), true).get();
+        service::get_storage_service().start(std::ref(_abort_source), std::ref(_db), std::ref(_gossiper), std::ref(_sys_dist_ks), std::ref(_view_update_generator), std::ref(_feature_service), sscfg, std::ref(_mnotif), std::ref(_token_metadata), std::ref(_messaging), std::ref(_cdc_generation_service), std::ref(_sl_controller), true).get();
         service::get_storage_service().invoke_on_all([] (auto& ss) {
             ss.enable_all_features();
         }).get();
+        _cdc_generation_service.start(std::ref(_cfg), std::ref(_gossiper), std::ref(_sys_dist_ks), std::ref(_abort_source), std::ref(_token_metadata)).get();
     }
     ~impl() {
+        _cdc_generation_service.stop().get();
         service::get_storage_service().stop().get();
         _messaging.stop().get();
         _db.stop().get();

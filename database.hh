@@ -18,7 +18,6 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/execution_stage.hh>
 #include <seastar/net/byteorder.hh>
-#include "utils/UUID_gen.hh"
 #include "utils/UUID.hh"
 #include "utils/hash.hh"
 #include "db_clock.hh"
@@ -136,7 +135,7 @@ class data_listeners;
 class large_data_handler;
 
 namespace system_keyspace {
-void make(database& db, bool durable, bool volatile_testing_only);
+future<> make(database& db);
 }
 }
 
@@ -438,6 +437,7 @@ private:
     std::optional<int64_t> _sstable_generation = {};
 
     db::replay_position _highest_rp;
+    db::replay_position _flush_rp;
     db::replay_position _lowest_allowed_rp;
 
     // Provided by the database that owns this commitlog
@@ -510,13 +510,9 @@ public:
         return _truncated_at;
     }
 
-    void notify_bootstrap_or_replace_start() {
-        _is_bootstrap_or_replace = true;
-    }
+    void notify_bootstrap_or_replace_start();
 
-    void notify_bootstrap_or_replace_end() {
-        _is_bootstrap_or_replace = false;
-    }
+    void notify_bootstrap_or_replace_end();
 private:
     bool cache_enabled() const {
         return _config.enable_cache && _schema->caching_options().enabled();
@@ -535,7 +531,7 @@ private:
     lw_shared_ptr<memtable> new_memtable();
     future<stop_iteration> try_flush_memtable_to_sstable(lw_shared_ptr<memtable> memt, sstable_write_permit&& permit);
     // Caller must keep m alive.
-    future<> update_cache(lw_shared_ptr<memtable> m, sstables::shared_sstable sst);
+    future<> update_cache(lw_shared_ptr<memtable> m, std::vector<sstables::shared_sstable> ssts);
     struct merge_comparator;
 
     // update the sstable generation, making sure that new new sstables don't overwrite this one.
@@ -677,6 +673,10 @@ public:
         return make_streaming_reader(schema, range, schema->full_slice());
     }
 
+    // Stream reader from the given sstables
+    flat_mutation_reader make_streaming_reader(schema_ptr schema, const dht::partition_range& range,
+            lw_shared_ptr<sstables::sstable_set> sstables) const;
+
     sstables::shared_sstable make_streaming_sstable_for_write(std::optional<sstring> subdir = {});
     sstables::shared_sstable make_streaming_staging_sstable() {
         return make_streaming_sstable_for_write("staging");
@@ -740,7 +740,7 @@ public:
 
     void start();
     future<> stop();
-    future<> flush();
+    future<> flush(std::optional<db::replay_position> = {});
     future<> clear(); // discards memtable(s) without flushing them to disk.
     future<db::replay_position> discard_sstables(db_clock::time_point);
 
@@ -1150,7 +1150,7 @@ public:
 
 class no_such_keyspace : public std::runtime_error {
 public:
-    no_such_keyspace(const sstring& ks_name);
+    no_such_keyspace(std::string_view ks_name);
 };
 
 class no_such_column_family : public std::runtime_error {
@@ -1307,11 +1307,9 @@ public:
     void set_local_id(utils::UUID uuid) noexcept { _local_host_id = std::move(uuid); }
 
 private:
-    // Unless you are an earlier boostraper or the database itself, you should
-    // not be using this directly.  Go for the public create_keyspace instead.
-    void add_keyspace(sstring name, keyspace k);
-    void create_in_memory_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm);
-    friend void db::system_keyspace::make(database& db, bool durable, bool volatile_testing_only);
+    using system_keyspace = bool_class<struct system_keyspace_tag>;
+    void create_in_memory_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm, system_keyspace system);
+    friend future<> db::system_keyspace::make(database& db);
     void setup_metrics();
     void setup_scylla_memory_diagnostics_producer();
 
@@ -1326,7 +1324,7 @@ private:
     template<typename Future>
     Future update_write_metrics(Future&& f);
     void update_write_metrics_for_timed_out_write();
-    future<> create_keyspace(const lw_shared_ptr<keyspace_metadata>&, bool is_bootstrap);
+    future<> create_keyspace(const lw_shared_ptr<keyspace_metadata>&, bool is_bootstrap, system_keyspace system);
 public:
     static utils::UUID empty_version;
 
@@ -1342,6 +1340,7 @@ public:
     ~database();
 
     cache_tracker& row_cache_tracker() { return _row_cache_tracker; }
+    future<> drop_caches() const;
 
     void update_version(const utils::UUID& version);
 
@@ -1383,14 +1382,13 @@ public:
      */
     future<> create_keyspace(const lw_shared_ptr<keyspace_metadata>&);
     /* below, find_keyspace throws no_such_<type> on fail */
-    keyspace& find_keyspace(const sstring& name);
-    const keyspace& find_keyspace(const sstring& name) const;
+    keyspace& find_keyspace(std::string_view name);
+    const keyspace& find_keyspace(std::string_view name) const;
     bool has_keyspace(std::string_view name) const;
     void validate_keyspace_update(keyspace_metadata& ksm);
     void validate_new_keyspace(keyspace_metadata& ksm);
-    future<> update_keyspace(const sstring& name);
+    future<> update_keyspace(sharded<service::storage_proxy>& proxy, const sstring& name);
     void drop_keyspace(const sstring& name);
-    const auto& keyspaces() const { return _keyspaces; }
     std::vector<sstring> get_non_system_keyspaces() const;
     column_family& find_column_family(std::string_view ks, std::string_view name);
     const column_family& find_column_family(std::string_view ks, std::string_view name) const;
@@ -1510,7 +1508,7 @@ public:
 
     bool update_column_family(schema_ptr s);
     future<> drop_column_family(const sstring& ks_name, const sstring& cf_name, timestamp_func, bool with_snapshot = true);
-    void remove(const column_family&);
+    future<> remove(const column_family&) noexcept;
 
     const logalloc::region_group& dirty_memory_region_group() const {
         return _dirty_memory_manager.region_group();
@@ -1570,6 +1568,6 @@ future<> stop_database(sharded<database>& db);
 flat_mutation_reader make_multishard_streaming_reader(distributed<database>& db, schema_ptr schema,
         std::function<std::optional<dht::partition_range>()> range_generator);
 
-bool is_internal_keyspace(const sstring& name);
+bool is_internal_keyspace(std::string_view name);
 
 #endif /* DATABASE_HH_ */

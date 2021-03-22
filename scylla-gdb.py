@@ -492,6 +492,10 @@ class std_list:
                 self._node = self._node['_M_next']
                 return val
 
+            # python2 compatibility
+            def next(self):
+                return self.__next__()
+
         return std_list_iterator(self)
 
     @staticmethod
@@ -662,7 +666,10 @@ class boost_intrusive_list_printer(gdb.printing.PrettyPrinter):
 
 class nonwrapping_interval_printer(gdb.printing.PrettyPrinter):
     def __init__(self, val):
-        self.val = val['_range']
+        try :
+            self.val = val['_interval']
+        except gdb.error: # 4.1 compatibility
+            self.val = val['_range']
 
     def inspect_bound(self, bound_opt):
         bound = std_optional(bound_opt)

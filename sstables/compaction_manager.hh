@@ -19,6 +19,7 @@
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/condition-variable.hh>
 #include "log.hh"
 #include "utils/exponential_backoff_retry.hh"
 #include <vector>
@@ -100,6 +101,7 @@ private:
     std::unordered_map<column_family*, rwlock> _compaction_locks;
 
     semaphore _custom_job_sem{1};
+    seastar::named_semaphore _rewrite_sstables_sem = {1, named_semaphore_exception_factory{"rewrite sstables"}};
 
     std::function<void()> compaction_submission_callback();
     // all registered column families are submitted for compaction at a constant interval.
@@ -174,9 +176,6 @@ public:
     // unless it is moved back to enabled state.
     future<> drain();
 
-    // FIXME: should not be public. It's not anyone's business if we are enabled.
-    // distributed_loader.cc uses for resharding, remove this when the new resharding series lands.
-    bool enabled() const { return _state == state::enabled; }
     // Stop all fibers, without waiting. Safe to be called multiple times.
     void do_stop() noexcept;
     void really_do_stop();

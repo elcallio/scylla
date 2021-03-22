@@ -82,6 +82,25 @@ public:
         }
         _fragments.erase(it.base(), _fragments.end());
     }
+
+    // Creates a fragmented temporary buffer of a specified size, supplied as a parameter.
+    // Max chunk size is limited to 128kb (the same limit as `bytes_stream` has).
+    static fragmented_temporary_buffer allocate_to_fit(size_t data_size) {
+        constexpr size_t max_fragment_size = default_fragment_size; // 128KB
+
+        const size_t full_fragment_count = data_size / max_fragment_size; // number of max-sized fragments
+        const size_t last_fragment_size = data_size % max_fragment_size;
+
+        std::vector<seastar::temporary_buffer<char>> fragments;
+        fragments.reserve(full_fragment_count + !!last_fragment_size);
+        for (size_t i = 0; i < full_fragment_count; ++i) {
+            fragments.emplace_back(seastar::temporary_buffer<char>(max_fragment_size));
+        }
+        if (last_fragment_size) {
+            fragments.emplace_back(seastar::temporary_buffer<char>(last_fragment_size));
+        }
+        return fragmented_temporary_buffer(std::move(fragments), data_size);
+    }
 };
 
 class fragmented_temporary_buffer::view {

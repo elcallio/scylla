@@ -274,7 +274,6 @@ def testLists(cql, test_keyspace):
         execute(cql, table, "UPDATE %s SET l = l - ? WHERE k=0", ["v1", "v2"])
         assert_rows(execute(cql, table, "SELECT l FROM %s WHERE k = 0"), [None]);
 
-@pytest.mark.xfail(reason="Cassandra 2.2.0's 'unset' values not yet supported. Issue #7740")
 def testMapWithUnsetValues(cql, test_keyspace):
     with create_table(cql, test_keyspace, "(k int PRIMARY KEY, m map<text, text>)") as table:
         # set up
@@ -285,7 +284,7 @@ def testMapWithUnsetValues(cql, test_keyspace):
         # test putting an unset map, should not delete the contents
         execute(cql, table, "INSERT INTO %s (k, m) VALUES (10, ?)", UNSET_VALUE)
         assert_rows(execute(cql, table, "SELECT m FROM %s WHERE k = 10"), [m])
-        # test unset variables in a map update operaiotn, should not delete the contents
+        # test unset variables in a map update operation, should not delete the contents
         execute(cql, table, "UPDATE %s SET m['k'] = ? WHERE k = 10", UNSET_VALUE)
         assert_rows(execute(cql, table, "SELECT m FROM %s WHERE k = 10"), [m])
         assert_invalid_message(cql, table, "Invalid unset map key", "UPDATE %s SET m[?] = 'foo' WHERE k = 10", UNSET_VALUE)
@@ -293,7 +292,6 @@ def testMapWithUnsetValues(cql, test_keyspace):
         # test unset value for map key
         assert_invalid_message(cql, table, "Invalid unset map key", "DELETE m[?] FROM %s WHERE k = 10", UNSET_VALUE)
 
-@pytest.mark.xfail(reason="Cassandra 2.2.0's 'unset' values not yet supported. Issue #7740")
 def testListWithUnsetValues(cql, test_keyspace):
     with create_table(cql, test_keyspace, "(k int PRIMARY KEY, l list<text>)") as table:
         # set up
@@ -326,10 +324,6 @@ def testListWithUnsetValues(cql, test_keyspace):
         # captures this case before sending it to the server.
         #assert_invalid_message(cql, table, "Invalid unset value for column k", "SELECT * FROM %s WHERE k IN (?)", UNSET_VALUE)
 
-# Note: I have to use skip instead of xfail here because this test, not only
-# fails, it crashes: the last command UPDATE %s SET s = s - ? WHERE k = 10",
-# bound with UNSET_VALUE, crashes with an assertion failure. See #7740.
-@pytest.mark.skip(reason="Cassandra 2.2.0's 'unset' values not yet supported. Issue #7740")
 def testSetWithUnsetValues(cql, test_keyspace):
     with create_table(cql, test_keyspace, "(k int PRIMARY KEY, s set<text>)") as table:
         s = {"bar", "baz", "foo"}
@@ -472,7 +466,6 @@ def testFunctionsOnCollections(cql, test_keyspace):
         assert_invalid(cql, table, "SELECT ttl(l) FROM %s WHERE k = 0")
         assert_invalid(cql, table, "SELECT writetime(l) FROM %s WHERE k = 0")
 
-@pytest.mark.xfail(reason="Cassandra 4.0's support for IN on table with collection not yet supported. Issue #7743")
 def testInRestrictionWithCollection(cql, test_keyspace):
     for frozen in [True, False]:
         with create_table(cql, test_keyspace,

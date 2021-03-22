@@ -47,6 +47,7 @@ void set_compaction_manager(http_context& ctx, routes& r) {
 
             for (const auto& c : cm.get_compactions()) {
                 cm::summary s;
+                s.id = c->compaction_uuid.to_sstring();
                 s.ks = c->ks_name;
                 s.cf = c->cf_name;
                 s.unit = "keys";

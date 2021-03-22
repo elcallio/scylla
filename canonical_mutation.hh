@@ -21,9 +21,9 @@
 // Safe to access from other shards via const&.
 // Safe to pass serialized across nodes.
 class canonical_mutation {
-    bytes _data;
+    bytes_ostream _data;
 public:
-    explicit canonical_mutation(bytes);
+    explicit canonical_mutation(bytes_ostream);
     explicit canonical_mutation(const mutation&);
 
     canonical_mutation(canonical_mutation&&) = default;
@@ -40,7 +40,7 @@ public:
 
     utils::UUID column_family_id() const;
 
-    const bytes& representation() const { return _data; }
+    const bytes_ostream& representation() const { return _data; }
 
     friend std::ostream& operator<<(std::ostream& os, const canonical_mutation& cm);
 };

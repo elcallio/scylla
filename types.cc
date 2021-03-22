@@ -42,7 +42,6 @@
 #include "utils/utf8.hh"
 #include "utils/ascii.hh"
 #include "mutation_partition.hh"
-#include "compaction_garbage_collector.hh"
 
 #include "types/user.hh"
 #include "types/tuple.hh"
@@ -156,8 +155,7 @@ struct simple_type_traits<db_clock::time_point> {
 
 template <typename T>
 simple_type_impl<T>::simple_type_impl(abstract_type::kind k, sstring name, std::optional<uint32_t> value_length_if_fixed)
-    : concrete_type<T>(k, std::move(name), std::move(value_length_if_fixed),
-              data::type_info::make_fixed_size(simple_type_traits<T>::serialized_size)) {}
+    : concrete_type<T>(k, std::move(name), std::move(value_length_if_fixed)) {}
 
 template <typename T>
 integer_type_impl<T>::integer_type_impl(
@@ -166,7 +164,7 @@ integer_type_impl<T>::integer_type_impl(
 
 template <typename T> static bytes decompose_value(T v) {
     bytes b(bytes::initialized_later(), sizeof(v));
-    *reinterpret_cast<T*>(b.begin()) = (T)net::hton(v);
+    write_unaligned<T>(b.begin(), net::hton(v));
     return b;
 }
 
@@ -195,37 +193,22 @@ int32_type_impl::int32_type_impl() : integer_type_impl{kind::int32, int32_type_n
 long_type_impl::long_type_impl() : integer_type_impl{kind::long_kind, long_type_name, 8} {}
 
 string_type_impl::string_type_impl(kind k, sstring name)
-    : concrete_type(k, name, {}, data::type_info::make_variable_size()) {}
+    : concrete_type(k, name, {}) {}
 
 ascii_type_impl::ascii_type_impl() : string_type_impl(kind::ascii, ascii_type_name) {}
 
 utf8_type_impl::utf8_type_impl() : string_type_impl(kind::utf8, utf8_type_name) {}
 
 bytes_type_impl::bytes_type_impl()
-    : concrete_type(kind::bytes, bytes_type_name, {}, data::type_info::make_variable_size()) {}
+    : concrete_type(kind::bytes, bytes_type_name, {}) {}
 
 boolean_type_impl::boolean_type_impl() : simple_type_impl<bool>(kind::boolean, boolean_type_name, 1) {}
 
-date_type_impl::date_type_impl() : concrete_type(kind::date, date_type_name, 8, data::type_info::make_fixed_size(sizeof(uint64_t))) {}
+date_type_impl::date_type_impl() : concrete_type(kind::date, date_type_name, 8) {}
 
 timeuuid_type_impl::timeuuid_type_impl()
     : concrete_type<utils::UUID>(
-              kind::timeuuid, timeuuid_type_name, 16, data::type_info::make_fixed_size(sizeof(uint64_t) * 2)) {}
-
-static int timeuuid_compare_bytes(bytes_view o1, bytes_view o2) {
-    auto compare_pos = [&] (unsigned pos, int mask, int ifequal) {
-        int d = (o1[pos] & mask) - (o2[pos] & mask);
-        return d ? d : ifequal;
-    };
-    return compare_pos(6, 0xf,
-        compare_pos(7, 0xff,
-            compare_pos(4, 0xff,
-                compare_pos(5, 0xff,
-                    compare_pos(0, 0xff,
-                        compare_pos(1, 0xff,
-                            compare_pos(2, 0xff,
-                                compare_pos(3, 0xff, 0))))))));
-}
+              kind::timeuuid, timeuuid_type_name, 16) {}
 
 timestamp_type_impl::timestamp_type_impl() : simple_type_impl(kind::timestamp, timestamp_type_name, 8) {}
 
@@ -413,12 +396,12 @@ int64_t time_type_impl::from_sstring(sstring_view s) {
 }
 
 uuid_type_impl::uuid_type_impl()
-    : concrete_type(kind::uuid, uuid_type_name, 16, data::type_info::make_fixed_size(sizeof(uint64_t) * 2)) {}
+    : concrete_type(kind::uuid, uuid_type_name, 16) {}
 
 using inet_address = seastar::net::inet_address;
 
 inet_addr_type_impl::inet_addr_type_impl()
-    : concrete_type<inet_address>(kind::inet, inet_addr_type_name, {}, data::type_info::make_variable_size()) {}
+    : concrete_type<inet_address>(kind::inet, inet_addr_type_name, {}) {}
 
 // Integer of same length of a given type. This is useful because our
 // ntoh functions only know how to operate on integers.
@@ -458,12 +441,12 @@ double_type_impl::double_type_impl() : floating_type_impl{kind::double_kind, dou
 
 float_type_impl::float_type_impl() : floating_type_impl{kind::float_kind, float_type_name, 4} {}
 
-varint_type_impl::varint_type_impl() : concrete_type{kind::varint, varint_type_name, { }, data::type_info::make_variable_size()} { }
+varint_type_impl::varint_type_impl() : concrete_type{kind::varint, varint_type_name, { }} { }
 
-decimal_type_impl::decimal_type_impl() : concrete_type{kind::decimal, decimal_type_name, { }, data::type_info::make_variable_size()} { }
+decimal_type_impl::decimal_type_impl() : concrete_type{kind::decimal, decimal_type_name, { }} { }
 
 counter_type_impl::counter_type_impl()
-    : abstract_type{kind::counter, counter_type_name, {}, data::type_info::make_variable_size()} {}
+    : abstract_type{kind::counter, counter_type_name, {}} {}
 
 // TODO(jhaberku): Move this to Seastar.
 template <size_t... Ts, class Function>
@@ -476,7 +459,7 @@ auto generate_tuple_from_index(std::index_sequence<Ts...>, Function&& f) {
 }
 
 duration_type_impl::duration_type_impl()
-    : concrete_type(kind::duration, duration_type_name, {}, data::type_info::make_variable_size()) {}
+    : concrete_type(kind::duration, duration_type_name, {}) {}
 
 using common_counter_type = cql_duration::common_counter_type;
 static std::tuple<common_counter_type, common_counter_type, common_counter_type> deserialize_counters(bytes_view v) {
@@ -496,7 +479,7 @@ static std::tuple<common_counter_type, common_counter_type, common_counter_type>
 }
 
 empty_type_impl::empty_type_impl()
-    : abstract_type(kind::empty, empty_type_name, 0, data::type_info::make_fixed_size(0)) {}
+    : abstract_type(kind::empty, empty_type_name, 0) {}
 
 logging::logger collection_type_impl::_logger("collection_type_impl");
 const size_t collection_type_impl::max_elements;
@@ -693,7 +676,7 @@ void write_simple(bytes_ostream& out, std::type_identity_t<T> val) {
     out.write(bytes_view(val_ptr, sizeof(T)));
 }
 
-void write_collection_value(bytes_ostream& out, cql_serialization_format sf, data::value_view val) {
+void write_collection_value(bytes_ostream& out, cql_serialization_format sf, atomic_cell_value_view val) {
     if (sf.using_32_bits_for_collections()) {
         write_simple<int32_t>(out, int32_t(val.size_bytes()));
     } else {
@@ -704,7 +687,7 @@ void write_collection_value(bytes_ostream& out, cql_serialization_format sf, dat
         }
         write_simple<uint16_t>(out, uint16_t(val.size_bytes()));
     }
-    for (auto&& frag : val) {
+    for (auto&& frag : fragment_range(val)) {
         out.write(frag);
     }
 }
@@ -1397,7 +1380,7 @@ static std::optional<data_type> update_listlike(
 }
 
 tuple_type_impl::tuple_type_impl(kind k, sstring name, std::vector<data_type> types, bool freeze_inner)
-        : concrete_type(k, std::move(name), { }, data::type_info::make_variable_size()), _types(std::move(types)) {
+        : concrete_type(k, std::move(name), { }), _types(std::move(types)) {
     if (freeze_inner) {
         for (auto& t : _types) {
             t = t->freeze();
@@ -1466,8 +1449,8 @@ struct validate_visitor {
     }
     void operator()(const ascii_type_impl&) {
         // ASCII can be validated independently for each fragment
-        for (View fv = v; fv.size_bytes() > 0; fv.remove_current()) {
-            if (!utils::ascii::validate(fv.current_fragment())) {
+        for (bytes_view frag : fragment_range(v)) {
+            if (!utils::ascii::validate(frag)) {
                 throw marshal_exception("Validation failed - non-ASCII character in an ASCII string");
             }
         }
@@ -1613,6 +1596,7 @@ void abstract_type::validate(const View& view, cql_serialization_format sf) cons
 // Explicit instantiation.
 template void abstract_type::validate<>(const single_fragmented_view&, cql_serialization_format) const;
 template void abstract_type::validate<>(const fragmented_temporary_buffer::view&, cql_serialization_format) const;
+template void abstract_type::validate<>(const managed_bytes_view&, cql_serialization_format) const;
 
 void abstract_type::validate(bytes_view v, cql_serialization_format sf) const {
     visit(*this, validate_visitor<single_fragmented_view>{single_fragmented_view(v), sf});
@@ -1856,6 +1840,10 @@ data_value collection_type_impl::deserialize_impl(View v, cql_serialization_form
 template data_value collection_type_impl::deserialize_impl<>(ser::buffer_view<bytes_ostream::fragment_iterator>, cql_serialization_format) const;
 template data_value collection_type_impl::deserialize_impl<>(fragmented_temporary_buffer::view, cql_serialization_format) const;
 template data_value collection_type_impl::deserialize_impl<>(single_fragmented_view, cql_serialization_format) const;
+template data_value collection_type_impl::deserialize_impl<>(managed_bytes_view, cql_serialization_format) const;
+
+template int read_collection_size(ser::buffer_view<bytes_ostream::fragment_iterator>& in, cql_serialization_format);
+template ser::buffer_view<bytes_ostream::fragment_iterator> read_collection_value(ser::buffer_view<bytes_ostream::fragment_iterator>& in, cql_serialization_format);
 
 template <FragmentedView View>
 data_value deserialize_aux(const tuple_type_impl& t, View v) {
@@ -2050,6 +2038,7 @@ data_value abstract_type::deserialize_impl(View v) const {
 template data_value abstract_type::deserialize_impl<>(fragmented_temporary_buffer::view) const;
 template data_value abstract_type::deserialize_impl<>(single_fragmented_view) const;
 template data_value abstract_type::deserialize_impl<>(ser::buffer_view<bytes_ostream::fragment_iterator>) const;
+template data_value abstract_type::deserialize_impl<>(managed_bytes_view) const;
 
 int32_t compare_aux(const tuple_type_impl& t, bytes_view v1, bytes_view v2) {
     // This is a slight modification of lexicographical_tri_compare:
@@ -2133,11 +2122,7 @@ struct compare_visitor {
         if (v2.empty()) {
             return 1;
         }
-        if (auto r = timeuuid_compare_bytes(v1, v2)) {
-            return r;
-        }
-        return lexicographical_tri_compare(
-                v1.begin(), v1.end(), v2.begin(), v2.end(), [] (const int8_t& a, const int8_t& b) { return a - b; });
+        return utils::timeuuid_tri_compare(v1, v2);
     }
     int32_t operator()(const listlike_collection_type_impl& l) {
         using llpdi = listlike_partial_deserializing_iterator;
@@ -2165,9 +2150,7 @@ struct compare_visitor {
         }
 
         if (c1 == 1) {
-            if (auto c = timeuuid_compare_bytes(v1, v2)) {
-                return c;
-            }
+            return utils::uuid_tri_compare_timeuuid(v1, v2);
         }
         return compare_unsigned(v1, v2);
     }
@@ -2239,12 +2222,30 @@ int32_t abstract_type::compare(bytes_view v1, bytes_view v2) const {
     }
 }
 
+int32_t abstract_type::compare(managed_bytes_view v1, managed_bytes_view v2) const {
+    // FIXME: don't linearize
+    return with_linearized(v1, [&] (bytes_view v1) {
+        return with_linearized(v2, [&] (bytes_view v2) {
+            return compare(v1, v2);
+        });
+    });
+}
+
 bool abstract_type::equal(bytes_view v1, bytes_view v2) const {
     return ::visit(*this, [&](const auto& t) {
         if (is_byte_order_equal_visitor{}(t)) {
             return compare_unsigned(v1, v2) == 0;
         }
         return compare_visitor{v1, v2}(t) == 0;
+    });
+}
+
+bool abstract_type::equal(managed_bytes_view v1, managed_bytes_view v2) const {
+    // FIXME: don't linearize
+    return with_linearized(v1, [&] (bytes_view v1) {
+        return with_linearized(v2, [&] (bytes_view v2) {
+            return equal(v1, v2);
+        });
     });
 }
 
@@ -2342,6 +2343,14 @@ size_t abstract_type::hash(bytes_view v) const {
     };
     return visit(*this, visitor{v});
 }
+
+size_t abstract_type::hash(managed_bytes_view v) const {
+    // FIXME: hash without linearization
+    return with_linearized(v, [&] (bytes_view v) {
+        return hash(v);
+    });
+}
+
 
 static size_t concrete_serialized_size(const byte_type_impl::native_type&) { return sizeof(int8_t); }
 static size_t concrete_serialized_size(const short_type_impl::native_type&) { return sizeof(int16_t); }
@@ -3032,21 +3041,13 @@ std::optional<data_type> abstract_type::update_user_type(const shared_ptr<const 
     return visit(*this, visitor{updated});
 }
 
-static bytes_view linearized(const data::value_view& v, std::vector<bytes>& store) {
-    if (v.is_fragmented()) {
-        return store.emplace_back(v.linearize());
-    }
-
-    return v.first_fragment();
-}
-
 static bytes_ostream serialize_for_cql_aux(const map_type_impl&, collection_mutation_view_description mut, cql_serialization_format sf) {
     bytes_ostream out;
     auto len_slot = out.write_place_holder(collection_size_len(sf));
     int elements = 0;
     for (auto&& e : mut.cells) {
         if (e.second.is_live(mut.tomb, false)) {
-            write_collection_value(out, sf, data::value_view(e.first));
+            write_collection_value(out, sf, atomic_cell_value_view(e.first));
             write_collection_value(out, sf, e.second.value());
             elements += 1;
         }
@@ -3061,7 +3062,7 @@ static bytes_ostream serialize_for_cql_aux(const set_type_impl&, collection_muta
     int elements = 0;
     for (auto&& e : mut.cells) {
         if (e.second.is_live(mut.tomb, false)) {
-            write_collection_value(out, sf, data::value_view(e.first));
+            write_collection_value(out, sf, atomic_cell_value_view(e.first));
             elements += 1;
         }
     }
@@ -3103,7 +3104,7 @@ static bytes_ostream serialize_for_cql_aux(const user_type_impl& type, collectio
         if (e.second.is_live(mut.tomb, false)) {
             auto value = e.second.value();
             write_simple<int32_t>(out, int32_t(value.size_bytes()));
-            for (auto&& frag : value) {
+            for (auto&& frag : fragment_range(value)) {
                 out.write(frag);
             }
         } else {

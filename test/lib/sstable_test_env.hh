@@ -22,30 +22,41 @@
 
 namespace sstables {
 
-class test_env {
-    std::unique_ptr<sstables_manager> _mgr;
+class test_env_sstables_manager : public sstables_manager {
+    using sstables_manager::sstables_manager;
 public:
-    explicit test_env() : _mgr(std::make_unique<sstables_manager>(nop_lp_handler, test_db_config, test_feature_service)) { }
+    sstable_writer_config configure_writer(sstring origin = "test") const {
+        return sstables_manager::configure_writer(std::move(origin));
+    }
+};
+
+class test_env {
+    std::unique_ptr<test_env_sstables_manager> _mgr;
+public:
+    explicit test_env() : _mgr(std::make_unique<test_env_sstables_manager>(nop_lp_handler, test_db_config, test_feature_service)) { }
 
     future<> stop() {
         return _mgr->close();
     }
 
     shared_sstable make_sstable(schema_ptr schema, sstring dir, unsigned long generation,
-            sstable::version_types v, sstable::format_types f = sstable::format_types::big,
+            sstable::version_types v = sstables::get_highest_sstable_version(), sstable::format_types f = sstable::format_types::big,
             size_t buffer_size = default_sstable_buffer_size, gc_clock::time_point now = gc_clock::now()) {
         return _mgr->make_sstable(std::move(schema), dir, generation, v, f, now, default_io_error_handler_gen(), buffer_size);
     }
 
     future<shared_sstable> reusable_sst(schema_ptr schema, sstring dir, unsigned long generation,
-            sstable::version_types version = sstable::version_types::la, sstable::format_types f = sstable::format_types::big) {
+            sstable::version_types version, sstable::format_types f = sstable::format_types::big) {
         auto sst = make_sstable(std::move(schema), dir, generation, version, f);
         return sst->load().then([sst = std::move(sst)] {
             return make_ready_future<shared_sstable>(std::move(sst));
         });
     }
 
-    sstables_manager& manager() { return *_mgr; }
+    // looks up the sstable in the given dir
+    future<shared_sstable> reusable_sst(schema_ptr schema, sstring dir, unsigned long generation);
+
+    test_env_sstables_manager& manager() { return *_mgr; }
 
     future<> working_sst(schema_ptr schema, sstring dir, unsigned long generation) {
         return reusable_sst(std::move(schema), dir, generation).then([] (auto ptr) { return make_ready_future<>(); });
@@ -54,7 +65,7 @@ public:
     template <typename Func>
     static inline auto do_with(Func&& func) {
         return seastar::do_with(test_env(), [func = std::move(func)] (test_env& env) mutable {
-            return func(env).finally([&env] {
+            return futurize_invoke(func, env).finally([&env] {
                 return env.stop();
             });
         });
@@ -63,7 +74,7 @@ public:
     template <typename T, typename Func>
     static inline auto do_with(T&& rval, Func&& func) {
         return seastar::do_with(test_env(), std::forward<T>(rval), [func = std::move(func)] (test_env& env, T& val) mutable {
-            return func(env, val).finally([&env] {
+            return futurize_invoke(func, env, val).finally([&env] {
                 return env.stop();
             });
         });

@@ -30,6 +30,7 @@
 #include "db_clock.hh"
 #include "dht/token.hh"
 #include "locator/token_metadata.hh"
+#include "utils/chunked_vector.hh"
 
 namespace seastar {
     class abort_source;
@@ -54,6 +55,7 @@ public:
 
     stream_id() = default;
     stream_id(bytes);
+    stream_id(dht::token, size_t);
 
     bool is_set() const;
     bool operator==(const stream_id&) const;
@@ -67,9 +69,6 @@ public:
 
     partition_key to_partition_key(const schema& log_schema) const;
     static int64_t token_from_bytes(bytes_view);
-private:
-    friend class topology_description_generator;
-    stream_id(dht::token, size_t);
 };
 
 /* Describes a mapping of tokens to CDC streams in a token range.
@@ -102,7 +101,8 @@ public:
     topology_description(std::vector<token_range_description> entries);
     bool operator==(const topology_description&) const;
 
-    const std::vector<token_range_description>& entries() const;
+    const std::vector<token_range_description>& entries() const&;
+    std::vector<token_range_description>&& entries() &&;
 };
 
 /**
@@ -111,14 +111,19 @@ public:
  */ 
 class streams_version {
 public:
-    std::vector<stream_id> streams;
+    utils::chunked_vector<stream_id> streams;
     db_clock::time_point timestamp;
-    std::optional<db_clock::time_point> expired;
 
-    streams_version(std::vector<stream_id> s, db_clock::time_point ts, std::optional<db_clock::time_point> exp)
+    streams_version(utils::chunked_vector<stream_id> s, db_clock::time_point ts)
         : streams(std::move(s))
         , timestamp(ts)
-        , expired(std::move(exp))
+    {}
+};
+
+class no_generation_data_exception : public std::runtime_error {
+public:
+    no_generation_data_exception(db_clock::time_point generation_ts)
+        : std::runtime_error(format("could not find generation data for timestamp {}", generation_ts))
     {}
 };
 
@@ -151,7 +156,7 @@ future<db_clock::time_point> get_local_streams_timestamp();
  * (not guaranteed in the current implementation, but expected to be the common case;
  *  we assume that `ring_delay` is enough for other nodes to learn about the new generation).
  */
-db_clock::time_point make_new_cdc_generation(
+future<db_clock::time_point> make_new_cdc_generation(
         const db::config& cfg,
         const std::unordered_set<dht::token>& bootstrap_tokens,
         const locator::token_metadata_ptr tmptr,
@@ -174,11 +179,20 @@ std::optional<db_clock::time_point> get_streams_timestamp_for(const gms::inet_ad
  *
  * Returning from this function does not mean that the table update was successful: the function
  * might run an asynchronous task in the background.
- *
- * Run inside seastar::async context.
  */
-void update_streams_description(
+future<> update_streams_description(
         db_clock::time_point,
+        shared_ptr<db::system_distributed_keyspace>,
+        noncopyable_function<unsigned()> get_num_token_owners,
+        abort_source&);
+
+/* Part of the upgrade procedure. Useful in case where the version of Scylla that we're upgrading from
+ * used the "cdc_streams_descriptions" table. This procedure ensures that the new "cdc_streams_descriptions_v2"
+ * table contains streams of all generations that were present in the old table and may still contain data
+ * (i.e. there exist CDC log tables that may contain rows with partition keys being the stream IDs from
+ * these generations). */
+future<> maybe_rewrite_streams_descriptions(
+        const database&,
         shared_ptr<db::system_distributed_keyspace>,
         noncopyable_function<unsigned()> get_num_token_owners,
         abort_source&);

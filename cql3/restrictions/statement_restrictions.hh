@@ -93,6 +93,9 @@ private:
 
     bool _has_queriable_regular_index = false, _has_queriable_pk_index = false, _has_queriable_ck_index = false;
 
+    std::optional<expr::expression> _where; ///< The entire WHERE clause.
+    std::vector<expr::expression> _clustering_prefix_restrictions; ///< Parts of _where defining the clustering slice.
+
 public:
     /**
      * Creates a new empty <code>StatementRestrictions</code>.
@@ -108,7 +111,6 @@ public:
         const std::vector<::shared_ptr<relation>>& where_clause,
         variable_specifications& bound_names,
         bool selects_only_static_columns,
-        bool select_a_collection,
         bool for_view = false,
         bool allow_filtering = false);
 
@@ -206,10 +208,9 @@ private:
      * Processes the clustering column restrictions.
      *
      * @param has_queriable_index <code>true</code> if some of the queried data are indexed, <code>false</code> otherwise
-     * @param select_a_collection <code>true</code> if the query should return a collection column
      * @throws InvalidRequestException if the request is invalid
      */
-    void process_clustering_columns_restrictions(bool select_a_collection, bool for_view, bool allow_filtering);
+    void process_clustering_columns_restrictions(bool for_view, bool allow_filtering);
 
     /**
      * Returns the <code>Restrictions</code> for the specified type of columns.

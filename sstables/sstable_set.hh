@@ -41,13 +41,9 @@ public:
 class sstable_set : public enable_lw_shared_from_this<sstable_set> {
     std::unique_ptr<sstable_set_impl> _impl;
     schema_ptr _schema;
-    // used to support column_family::get_sstable(), which wants to return an sstable_list
-    // that has a reference somewhere
-    lw_shared_ptr<sstable_list> _all;
-    std::unordered_map<utils::UUID, sstable_run> _all_runs;
 public:
     ~sstable_set();
-    sstable_set(std::unique_ptr<sstable_set_impl> impl, schema_ptr s, lw_shared_ptr<sstable_list> all);
+    sstable_set(std::unique_ptr<sstable_set_impl> impl, schema_ptr s);
     sstable_set(const sstable_set&);
     sstable_set(sstable_set&&) noexcept;
     sstable_set& operator=(const sstable_set&);
@@ -55,7 +51,10 @@ public:
     std::vector<shared_sstable> select(const dht::partition_range& range) const;
     // Return all runs which contain any of the input sstables.
     std::vector<sstable_run> select_sstable_runs(const std::vector<shared_sstable>& sstables) const;
-    lw_shared_ptr<sstable_list> all() const { return _all; }
+    // Return all sstables. It's not guaranteed that sstable_set will keep a reference to the returned list, so user should keep it.
+    lw_shared_ptr<sstable_list> all() const;
+    // Prefer for_each_sstable() over all() for iteration purposes, as the latter may have to copy all sstables into a temporary
+    void for_each_sstable(std::function<void(const shared_sstable&)> func) const;
     void insert(shared_sstable sst);
     void erase(shared_sstable sst);
 
@@ -100,7 +99,7 @@ public:
         schema_ptr,
         reader_permit,
         utils::estimated_histogram&,
-        const dht::ring_position&, // must contain a key
+        const dht::partition_range&, // must be singular and contain a key
         const query::partition_slice&,
         const io_priority_class&,
         tracing::trace_state_ptr,
@@ -133,6 +132,17 @@ public:
         streamed_mutation::forwarding,
         mutation_reader::forwarding,
         read_monitor_generator& rmg = default_read_monitor_generator()) const;
+
+    flat_mutation_reader make_reader(
+            schema_ptr,
+            reader_permit,
+            const dht::partition_range&,
+            const query::partition_slice&,
+            const io_priority_class&,
+            tracing::trace_state_ptr,
+            streamed_mutation::forwarding,
+            mutation_reader::forwarding,
+            read_monitor_generator& rmg = default_read_monitor_generator()) const;
 };
 
 /// Read a range from the passed-in sstables.

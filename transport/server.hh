@@ -96,7 +96,6 @@ struct cql_query_state {
 struct cql_server_config {
     ::timeout_config timeout_config;
     size_t max_request_size;
-    std::function<utils::updateable_value<uint32_t> ()> get_max_concurrent_requests_updateable_value;
     std::function<semaphore& ()> get_service_memory_limiter_semaphore;
     sstring partitioner_name;
     unsigned sharding_ignore_msb;
@@ -148,7 +147,7 @@ private:
     qos::service_level_controller& _sl_controller;
 public:
     cql_server(distributed<cql3::query_processor>& qp, auth::service&,
-            service::migration_notifier& mn,
+            service::migration_notifier& mn, database& db,
             cql_server_config config,
             qos::service_level_controller& sl_controller);
     future<> listen(socket_address addr, std::shared_ptr<seastar::tls::credentials_builder> = {}, bool is_shard_aware = false, bool keepalive = false);
@@ -229,6 +228,7 @@ private:
         std::unique_ptr<cql_server::response> make_mutation_write_failure_error(int16_t stream, exceptions::exception_code err, sstring msg, db::consistency_level cl, int32_t received, int32_t numfailures, int32_t blockfor, db::write_type type, const tracing::trace_state_ptr& tr_state) const;
         std::unique_ptr<cql_server::response> make_already_exists_error(int16_t stream, exceptions::exception_code err, sstring msg, sstring ks_name, sstring cf_name, const tracing::trace_state_ptr& tr_state) const;
         std::unique_ptr<cql_server::response> make_unprepared_error(int16_t stream, exceptions::exception_code err, sstring msg, bytes id, const tracing::trace_state_ptr& tr_state) const;
+        std::unique_ptr<cql_server::response> make_function_failure_error(int16_t stream, exceptions::exception_code err, sstring msg, sstring ks_name, sstring func_name, std::vector<sstring> args, const tracing::trace_state_ptr& tr_state) const;
         std::unique_ptr<cql_server::response> make_error(int16_t stream, exceptions::exception_code err, sstring msg, const tracing::trace_state_ptr& tr_state) const;
         std::unique_ptr<cql_server::response> make_ready(int16_t stream, const tracing::trace_state_ptr& tr_state) const;
         std::unique_ptr<cql_server::response> make_supported(int16_t stream, const tracing::trace_state_ptr& tr_state) const;

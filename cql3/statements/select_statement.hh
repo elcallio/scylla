@@ -46,6 +46,8 @@
 
 namespace cql3 {
 
+class query_processor;
+
 namespace statements {
 
 /**
@@ -111,7 +113,7 @@ public:
     virtual bool depends_on_keyspace(const sstring& ks_name) const;
     virtual bool depends_on_column_family(const sstring& cf_name) const;
 
-    virtual future<::shared_ptr<cql_transport::messages::result_message>> execute(service::storage_proxy& proxy,
+    virtual future<::shared_ptr<cql_transport::messages::result_message>> execute(query_processor& qp,
         service::query_state& state, const query_options& options) const override;
 
     future<::shared_ptr<cql_transport::messages::result_message>> execute(service::storage_proxy& proxy,
@@ -136,7 +138,7 @@ public:
 
     bool has_group_by() const { return _group_by_cell_indices && !_group_by_cell_indices->empty(); }
 
-    db::timeout_clock::duration get_timeout(const query_options& options) const;
+    db::timeout_clock::duration get_timeout(const service::client_state& state, const query_options& options) const;
 
 protected:
     uint64_t do_get_limit(const query_options& options, ::shared_ptr<term> limit, uint64_t default_limit) const;

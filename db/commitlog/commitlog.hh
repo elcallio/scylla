@@ -112,6 +112,7 @@ public:
         sstring commit_log_location;
         sstring metrics_category_name;
         uint64_t commitlog_total_space_in_mb = 0;
+        std::optional<uint64_t> commitlog_flush_threshold_in_mb = {};
         uint64_t commitlog_segment_size_in_mb = 32;
         uint64_t commitlog_sync_period_in_ms = 10 * 1000; //TODO: verify default!
         // Max number of segments to keep in pre-alloc reserve.
@@ -128,6 +129,7 @@ public:
         bool reuse_segments = true;
         bool use_o_dsync = false;
         bool warn_about_segments_left_on_disk_after_shutdown = true;
+        bool allow_going_over_size_limit = false;
 
         const db::extensions * extensions = nullptr;
     };
@@ -140,9 +142,12 @@ public:
         static const std::string FILENAME_PREFIX;
         static const std::string FILENAME_EXTENSION;
 
+        static inline constexpr uint32_t segment_version_1 = 1u;
+        static inline constexpr uint32_t segment_version_2 = 2u;
+
         descriptor(descriptor&&) noexcept = default;
         descriptor(const descriptor&) = default;
-        descriptor(segment_id_type i, const std::string& fname_prefix, uint32_t v = 1, sstring = {});
+        descriptor(segment_id_type i, const std::string& fname_prefix, uint32_t v = segment_version_2, sstring = {});
         descriptor(replay_position p, const std::string& fname_prefix = FILENAME_PREFIX);
         descriptor(const sstring& filename, const std::string& fname_prefix = FILENAME_PREFIX);
 
@@ -215,6 +220,13 @@ public:
      * @param entry_writer a writer responsible for writing the entry
      */
     future<rp_handle> add_entry(const cf_id_type& id, const commitlog_entry_writer& entry_writer, db::timeout_clock::time_point timeout);
+
+    /**
+     * Add N entries to the commit log as a single operation (in a single segment).
+     * Resolves with timed_out_error when timeout is reached.
+     * @param entry_writers a vector of writers responsible for writing respective entry
+     */
+    future<std::vector<rp_handle>> add_entries(std::vector<commitlog_entry_writer> entry_writers, db::timeout_clock::time_point timeout);
 
     /**
      * Modifies the per-CF dirty cursors of any commit log segments for the column family according to the position
@@ -382,15 +394,7 @@ public:
 private:
     commitlog(config);
 
-    struct entry_writer {
-        force_sync sync;
-        explicit entry_writer(force_sync sync_) : sync(sync_) {}
-        virtual size_t size(segment&) = 0;
-        // Returns segment-independent size of the entry. Must be <= than segment-dependant size.
-        virtual size_t size() = 0;
-        virtual void write(segment&, output&) = 0;
-        virtual ~entry_writer() {};
-    };
+    struct entry_writer;
 };
 
 }

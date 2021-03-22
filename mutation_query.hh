@@ -141,7 +141,7 @@ class reconcilable_result_builder {
     utils::chunked_vector<partition> _result;
 public:
     reconcilable_result_builder(const schema& s, const query::partition_slice& slice,
-                                query::result_memory_accounter&& accounter)
+                                query::result_memory_accounter&& accounter) noexcept
         : _schema(s), _slice(slice)
         , _memory_accounter(std::move(accounter))
     { }
@@ -155,7 +155,23 @@ public:
     reconcilable_result consume_end_of_stream();
 };
 
-query::result to_data_query_result(const reconcilable_result&, schema_ptr, const query::partition_slice&, uint64_t row_limit, uint32_t partition_limit, query::result_options opts = query::result_options::only_result());
+query::result to_data_query_result(
+        const reconcilable_result&,
+        schema_ptr,
+        const query::partition_slice&,
+        uint64_t row_limit,
+        uint32_t partition_limit,
+        query::result_options opts = query::result_options::only_result());
+
+// Query the content of the mutation.
+//
+// The mutation is destroyed in the process, see `mutation::consume()`.
+query::result query_mutation(
+        mutation&& m,
+        const query::partition_slice& slice,
+        uint64_t row_limit = query::max_rows,
+        gc_clock::time_point now = gc_clock::now(),
+        query::result_options opts = query::result_options::only_result());
 
 // Performs a query on given data source returning data in reconcilable form.
 //

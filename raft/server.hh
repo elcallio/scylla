@@ -39,12 +39,15 @@ public:
         size_t snapshot_trailing = 200;
         // max size of appended entries in bytes
         size_t append_request_threshold = 100000;
-        // max number of entries of in-memory part of the log after
-        // which requests are stopped to be addmitted unill the log
-        // is shrunk back by snapshoting. It has to be greater than
-        // snapshot_threshold otherwise submition of new entries will
-        // deadlock. 
-        size_t max_log_length = 5000;
+        // Max number of entries of in-memory part of the log after
+        // which requests are stopped to be admitted until the log
+        // is shrunk back by a snapshot. Should be greater than
+        // whatever the default number of trailing log entries
+        // is configured by the snapshot, otherwise the state
+        // machine will deadlock on attempt to submit a new entry.
+        size_t max_log_size = 5000;
+        // If set to true will enable prevoting stage during election
+        bool enable_prevoting = true;
     };
 
     virtual ~server() {}
@@ -57,21 +60,17 @@ public:
     // by another leader. In the later case dropped_entry exception will be returned.
     virtual future<> add_entry(command command, wait_type type) = 0;
 
-    // Add new server to a cluster. If a node is already a member
-    // of the cluster does nothing. Provided node_info is passed to
-    // rpc::new_node() on each node in a cluster as it learns
-    // about joining node. Connection info can be passed there.
+    // Set a new cluster configuration. If the configuration is
+    // identical to the previous one does nothing.
+    // Provided node_info is passed to rpc::add_server() for each
+    // new server and rpc::remove_server() is called for each
+    // departing server.
+    // struct node_info is expected to contain connection
+    // information/credentials which is then used by RPC.
     // Can be called on a leader only, otherwise throws not_a_leader.
-    // Cannot be called until previous add/remove server completes
-    // otherwise conf_change_in_progress exception is thrown.
-    virtual future<> add_server(server_id id, server_info node_info, clock_type::duration timeout) = 0;
-
-    // Remove a server from the cluster. If the server is not a member
-    // of the cluster does nothing. Can be called on a leader only
-    // otherwise throws not_a_leader.
-    // Cannot be called until previous add/remove server completes
-    // otherwise conf_change_in_progress exception is thrown.
-    virtual future<> remove_server(server_id id, clock_type::duration timeout) = 0;
+    // Cannot be called until previous set_configuration() completes
+    // otherwise throws conf_change_in_progress exception.
+    virtual future<> set_configuration(server_address_set c_new) = 0;
 
     // Load persisted state and start background work that needs
     // to run for this Raft server to function; The object cannot
@@ -97,7 +96,7 @@ public:
     //
     // 1) The result of all completed
     //    add_entries(wait_type::applied) can be observed by
-    //    direct access to the local state machine. 
+    //    direct access to the local state machine.
     // 2) A subsequent add_entry() is likely to find this
     //    server still in the leader role.
     // 3) If the caller ensures that writes to the state machine
@@ -122,13 +121,15 @@ public:
 
     // Ad hoc functions for testing
     virtual future<> elect_me_leader() = 0;
+    virtual future<> wait_log_idx(index_t) = 0;
+    virtual index_t log_last_idx() = 0;
     virtual void elapse_election() = 0;
     virtual bool is_leader() = 0;
     virtual void tick() = 0;
 };
 
 std::unique_ptr<server> create_server(server_id uuid, std::unique_ptr<rpc> rpc,
-        std::unique_ptr<state_machine> state_machine, std::unique_ptr<storage> storage,
+        std::unique_ptr<state_machine> state_machine, std::unique_ptr<persistence> persistence,
         seastar::shared_ptr<failure_detector> failure_detector, server::configuration config);
 
 } // namespace raft

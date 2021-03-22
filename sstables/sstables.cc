@@ -67,6 +67,9 @@
 #include "sstables_manager.hh"
 #include <boost/algorithm/string/predicate.hpp>
 #include "tracing/traced_file.hh"
+#include "kl/reader.hh"
+#include "mx/reader.hh"
+#include "utils/bit_cast.hh"
 
 thread_local disk_error_signal_type sstable_read_error;
 thread_local disk_error_signal_type sstable_write_error;
@@ -203,54 +206,35 @@ static void check_buf_size(temporary_buffer<char>& buf, size_t expected) {
     }
 }
 
-// Base parser, parses an integer type
 template <typename T>
-typename std::enable_if_t<std::is_integral<T>::value, void>
-read_integer(temporary_buffer<char>& buf, T& i) {
-    auto *nr = reinterpret_cast<const net::packed<T> *>(buf.get());
-    i = net::ntoh(*nr);
-}
-
-template <typename T>
-typename std::enable_if_t<std::is_integral<T>::value, future<>>
-parse(const schema&, sstable_version_types v, random_access_reader& in, T& i) {
+requires std::is_integral_v<T>
+future<> parse(const schema&, sstable_version_types v, random_access_reader& in, T& i) {
     return in.read_exactly(sizeof(T)).then([&i] (auto buf) {
         check_buf_size(buf, sizeof(T));
-
-        read_integer(buf, i);
+        i = net::ntoh(read_unaligned<T>(buf.get()));
         return make_ready_future<>();
     });
 }
 
-
 template <typename T>
-typename std::enable_if_t<std::is_enum<T>::value, future<>>
-parse(const schema& s, sstable_version_types v, random_access_reader& in, T& i) {
-    return parse(s, v, in, reinterpret_cast<typename std::underlying_type<T>::type&>(i));
+requires std::is_enum_v<T>
+future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, T& i) {
+    return in.read_exactly(sizeof(T)).then([&i] (auto buf) {
+        check_buf_size(buf, sizeof(T));
+        i = static_cast<T>(net::ntoh(read_unaligned<std::underlying_type_t<T>>(buf.get())));
+        return make_ready_future<>();
+    });
 }
 
 future<> parse(const schema& s, sstable_version_types v, random_access_reader& in, bool& i) {
     return parse(s, v, in, reinterpret_cast<uint8_t&>(i));
 }
 
-template <typename To, typename From>
-static inline To convert(From f) {
-    static_assert(sizeof(To) == sizeof(From), "Sizes must match");
-    union {
-        To to;
-        From from;
-    } conv;
-
-    conv.from = f;
-    return conv.to;
-}
-
 future<> parse(const schema&, sstable_version_types, random_access_reader& in, double& d) {
     return in.read_exactly(sizeof(double)).then([&d] (auto buf) {
         check_buf_size(buf, sizeof(double));
-
-        auto *nr = reinterpret_cast<const net::packed<unsigned long> *>(buf.get());
-        d = convert<double>(net::ntoh(*nr));
+        unsigned long nr = read_unaligned<unsigned long>(buf.get());
+        d = bit_cast<double>(net::ntoh(nr));
         return make_ready_future<>();
     });
 }
@@ -360,9 +344,8 @@ parse(const schema&, sstable_version_types, random_access_reader& in, Size& len,
         return in.read_exactly(now * sizeof(Members)).then([&arr, len, now, done] (auto buf) {
             check_buf_size(buf, now * sizeof(Members));
 
-            auto *nr = reinterpret_cast<const net::packed<Members> *>(buf.get());
             for (size_t i = 0; i < now; ++i) {
-                arr.push_back(net::ntoh(nr[i]));
+                arr.push_back(net::ntoh(read_unaligned<Members>(buf.get() + i * sizeof(Members))));
             }
             *done += now;
             return make_ready_future<stop_iteration>(*done == len ? stop_iteration::yes : stop_iteration::no);
@@ -681,10 +664,9 @@ future<> parse(const schema& s, sstable_version_types v, random_access_reader& i
             check_buf_size(buf, length * type_size);
 
             return do_with(size_t(0), std::move(buf), [&eh, length] (size_t& j, auto& buf) mutable {
-                auto *nr = reinterpret_cast<const net::packed<uint64_t> *>(buf.get());
-                return do_until([&eh, length] { return eh.buckets.size() == length; }, [nr, &eh, &j] () mutable {
-                    auto offset = net::ntoh(nr[j++]);
-                    auto bucket = net::ntoh(nr[j++]);
+                return do_until([&eh, length] { return eh.buckets.size() == length; }, [&eh, &j, &buf] () mutable {
+                    auto offset = net::ntoh(read_unaligned<uint64_t>(buf.get() + (j++) * sizeof(uint64_t)));
+                    auto bucket = net::ntoh(read_unaligned<uint64_t>(buf.get() + (j++) * sizeof(uint64_t)));
                     if (eh.buckets.size() > 0) {
                         eh.bucket_offsets.push_back(offset);
                     }
@@ -702,14 +684,14 @@ void write(sstable_version_types v, file_writer& out, const utils::estimated_his
 
     write(v, out, len);
     struct element {
-        uint64_t offsets;
-        uint64_t buckets;
+        int64_t offsets;
+        int64_t buckets;
     };
     std::vector<element> elements;
     elements.reserve(eh.buckets.size());
 
-    auto *offsets_nr = reinterpret_cast<const net::packed<uint64_t> *>(eh.bucket_offsets.data());
-    auto *buckets_nr = reinterpret_cast<const net::packed<uint64_t> *>(eh.buckets.data());
+    const int64_t* offsets_nr = eh.bucket_offsets.data();
+    const int64_t* buckets_nr = eh.buckets.data();
     for (size_t i = 0; i < eh.buckets.size(); i++) {
         auto offsets = net::hton(offsets_nr[i == 0 ? 0 : i - 1]);
         auto buckets = net::hton(buckets_nr[i]);
@@ -801,9 +783,8 @@ future<> parse(const schema& s, sstable_version_types v, random_access_reader& i
             return do_until(eoarr, [&in, &c, &len, &offsets] () {
                 auto now = std::min(len - c.offsets.size(), 100000 / sizeof(uint64_t));
                 return in.read_exactly(now * sizeof(uint64_t)).then([&offsets, now] (auto buf) {
-                    uint64_t value;
                     for (size_t i = 0; i < now; ++i) {
-                        std::copy_n(buf.get() + i * sizeof(uint64_t), sizeof(uint64_t), reinterpret_cast<char*>(&value));
+                        uint64_t value = read_unaligned<uint64_t>(buf.get() + i * sizeof(uint64_t));
                         offsets.push_back(net::ntoh(value));
                     }
                 });
@@ -1322,6 +1303,10 @@ future<> sstable::open_data() noexcept {
         if (ld_stats) {
             _large_data_stats.emplace(*ld_stats);
         }
+        auto* origin = _components->scylla_metadata->data.get<scylla_metadata_type::SSTableOrigin, scylla_metadata::sstable_origin>();
+        if (origin) {
+            _origin = sstring(to_sstring_view(bytes_view(origin->value)));
+        }
     });
 }
 
@@ -1596,7 +1581,7 @@ sstable::read_scylla_metadata(const io_priority_class& pc) noexcept {
 
 void
 sstable::write_scylla_metadata(const io_priority_class& pc, shard_id shard, sstable_enabled_features features, struct run_identifier identifier,
-        std::optional<scylla_metadata::large_data_stats> ld_stats) {
+        std::optional<scylla_metadata::large_data_stats> ld_stats, sstring origin) {
     auto&& first_key = get_first_decorated_key();
     auto&& last_key = get_last_decorated_key();
     auto sm = create_sharding_metadata(_schema, first_key, last_key, shard);
@@ -1616,6 +1601,11 @@ sstable::write_scylla_metadata(const io_priority_class& pc, shard_id shard, ssta
     _components->scylla_metadata->data.set<scylla_metadata_type::RunIdentifier>(std::move(identifier));
     if (ld_stats) {
         _components->scylla_metadata->data.set<scylla_metadata_type::LargeDataStats>(std::move(*ld_stats));
+    }
+    if (!origin.empty()) {
+        scylla_metadata::sstable_origin o;
+        o.value = bytes(to_bytes_view(sstring_view(origin)));
+        _components->scylla_metadata->data.set<scylla_metadata_type::SSTableOrigin>(std::move(o));
     }
 
     write_simple<component_type::Scylla>(*_components->scylla_metadata, pc);
@@ -1697,9 +1687,7 @@ future<> sstable::write_components(
     assert_large_data_handler_is_running();
     return seastar::async([this, mr = std::move(mr), estimated_partitions, schema = std::move(schema), cfg, stats, &pc] () mutable {
         auto wr = get_writer(*schema, estimated_partitions, cfg, stats, pc);
-        auto validator = mutation_fragment_stream_validating_filter(format("sstable writer {}", get_filename()), *schema,
-                cfg.validate_keys);
-        mr.consume_in_thread(std::move(wr), std::move(validator), db::no_timeout);
+        mr.consume_in_thread(std::move(wr), db::no_timeout);
     }).finally([this] {
         assert_large_data_handler_is_running();
     });
@@ -1753,7 +1741,7 @@ future<> sstable::generate_summary(const io_priority_class& pc) {
                         [this, &pc, options = std::move(options), index_file, index_size] (summary_generator& s) mutable {
                     auto sem = std::make_unique<reader_concurrency_semaphore>(reader_concurrency_semaphore::no_limits{});
                     auto ctx = make_lw_shared<index_consume_entry_context<summary_generator>>(
-                            sem->make_permit(_schema.get(), "generate-summary"), s, trust_promoted_index::yes, *_schema, "", index_file, std::move(options), 0, index_size,
+                            sem->make_permit(_schema.get(), "generate-summary"), s, trust_promoted_index::yes, *_schema, index_file, std::move(options), 0, index_size,
                             (_version >= sstable_version_types::mc
                                 ? std::make_optional(get_clustering_values_fixed_lengths(get_serialization_header()))
                                 : std::optional<column_values_fixed_lengths>{}));
@@ -2079,6 +2067,23 @@ future<> sstable::move_to_new_dir(sstring new_dir, int64_t new_generation, bool 
         }
         return when_all_succeed(sync_directory(old_dir), sync_directory(new_dir)).discard_result();
     });
+}
+
+flat_mutation_reader
+sstable::make_reader(
+        schema_ptr schema,
+        reader_permit permit,
+        const dht::partition_range& range,
+        const query::partition_slice& slice,
+        const io_priority_class& pc,
+        tracing::trace_state_ptr trace_state,
+        streamed_mutation::forwarding fwd,
+        mutation_reader::forwarding fwd_mr,
+        read_monitor& mon) {
+    if (_version >= version_types::mc) {
+        return mx::make_reader(shared_from_this(), std::move(schema), std::move(permit), range, slice, pc, std::move(trace_state), fwd, fwd_mr, mon);
+    }
+    return kl::make_reader(shared_from_this(), std::move(schema), std::move(permit), range, slice, pc, std::move(trace_state), fwd, fwd_mr, mon);
 }
 
 entry_descriptor entry_descriptor::make_descriptor(sstring sstdir, sstring fname) {
@@ -2832,8 +2837,6 @@ future<> init_metrics() {
             sm::description("Number of single partition flat mutation reads")),
         sm::make_derive("range_partition_reads", [] { return sstables_stats::get_shard_stats().range_partition_reads; },
             sm::description("Number of partition range flat mutation reads")),
-        sm::make_derive("sstable_partition_reads", [] { return sstables_stats::get_shard_stats().sstable_partition_reads; },
-            sm::description("Number of whole sstable flat mutation reads")),
         sm::make_derive("partition_reads", [] { return sstables_stats::get_shard_stats().partition_reads; },
             sm::description("Number of partitions read")),
         sm::make_derive("partition_seeks", [] { return sstables_stats::get_shard_stats().partition_seeks; },
@@ -2858,15 +2861,7 @@ mutation_source sstable::as_mutation_source() {
             tracing::trace_state_ptr trace_state,
             streamed_mutation::forwarding fwd,
             mutation_reader::forwarding fwd_mr) mutable {
-        // CAVEAT: if as_mutation_source() is called on a single partition
-        // we want to optimize and read exactly this partition. As a
-        // consequence, fast_forward_to() will *NOT* work on the result,
-        // regardless of what the fwd_mr parameter says.
-        if (range.is_singular() && range.start()->value().has_key()) {
-            return sst->read_row_flat(s, std::move(permit), range.start()->value(), slice, pc, std::move(trace_state), fwd);
-        } else {
-            return sst->read_range_rows_flat(s, std::move(permit), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
-        }
+        return sst->make_reader(std::move(s), std::move(permit), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
     });
 }
 

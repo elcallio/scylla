@@ -65,7 +65,7 @@ namespace gms {
     class feature_service;
 }
 
-bool is_system_keyspace(const sstring& ks_name);
+bool is_system_keyspace(std::string_view ks_name);
 
 namespace db {
 
@@ -91,6 +91,8 @@ static constexpr auto LARGE_PARTITIONS = "large_partitions";
 static constexpr auto LARGE_ROWS = "large_rows";
 static constexpr auto LARGE_CELLS = "large_cells";
 static constexpr auto SCYLLA_LOCAL = "scylla_local";
+static constexpr auto RAFT = "raft";
+static constexpr auto RAFT_SNAPSHOTS = "raft_snapshots";
 extern const char *const CLIENTS;
 
 namespace v3 {
@@ -143,6 +145,8 @@ extern schema_ptr hints();
 extern schema_ptr batchlog();
 extern schema_ptr paxos();
 extern schema_ptr built_indexes(); // TODO (from Cassandra): make private
+schema_ptr raft();
+schema_ptr raft_snapshots();
 
 namespace legacy {
 
@@ -196,7 +200,7 @@ future<> set_scylla_local_param(const sstring& key, const sstring& value);
 future<std::optional<sstring>> get_scylla_local_param(const sstring& key);
 
 std::vector<schema_ptr> all_tables();
-void make(database& db, bool durable, bool volatile_testing_only = false);
+future<> make(database& db);
 
 /// overloads
 
@@ -622,6 +626,9 @@ future<> save_paxos_promise(const schema& s, const partition_key& key, const uti
 future<> save_paxos_proposal(const schema& s, const service::paxos::proposal& proposal, db::timeout_clock::time_point timeout);
 future<> save_paxos_decision(const schema& s, const service::paxos::proposal& decision, db::timeout_clock::time_point timeout);
 future<> delete_paxos_decision(const schema& s, const partition_key& key, const utils::UUID& ballot, db::timeout_clock::time_point timeout);
+
+future<bool> cdc_is_rewritten();
+future<> cdc_set_rewritten(std::optional<db_clock::time_point>);
 
 } // namespace system_keyspace
 } // namespace db

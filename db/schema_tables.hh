@@ -155,6 +155,8 @@ future<> save_system_schema(cql3::query_processor& qp, const sstring & ks);
 // saves/creates "system_schema" keyspace
 future<> save_system_keyspace_schema(cql3::query_processor& qp);
 
+future<utils::UUID> calculate_schema_digest(distributed<service::storage_proxy>& proxy, schema_features, noncopyable_function<bool(std::string_view)> accept_keyspace);
+// Calculates schema digest for all non-system keyspaces
 future<utils::UUID> calculate_schema_digest(distributed<service::storage_proxy>& proxy, schema_features);
 
 future<std::vector<canonical_mutation>> convert_schema_to_mutations(distributed<service::storage_proxy>& proxy, schema_features);
@@ -165,8 +167,6 @@ read_schema_partition_for_keyspace(distributed<service::storage_proxy>& proxy, c
 future<mutation> read_keyspace_mutation(distributed<service::storage_proxy>&, const sstring& keyspace_name);
 
 future<> merge_schema(distributed<service::storage_proxy>& proxy, gms::feature_service& feat, std::vector<mutation> mutations);
-
-future<> merge_schema(distributed<service::storage_proxy>& proxy, std::vector<mutation> mutations, bool do_flush);
 
 // Recalculates the local schema version.
 //
@@ -228,7 +228,9 @@ std::vector<mutation> make_update_view_mutations(lw_shared_ptr<keyspace_metadata
 
 std::vector<mutation> make_drop_view_mutations(lw_shared_ptr<keyspace_metadata> keyspace, view_ptr view, api::timestamp_type timestamp);
 
-future<> maybe_update_legacy_secondary_index_mv_schema(service::migration_manager& mm, database& db, view_ptr v);
+class preserve_version_tag {};
+using preserve_version = bool_class<preserve_version_tag>;
+view_ptr maybe_fix_legacy_secondary_index_mv_schema(database& db, const view_ptr& v, schema_ptr base_schema, preserve_version preserve_version);
 
 sstring serialize_kind(column_kind kind);
 column_kind deserialize_kind(sstring kind);

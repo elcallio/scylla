@@ -9,6 +9,7 @@
  */
 
 #include "flat_mutation_reader.hh"
+#include "mutation_fragment_stream_validator.hh"
 #include "mutation_reader.hh"
 #include "seastar/util/reference_wrapper.hh"
 #include "clustering_ranges_walker.hh"
@@ -156,7 +157,7 @@ flat_mutation_reader make_reversing_reader(flat_mutation_reader& original, query
             });
         }
 
-        virtual void next_partition() override {
+        virtual future<> next_partition() override {
             clear_buffer_to_next_partition();
             if (is_buffer_empty() && !is_end_of_stream()) {
                 while (!_mutation_fragments.empty()) {
@@ -165,8 +166,9 @@ flat_mutation_reader make_reversing_reader(flat_mutation_reader& original, query
                 }
                 _range_tombstones.clear();
                 _partition_end = std::nullopt;
-                _source->next_partition();
+                return _source->next_partition();
             }
+            return make_ready_future<>();
         }
 
         virtual future<> fast_forward_to(const dht::partition_range&, db::timeout_clock::time_point) override {
@@ -259,17 +261,21 @@ flat_mutation_reader make_forwardable(flat_mutation_reader m) {
             forward_buffer_to(_current.start());
             return make_ready_future<>();
         }
-        virtual void next_partition() override {
+        virtual future<> next_partition() override {
             _end_of_stream = false;
+            auto maybe_next_partition = make_ready_future<>();
             if (!_next || !_next->is_partition_start()) {
-                _underlying.next_partition();
+              maybe_next_partition = _underlying.next_partition().then([this] {
                 _next = {};
+              });
             }
+          return maybe_next_partition.then([this] {
             clear_buffer_to_next_partition();
             _current = {
                 position_in_partition(position_in_partition::partition_start_tag_t()),
                 position_in_partition(position_in_partition::after_static_row_tag_t())
             };
+          });
         }
         virtual future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override {
             _end_of_stream = false;
@@ -303,11 +309,12 @@ flat_mutation_reader make_nonforwardable(flat_mutation_reader r, bool single_par
                 _end_of_stream = true;
                 return make_ready_future<>();
             }
-            _underlying.next_partition();
+          return _underlying.next_partition().then([this, timeout] {
             _static_row_done = false;
             return _underlying.fill_buffer(timeout).then([this] {
                 _end_of_stream = is_end_end_of_underlying_stream();
             });
+          });
         }
     public:
         reader(flat_mutation_reader r, bool single_partition)
@@ -328,12 +335,15 @@ flat_mutation_reader make_nonforwardable(flat_mutation_reader r, bool single_par
         virtual future<> fast_forward_to(position_range pr, db::timeout_clock::time_point timeout) override {
             return make_exception_future<>(make_backtraced_exception_ptr<std::bad_function_call>());
         }
-        virtual void next_partition() override {
+        virtual future<> next_partition() override {
             clear_buffer_to_next_partition();
+            auto maybe_next_partition = make_ready_future<>();;
             if (is_buffer_empty()) {
-                _underlying.next_partition();
+                maybe_next_partition = _underlying.next_partition();
             }
+          return maybe_next_partition.then([this] {
             _end_of_stream = is_end_end_of_underlying_stream();
+          });
         }
         virtual future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override {
             _end_of_stream = false;
@@ -348,7 +358,7 @@ class empty_flat_reader final : public flat_mutation_reader::impl {
 public:
     empty_flat_reader(schema_ptr s, reader_permit permit) : impl(std::move(s), std::move(permit)) { _end_of_stream = true; }
     virtual future<> fill_buffer(db::timeout_clock::time_point timeout) override { return make_ready_future<>(); }
-    virtual void next_partition() override {}
+    virtual future<> next_partition() override { return make_ready_future<>(); }
     virtual future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override { return make_ready_future<>(); };
     virtual future<> fast_forward_to(position_range cr, db::timeout_clock::time_point timeout) override { return make_ready_future<>(); };
 };
@@ -455,11 +465,8 @@ flat_mutation_reader_from_mutations(reader_permit permit, std::vector<mutation> 
         }
         void destroy_current_mutation() {
             auto &crs = _cur->partition().clustered_rows();
-            auto re = crs.unlink_leftmost_without_rebalance();
-            while (re) {
-                current_deleter<rows_entry>()(re);
-                re = crs.unlink_leftmost_without_rebalance();
-            }
+            auto deleter = current_deleter<rows_entry>();
+            crs.clear_and_dispose(deleter);
 
             auto &rts = _cur->partition().row_tombstones();
             auto rt = rts.pop_front_and_lock();
@@ -541,7 +548,7 @@ flat_mutation_reader_from_mutations(reader_permit permit, std::vector<mutation> 
             do_fill_buffer(timeout);
             return make_ready_future<>();
         }
-        virtual void next_partition() override {
+        virtual future<> next_partition() override {
             clear_buffer_to_next_partition();
             if (is_buffer_empty() && !is_end_of_stream()) {
                 destroy_current_mutation();
@@ -552,6 +559,7 @@ flat_mutation_reader_from_mutations(reader_permit permit, std::vector<mutation> 
                     start_new_partition();
                 }
             }
+            return make_ready_future<>();
         }
         virtual future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override {
             clear_buffer();
@@ -635,14 +643,15 @@ public:
     virtual future<> fast_forward_to(position_range pr, db::timeout_clock::time_point timeout) override {
         return make_exception_future<>(make_backtraced_exception_ptr<std::bad_function_call>());
     }
-    virtual void next_partition() override {
+    virtual future<> next_partition() override {
         if (!_reader) {
-            return;
+            return make_ready_future<>();
         }
         clear_buffer_to_next_partition();
         if (is_buffer_empty() && !is_end_of_stream()) {
-            _reader->next_partition();
+            return _reader->next_partition();
         }
+        return make_ready_future<>();
     }
 };
 
@@ -705,11 +714,12 @@ public:
         return make_exception_future<>(make_backtraced_exception_ptr<std::bad_function_call>());
     }
 
-    virtual void next_partition() override {
+    virtual future<> next_partition() override {
         clear_buffer_to_next_partition();
         if (is_buffer_empty() && !is_end_of_stream()) {
-            _reader.next_partition();
+            return _reader.next_partition();
         }
+        return make_ready_future<>();
     }
 };
 
@@ -837,13 +847,14 @@ make_flat_mutation_reader_from_fragments(schema_ptr schema, reader_permit permit
             }
             return make_ready_future<>();
         }
-        virtual void next_partition() override {
+        virtual future<> next_partition() override {
             clear_buffer_to_next_partition();
             if (is_buffer_empty()) {
                 while (!(_end_of_stream = end_of_range()) && !_fragments.front().is_partition_start()) {
                     _fragments.pop_front();
                 }
             }
+            return make_ready_future<>();
         }
         virtual future<> fast_forward_to(position_range pr, db::timeout_clock::time_point timeout) override {
             throw std::runtime_error("This reader can't be fast forwarded to another range.");
@@ -909,8 +920,8 @@ public:
             });
         });
     }
-    virtual void next_partition() override {
-        throw_with_backtrace<std::bad_function_call>();
+    virtual future<> next_partition() override {
+        return make_exception_future<>(make_backtraced_exception_ptr<std::bad_function_call>());
     }
     virtual future<> fast_forward_to(const dht::partition_range&, db::timeout_clock::time_point) override {
         return make_exception_future<>(make_backtraced_exception_ptr<std::bad_function_call>());
@@ -947,17 +958,25 @@ bool mutation_fragment_stream_validator::operator()(const dht::decorated_key& dk
     return false;
 }
 
-bool mutation_fragment_stream_validator::operator()(const mutation_fragment& mf) {
+bool mutation_fragment_stream_validator::operator()(dht::token t) {
+    if (_prev_partition_key.token() <= t) {
+        _prev_partition_key._token = t;
+        return true;
+    }
+    return false;
+}
+
+bool mutation_fragment_stream_validator::operator()(mutation_fragment::kind kind, position_in_partition_view pos) {
     if (_prev_kind == mutation_fragment::kind::partition_end) {
-        const bool valid = mf.is_partition_start();
+        const bool valid = (kind == mutation_fragment::kind::partition_start);
         if (valid) {
             _prev_kind = mutation_fragment::kind::partition_start;
-            _prev_pos = mf.position();
+            _prev_pos = pos;
         }
         return valid;
     }
     auto cmp = position_in_partition::tri_compare(_schema);
-    auto res = cmp(_prev_pos, mf.position());
+    auto res = cmp(_prev_pos, pos);
     bool valid = true;
     if (_prev_kind == mutation_fragment::kind::range_tombstone) {
         valid = res <= 0;
@@ -965,10 +984,14 @@ bool mutation_fragment_stream_validator::operator()(const mutation_fragment& mf)
         valid = res < 0;
     }
     if (valid) {
-        _prev_kind = mf.mutation_fragment_kind();
-        _prev_pos = mf.position();
+        _prev_kind = kind;
+        _prev_pos = pos;
     }
     return valid;
+}
+
+bool mutation_fragment_stream_validator::operator()(const mutation_fragment& mf) {
+    return (*this)(mf.mutation_fragment_kind(), mf.position());
 }
 
 bool mutation_fragment_stream_validator::operator()(mutation_fragment::kind kind) {
@@ -1010,39 +1033,63 @@ namespace {
 }
 
 bool mutation_fragment_stream_validating_filter::operator()(const dht::decorated_key& dk) {
-    if (_compare_keys) {
-        if (!_validator(dk)) {
-            on_validation_error(fmr_logger, format("[validator {} for {}] Unexpected partition key: previous {}, current {}",
-                    static_cast<void*>(this), _name, _validator.previous_partition_key(), dk));
-        }
+    if (_validation_level < mutation_fragment_stream_validation_level::token) {
+        return true;
     }
-    return true;
+    if (_validation_level == mutation_fragment_stream_validation_level::token) {
+        if (_validator(dk.token())) {
+            return true;
+        }
+        on_validation_error(fmr_logger, format("[validator {} for {}] Unexpected token: previous {}, current {}",
+                static_cast<void*>(this), _name, _validator.previous_token(), dk.token()));
+    } else {
+        if (_validator(dk)) {
+            return true;
+        }
+        on_validation_error(fmr_logger, format("[validator {} for {}] Unexpected partition key: previous {}, current {}",
+                static_cast<void*>(this), _name, _validator.previous_partition_key(), dk));
+    }
 }
 
-mutation_fragment_stream_validating_filter::mutation_fragment_stream_validating_filter(sstring_view name, const schema& s, bool compare_keys)
+mutation_fragment_stream_validating_filter::mutation_fragment_stream_validating_filter(sstring_view name, const schema& s,
+        mutation_fragment_stream_validation_level level)
     : _validator(s)
     , _name(format("{} ({}.{} {})", name, s.ks_name(), s.cf_name(), s.id()))
-    , _compare_keys(compare_keys)
+    , _validation_level(level)
 {
-    fmr_logger.debug("[validator {} for {}] Will validate {} monotonicity.", static_cast<void*>(this), _name,
-            compare_keys ? "keys" : "only partition regions");
+    if (fmr_logger.level() <= log_level::debug) {
+        std::string_view what;
+        switch (_validation_level) {
+            case mutation_fragment_stream_validation_level::partition_region:
+                what = "partition region";
+                break;
+            case mutation_fragment_stream_validation_level::token:
+                what = "partition region and token";
+                break;
+            case mutation_fragment_stream_validation_level::partition_key:
+                what = "partition region and partition key";
+                break;
+            case mutation_fragment_stream_validation_level::clustering_key:
+                what = "partition region, partition key and clustering key";
+                break;
+        }
+        fmr_logger.debug("[validator {} for {}] Will validate {} monotonicity.", static_cast<void*>(this), _name, what);
+    }
 }
 
-bool mutation_fragment_stream_validating_filter::operator()(const mutation_fragment& mv) {
-    auto kind = mv.mutation_fragment_kind();
-    auto pos = mv.position();
+bool mutation_fragment_stream_validating_filter::operator()(mutation_fragment::kind kind, position_in_partition_view pos) {
     bool valid = false;
 
     fmr_logger.debug("[validator {}] {}:{}", static_cast<void*>(this), kind, pos);
 
-    if (_compare_keys) {
-        valid = _validator(mv);
+    if (_validation_level >= mutation_fragment_stream_validation_level::clustering_key) {
+        valid = _validator(kind, pos);
     } else {
         valid = _validator(kind);
     }
 
     if (__builtin_expect(!valid, false)) {
-        if (_compare_keys) {
+        if (_validation_level >= mutation_fragment_stream_validation_level::clustering_key) {
             on_validation_error(fmr_logger, format("[validator {} for {}] Unexpected mutation fragment: previous {}:{}, current {}:{}",
                     static_cast<void*>(this), _name, _validator.previous_mutation_fragment_kind(), _validator.previous_position(), kind, pos));
         } else {
@@ -1052,6 +1099,14 @@ bool mutation_fragment_stream_validating_filter::operator()(const mutation_fragm
     }
 
     return true;
+}
+
+bool mutation_fragment_stream_validating_filter::operator()(const mutation_fragment& mv) {
+    return (*this)(mv.mutation_fragment_kind(), mv.position());
+}
+
+bool mutation_fragment_stream_validating_filter::on_end_of_partition() {
+    return (*this)(mutation_fragment::kind::partition_end, position_in_partition_view(position_in_partition_view::end_of_partition_tag_t()));
 }
 
 void mutation_fragment_stream_validating_filter::on_end_of_stream() {

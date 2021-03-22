@@ -21,6 +21,7 @@
 #pragma once
 
 #include <vector>
+#include <unordered_set>
 #include <functional>
 #include <boost/container/deque.hpp>
 #include <seastar/core/lowres_clock.hh>
@@ -40,7 +41,7 @@ using command_cref = std::reference_wrapper<const command>;
 extern seastar::logger logger;
 
 // This is user provided id for a snapshot
-using snapshot_id = internal::tagged_id<struct shapshot_id_tag>;
+using snapshot_id = internal::tagged_id<struct snapshot_id_tag>;
 // Unique identifier of a server in a Raft group
 using server_id = internal::tagged_id<struct server_id_tag>;
 
@@ -63,19 +64,99 @@ using server_info = bytes;
 
 struct server_address {
     server_id id;
+    bool can_vote = true;
     server_info info;
+    bool operator==(const server_address& rhs) const {
+        return id == rhs.id;
+    }
+};
+
+} // end of namespace raft
+
+namespace std {
+
+template <> struct hash<raft::server_address> {
+    size_t operator()(const raft::server_address& address) const {
+        return std::hash<raft::server_id>{}(address.id);
+    }
+};
+
+} // end of namespace std
+
+namespace raft {
+
+using server_address_set = std::unordered_set<server_address>;
+
+// A configuration change decomposed to joining and leaving
+// servers. Helps validate the configuration and update RPC.
+struct configuration_diff {
+    server_address_set joining, leaving;
 };
 
 struct configuration {
-    std::vector<server_address> servers;
+    // Contains the current configuration. When configuration
+    // change is in progress, contains the new configuration.
+    server_address_set current;
+    // Used during the transitioning period of configuration
+    // changes.
+    server_address_set previous;
 
     configuration(std::initializer_list<server_id> ids) {
-        servers.reserve(ids.size());
+        current.reserve(ids.size());
         for (auto&& id : ids) {
-            servers.emplace_back(server_address{std::move(id)});
+            current.emplace(server_address{std::move(id)});
         }
     }
-    configuration() = default;
+
+    configuration(server_address_set current_arg = {}, server_address_set previous_arg = {})
+        : current(std::move(current_arg)), previous(std::move(previous_arg)) {}
+
+    // Return true if the previous configuration is still
+    // in use
+    bool is_joint() const {
+        return !previous.empty();
+    }
+
+    // Check the proposed configuration and compute a diff
+    // between it and the current one.
+    configuration_diff diff(const server_address_set& c_new) const {
+        // We must have at least one voting member in the config.
+        if (std::count_if(c_new.begin(), c_new.end(), [] (const server_address& s) { return s.can_vote; }) == 0) {
+            throw std::invalid_argument("Attempt to transition to an empty Raft configuration");
+        }
+
+        configuration_diff diff;
+        // joining
+        for (const auto& s : c_new) {
+            auto it = current.find(s);
+            // a node is added to a joining set if it is not yet known or its voting status changes
+            if (it == current.end() || it->can_vote != s.can_vote) {
+                diff.joining.insert(s);
+            }
+        }
+
+        // leaving
+        for (const auto& s : current) {
+            if (c_new.count(s) == 0) {
+                diff.leaving.insert(s);
+            }
+        }
+        return diff;
+    }
+
+    // Enter a joint configuration given a new set of servers.
+    void enter_joint(server_address_set c_new) {
+        // @todo: validate that c_old & c_new are compatible.
+        assert(c_new.size());
+        previous = std::move(current);
+        current = std::move(c_new);
+    }
+
+    // Transition from C_old + C_new to C_new.
+    void leave_joint() {
+        assert(is_joint());
+        previous.clear();
+    }
 };
 
 struct log_entry {
@@ -129,7 +210,7 @@ struct snapshot {
     snapshot_id id;
 };
 
-struct append_request_base {
+struct append_request {
     // The leader's term.
     term_t current_term;
     // So that follower can redirect clients
@@ -141,17 +222,9 @@ struct append_request_base {
     term_t prev_log_term;
     // The leader's commit_idx.
     index_t leader_commit_idx;
-};
-
-struct append_request_send : public append_request_base {
     // Log entries to store (empty vector for heartbeat; may send more
     // than one entry for efficiency).
     std::vector<log_entry_ptr> entries;
-};
-struct append_request_recv : public append_request_base {
-    // Same as for append_request_send but unlike it here the
-    // message owns the entries.
-    std::vector<log_entry> entries;
 };
 
 struct append_reply {
@@ -170,11 +243,11 @@ struct append_reply {
     };
     // Current term, for leader to update itself.
     term_t current_term;
-    // Contains an index of the last commited entry on the follower
+    // Contains an index of the last committed entry on the follower
     // It is used by a leader to know if a follower is behind and issuing
     // empty append entry with updates commit_idx if it is
-    // Regular RAFT handles this by always sending enoty append requests 
-    // as a hearbeat.
+    // Regular RAFT handles this by always sending enoty append requests
+    // as a heartbeat.
     index_t commit_idx;
     std::variant<rejected, accepted> result;
 };
@@ -186,6 +259,8 @@ struct vote_request {
     index_t last_log_idx;
     // The term of the candidate's last log entry.
     term_t last_log_term;
+    // True if this is prevote request
+    bool is_prevote;
 };
 
 struct vote_reply {
@@ -193,6 +268,8 @@ struct vote_reply {
     term_t current_term;
     // True means the candidate received a vote.
     bool vote_granted;
+    // True if it is a reply to prevote request
+    bool is_prevote;
 };
 
 struct install_snapshot {
@@ -206,17 +283,17 @@ struct snapshot_reply {
     bool success;
 };
 
-using rpc_message = std::variant<append_request_send, append_reply, vote_request, vote_reply, install_snapshot, snapshot_reply>;
+using rpc_message = std::variant<append_request, append_reply, vote_request, vote_reply, install_snapshot, snapshot_reply>;
 
 // we need something that can be truncated form both sides.
 // std::deque move constructor is not nothrow hence cannot be used
 using log_entries = boost::container::deque<log_entry_ptr>;
 
-// rpc, storage and satte_machine classes will have to be implemented by the
+// rpc, persistence and state_machine classes will have to be implemented by the
 // raft user to provide network, persistency and busyness logic support
 // repectively.
 class rpc;
-class storage;
+class persistence;
 
 // Any of the functions may return an error, but it will kill the
 // raft instance that uses it. Depending on what state the failure
@@ -232,7 +309,7 @@ public:
     // This is called after entries are committed (replicated to
     // at least quorum of servers). If a provided vector contains
     // more than one entry all of them will be committed simultaneously.
-    // Will be eventually called on all replicas, for all commited commands.
+    // Will be eventually called on all replicas, for all committed commands.
     // Raft owns the data since it may be still replicating.
     // Raft will not call another apply until the retuned future
     // will not become ready.
@@ -282,7 +359,7 @@ public:
     // Send provided append_request to the supplied server, does
     // not wait for reply. The returned future resolves when
     // message is sent. It does not mean it was received.
-    virtual future<> send_append_entries(server_id id, const append_request_send& append_request) = 0;
+    virtual future<> send_append_entries(server_id id, const append_request& append_request) = 0;
 
     // Send a reply to an append_request. The returned future
     // resolves when message is sent. It does not mean it was
@@ -323,7 +400,7 @@ public:
     virtual ~rpc_server() {};
 
     // This function is called by append_entries RPC
-    virtual void append_entries(server_id from, append_request_recv append_request) = 0;
+    virtual void append_entries(server_id from, append_request append_request) = 0;
 
     // This function is called by append_entries_reply RPC
     virtual void append_entries_reply(server_id from, append_reply reply) = 0;
@@ -341,15 +418,15 @@ public:
     void set_rpc_server(class rpc *rpc) { rpc->_client = this; }
 };
 
-// This class represents persistent storage state. If any of the
+// This class represents persistent storage state for the internal fsm. If any of the
 // function returns an error the Raft instance will be aborted.
-class storage {
+class persistence {
 public:
-    virtual ~storage() {}
+    virtual ~persistence() {}
 
     // Persist given term and vote.
     // Can be called concurrently with other save-* functions in
-    // the storage and with itself but an implementation has to
+    // the persistence and with itself but an implementation has to
     // make sure that the result is returned back in the calling order.
     virtual future<> store_term_and_vote(term_t term, server_id vote) = 0;
 
@@ -395,8 +472,8 @@ public:
     // entries.
     virtual future<> truncate_log(index_t idx) = 0;
 
-    // Stop the storage instance by aborting the work that can be
-    // aborted and waiting for all the rest to complete any
+    // Stop the persistence instance by aborting the work that can be
+    // aborted and waiting for all the rest to complete. Any
     // unfinished store/load operation may return an error after
     // this function is called.
     virtual future<> abort() = 0;

@@ -30,7 +30,7 @@
 
 #include "cql3/statements/select_statement.hh"
 #include "cql3/statements/raw/select_statement.hh"
-
+#include "cql3/query_processor.hh"
 #include "transport/messages/result_message.hh"
 #include "cql3/functions/as_json_function.hh"
 #include "cql3/selection/selection.hh"
@@ -51,7 +51,7 @@
 #include "test/lib/select_statement_utils.hh"
 #include <boost/algorithm/cxx11/any_of.hpp>
 
-bool is_system_keyspace(const sstring& name);
+bool is_system_keyspace(std::string_view name);
 
 namespace cql3 {
 
@@ -150,8 +150,8 @@ select_statement::select_statement(schema_ptr schema,
     _opts.set_if<query::partition_slice::option::reversed>(_is_reversed);
 }
 
-db::timeout_clock::duration select_statement::get_timeout(const query_options& options) const {
-    return _attrs->is_timeout_set() ? _attrs->get_timeout(options) : options.get_timeout_config().*get_timeout_config_selector();
+db::timeout_clock::duration select_statement::get_timeout(const service::client_state& state, const query_options& options) const {
+    return _attrs->is_timeout_set() ? _attrs->get_timeout(options) : state.get_timeout_config().*get_timeout_config_selector();
 }
 
 ::shared_ptr<const cql3::metadata> select_statement::get_result_metadata() const {
@@ -277,10 +277,11 @@ static thread_local inheriting_concrete_execution_stage<
         const query_options&> select_stage{"cql3_select", select_statement_executor::get()};
 
 future<shared_ptr<cql_transport::messages::result_message>>
-select_statement::execute(service::storage_proxy& proxy,
+select_statement::execute(query_processor& qp,
                              service::query_state& state,
                              const query_options& options) const
 {
+    service::storage_proxy& proxy = qp.proxy();
     return select_stage(this, seastar::ref(proxy), seastar::ref(state), seastar::cref(options));
 }
 
@@ -360,7 +361,7 @@ select_statement::do_execute(service::storage_proxy& proxy,
     }
 
     command->slice.options.set<query::partition_slice::option::allow_short_read>();
-    auto timeout_duration = get_timeout(options);
+    auto timeout_duration = get_timeout(state.get_client_state(), options);
     auto timeout = db::timeout_clock::now() + timeout_duration;
     auto p = service::pager::query_pagers::pager(_schema, _selection,
             state, options, command, std::move(key_ranges), restrictions_need_filtering ? _restrictions : nullptr);
@@ -368,14 +369,14 @@ select_statement::do_execute(service::storage_proxy& proxy,
     if (aggregate || nonpaged_filtering) {
         return do_with(
                 cql3::selection::result_set_builder(*_selection, now,
-                        options.get_cql_serialization_format(), *_group_by_cell_indices),
-                [this, p, page_size, now, timeout, restrictions_need_filtering](auto& builder) {
-                    return do_until([p] {return p->is_exhausted();},
-                            [p, &builder, page_size, now, timeout] {
+                        options.get_cql_serialization_format(), *_group_by_cell_indices), std::move(p),
+                [this, page_size, now, timeout, restrictions_need_filtering](auto& builder, std::unique_ptr<service::pager::query_pager>& p) {
+                    return do_until([&p] {return p->is_exhausted();},
+                            [&p, &builder, page_size, now, timeout] {
                                 return p->fetch_page(builder, page_size, now, timeout);
                             }
-                    ).then([this, p, &builder, restrictions_need_filtering] {
-                        return builder.with_thread_if_needed([this, p, &builder, restrictions_need_filtering] {
+                    ).then([this, &p, &builder, restrictions_need_filtering] {
+                        return builder.with_thread_if_needed([this, &p, &builder, restrictions_need_filtering] {
                             auto rs = builder.build();
                             if (restrictions_need_filtering) {
                                 _stats.filtered_rows_read_total += p->stats().rows_read_total;
@@ -396,7 +397,7 @@ select_statement::do_execute(service::storage_proxy& proxy,
     }
 
     if (_selection->is_trivial() && !restrictions_need_filtering && !_per_partition_limit) {
-        return p->fetch_page_generator(page_size, now, timeout, _stats).then([this, p] (result_generator generator) {
+        return p->fetch_page_generator(page_size, now, timeout, _stats).then([this, p = std::move(p)] (result_generator generator) {
             auto meta = [&] () -> shared_ptr<const cql3::metadata> {
                 if (!p->is_exhausted()) {
                     auto meta = make_shared<metadata>(*_selection->get_result_metadata());
@@ -414,7 +415,7 @@ select_statement::do_execute(service::storage_proxy& proxy,
     }
 
     return p->fetch_page(page_size, now, timeout).then(
-            [this, p, &options, now, restrictions_need_filtering](std::unique_ptr<cql3::result_set> rs) {
+            [this, p = std::move(p), &options, now, restrictions_need_filtering](std::unique_ptr<cql3::result_set> rs) {
 
                 if (!p->is_exhausted()) {
                     rs->get_metadata().set_paging_state(p->state());
@@ -441,7 +442,7 @@ generate_base_key_from_index_pk(const partition_key& index_pk, const std::option
         return KeyType::make_empty();
     }
 
-    std::vector<bytes_view> exploded_base_key;
+    std::vector<managed_bytes_view> exploded_base_key;
     exploded_base_key.reserve(base_columns.size());
 
     for (const column_definition& base_col : base_columns) {
@@ -507,7 +508,7 @@ indexed_table_select_statement::do_execute_base_query(
         lw_shared_ptr<const service::pager::paging_state> paging_state) const {
     using value_type = std::tuple<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>;
     auto cmd = prepare_command_for_base_query(proxy, options, state, now, bool(paging_state));
-    auto timeout = db::timeout_clock::now() + get_timeout(options);
+    auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
     uint32_t queried_ranges_count = partition_ranges.size();
     service::query_ranges_to_vnodes_generator ranges_to_vnodes(proxy.get_token_metadata_ptr(), _schema, std::move(partition_ranges));
 
@@ -601,7 +602,7 @@ indexed_table_select_statement::do_execute_base_query(
         lw_shared_ptr<const service::pager::paging_state> paging_state) const {
     using value_type = std::tuple<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>;
     auto cmd = prepare_command_for_base_query(proxy, options, state, now, bool(paging_state));
-    auto timeout = db::timeout_clock::now() + get_timeout(options);
+    auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
 
     struct base_query_state {
         query::result_merger merger;
@@ -683,7 +684,7 @@ select_statement::execute(service::storage_proxy& proxy,
     // is specified we need to get "limit" rows from each partition since there
     // is no way to tell which of these rows belong to the query result before
     // doing post-query ordering.
-    auto timeout = db::timeout_clock::now() + get_timeout(options);
+    auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
     if (needs_post_query_ordering() && _limit) {
         return do_with(std::forward<dht::partition_range_vector>(partition_ranges), [this, &proxy, &state, &options, cmd, timeout](auto& prs) {
             assert(cmd->partition_limit == query::max_partitions);
@@ -876,7 +877,7 @@ indexed_table_select_statement::indexed_table_select_statement(schema_ptr schema
 
 template<typename KeyType>
 requires (std::is_same_v<KeyType, partition_key> || std::is_same_v<KeyType, clustering_key_prefix>)
-static void append_base_key_to_index_ck(std::vector<bytes_view>& exploded_index_ck, const KeyType& base_key, const column_definition& index_cdef) {
+static void append_base_key_to_index_ck(std::vector<managed_bytes_view>& exploded_index_ck, const KeyType& base_key, const column_definition& index_cdef) {
     auto key_view = base_key.view();
     auto begin = key_view.begin();
     if ((std::is_same_v<KeyType, partition_key> && index_cdef.is_partition_key())
@@ -931,7 +932,7 @@ lw_shared_ptr<const service::pager::paging_state> indexed_table_select_statement
         }
     }();
 
-    std::vector<bytes_view> exploded_index_ck;
+    std::vector<managed_bytes_view> exploded_index_ck;
     exploded_index_ck.reserve(_view_schema->clustering_key_size());
 
     bytes token_bytes;
@@ -1233,7 +1234,7 @@ indexed_table_select_statement::read_posting_list(service::storage_proxy& proxy,
 
     auto p = service::pager::query_pagers::pager(_view_schema, selection,
             state, options, cmd, std::move(partition_ranges), nullptr);
-    return p->fetch_page(options.get_page_size(), now, timeout).then([p, &options, limit, now] (std::unique_ptr<cql3::result_set> rs) {
+    return p->fetch_page(options.get_page_size(), now, timeout).then([p = std::move(p), &options, limit, now] (std::unique_ptr<cql3::result_set> rs) {
         rs->get_metadata().set_paging_state(p->state());
         return ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(rs)));
     });
@@ -1248,7 +1249,7 @@ indexed_table_select_statement::find_index_partition_ranges(service::storage_pro
 {
     using value_type = std::tuple<dht::partition_range_vector, lw_shared_ptr<const service::pager::paging_state>>;
     auto now = gc_clock::now();
-    auto timeout = db::timeout_clock::now() + get_timeout(options);
+    auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
     return read_posting_list(proxy, options, get_limit(options), state, now, timeout, false).then(
             [this, now, &options] (::shared_ptr<cql_transport::messages::result_message::rows> rows) {
         auto rs = cql3::untyped_result_set(rows);
@@ -1289,7 +1290,7 @@ indexed_table_select_statement::find_index_clustering_rows(service::storage_prox
 {
     using value_type = std::tuple<std::vector<indexed_table_select_statement::primary_key>, lw_shared_ptr<const service::pager::paging_state>>;
     auto now = gc_clock::now();
-    auto timeout = db::timeout_clock::now() + get_timeout(options);
+    auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
     return read_posting_list(proxy, options, get_limit(options), state, now, timeout, true).then(
             [this, now, &options] (::shared_ptr<cql_transport::messages::result_message::rows> rows) {
 
@@ -1329,7 +1330,7 @@ audit::statement_category select_statement::category() const {
     return audit::statement_category::QUERY;
 }
 
-select_statement::select_statement(::shared_ptr<cf_name> cf_name,
+select_statement::select_statement(cf_name cf_name,
                                    lw_shared_ptr<const parameters> parameters,
                                    std::vector<::shared_ptr<selection::raw_selector>> select_clause,
                                    std::vector<::shared_ptr<relation>> where_clause,
@@ -1337,7 +1338,7 @@ select_statement::select_statement(::shared_ptr<cf_name> cf_name,
                                    ::shared_ptr<term::raw> per_partition_limit,
                                    std::vector<::shared_ptr<cql3::column_identifier::raw>> group_by_columns,
                                    std::unique_ptr<attributes::raw> attrs)
-    : cf_statement(std::move(cf_name))
+    : cf_statement(cf_name)
     , _parameters(std::move(parameters))
     , _select_clause(std::move(select_clause))
     , _where_clause(std::move(where_clause))
@@ -1466,7 +1467,7 @@ select_statement::prepare_restrictions(database& db,
 {
     try {
         return ::make_shared<restrictions::statement_restrictions>(db, schema, statement_type::SELECT, std::move(_where_clause), bound_names,
-            selection->contains_only_static_columns(), selection->contains_a_collection(), for_view, allow_filtering);
+            selection->contains_only_static_columns(), for_view, allow_filtering);
     } catch (const exceptions::unrecognized_entity_exception& e) {
         if (contains_alias(e.entity)) {
             throw exceptions::invalid_request_exception(format("Aliases aren't allowed in the where clause ('{}')", e.relation_str));

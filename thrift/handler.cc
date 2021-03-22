@@ -190,9 +190,9 @@ enum class query_order { no, yes };
 class thrift_handler : public CassandraCobSvIf {
     distributed<database>& _db;
     distributed<cql3::query_processor>& _query_processor;
+    ::timeout_config _timeout_config;
     service::client_state _client_state;
     service::query_state _query_state;
-    ::timeout_config _timeout_config;
 private:
     template <typename Cob, typename Func>
     void
@@ -209,9 +209,9 @@ public:
     explicit thrift_handler(distributed<database>& db, distributed<cql3::query_processor>& qp, auth::service& auth_service, ::timeout_config timeout_config)
         : _db(db)
         , _query_processor(qp)
-        , _client_state(service::client_state::external_tag{}, auth_service, socket_address(), true)
-        , _query_state(_client_state, /*FIXME: pass real permit*/empty_service_permit())
         , _timeout_config(timeout_config)
+        , _client_state(service::client_state::external_tag{}, auth_service, _timeout_config, socket_address(), true)
+        , _query_state(_client_state, /*FIXME: pass real permit*/empty_service_permit())
     { }
 
     const sstring& current_keyspace() const {
@@ -701,7 +701,7 @@ public:
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             validate_login();
             std::vector<KsDef>  ret;
-            for (auto&& ks : _db.local().keyspaces()) {
+            for (auto&& ks : _db.local().get_keyspaces()) {
                 ret.emplace_back(get_keyspace_definition(ks.second));
             }
             return ret;
@@ -834,7 +834,7 @@ public:
 
             auto s = schema_from_thrift(cf_def, cf_def.keyspace);
             return _query_state.get_client_state().has_keyspace_access(cf_def.keyspace, auth::permission::CREATE).then([this, s = std::move(s)] {
-                return service::get_local_migration_manager().announce_new_column_family(std::move(s)).then([this] {
+                return _query_processor.local().get_migration_manager().announce_new_column_family(std::move(s)).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -850,7 +850,7 @@ public:
                 if (!cf.views().empty()) {
                     throw make_exception<InvalidRequestException>("Cannot drop table with Materialized Views %s", column_family);
                 }
-                return service::get_local_migration_manager().announce_column_family_drop(current_keyspace(), column_family).then([this] {
+                return _query_processor.local().get_migration_manager().announce_column_family_drop(current_keyspace(), column_family).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -861,7 +861,7 @@ public:
         with_cob(std::move(cob), std::move(exn_cob), [&] {
             auto ksm = keyspace_from_thrift(ks_def);
             return _query_state.get_client_state().has_all_keyspaces_access(auth::permission::CREATE).then([this, ksm = std::move(ksm)] {
-                return service::get_local_migration_manager().announce_new_keyspace(std::move(ksm)).then([this] {
+                return _query_processor.local().get_migration_manager().announce_new_keyspace(std::move(ksm)).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -876,7 +876,7 @@ public:
             }
 
             return _query_state.get_client_state().has_keyspace_access(keyspace, auth::permission::DROP).then([this, keyspace] {
-                return service::get_local_migration_manager().announce_keyspace_drop(keyspace).then([this] {
+                return _query_processor.local().get_migration_manager().announce_keyspace_drop(keyspace).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -896,7 +896,7 @@ public:
 
             auto ksm = keyspace_from_thrift(ks_def);
             return _query_state.get_client_state().has_keyspace_access(ks_def.name, auth::permission::ALTER).then([this, ksm = std::move(ksm)] {
-                return service::get_local_migration_manager().announce_keyspace_update(std::move(ksm)).then([this] {
+                return _query_processor.local().get_migration_manager().announce_keyspace_update(std::move(ksm)).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -927,7 +927,7 @@ public:
                 fail(unimplemented::cause::MIXED_CF);
             }
             return _query_state.get_client_state().has_schema_access(*schema, auth::permission::ALTER).then([this, s = std::move(s)] {
-                return service::get_local_migration_manager().announce_column_family_update(std::move(s), true, {}).then([this] {
+                return _query_processor.local().get_migration_manager().announce_column_family_update(std::move(s), true, {}).then([this] {
                     return std::string(_db.local().get_version().to_sstring());
                 });
             });
@@ -973,7 +973,7 @@ public:
                 throw make_exception<InvalidRequestException>("Compressed query strings are not supported");
             }
             auto& qp = _query_processor.local();
-            auto opts = std::make_unique<cql3::query_options>(qp.get_cql_config(), cl_from_thrift(consistency), _timeout_config, std::nullopt, std::vector<cql3::raw_value_view>(),
+            auto opts = std::make_unique<cql3::query_options>(qp.get_cql_config(), cl_from_thrift(consistency), std::nullopt, std::vector<cql3::raw_value_view>(),
                             false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
             auto f = qp.execute_direct(query, _query_state, *opts);
             return f.then([cob = std::move(cob), opts = std::move(opts)](auto&& ret) {
@@ -1053,7 +1053,7 @@ public:
                 return cql3::raw_value::make_value(to_bytes(s));
             });
             auto& qp = _query_processor.local();
-            auto opts = std::make_unique<cql3::query_options>(qp.get_cql_config(), cl_from_thrift(consistency), _timeout_config, std::nullopt, std::move(bytes_values),
+            auto opts = std::make_unique<cql3::query_options>(qp.get_cql_config(), cl_from_thrift(consistency), std::nullopt, std::move(bytes_values),
                             false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
             auto f = qp.execute_prepared(std::move(prepared), std::move(cache_key), _query_state, *opts, needs_authorization);
             return f.then([cob = std::move(cob), opts = std::move(opts)](auto&& ret) {
@@ -1597,7 +1597,7 @@ private:
         return counter_column_to_column_or_supercolumn(make_counter_column(col, cell));
     }
     static std::string partition_key_to_string(const schema& s, const partition_key& key) {
-        return bytes_to_string(to_legacy(*s.partition_key_type(), key));
+        return bytes_to_string(to_legacy(*s.partition_key_type(), key.representation()));
     }
 
     template<typename Aggregator, query_order QueryOrder>

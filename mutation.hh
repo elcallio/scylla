@@ -18,8 +18,26 @@
 #include "dht/i_partitioner.hh"
 #include "hashing.hh"
 #include "mutation_fragment.hh"
+#include "mutation_consumer_concepts.hh"
 
 #include <seastar/util/optimized_optional.hh>
+
+
+template<typename Result>
+struct mutation_consume_result {
+    stop_iteration stop;
+    Result result;
+};
+
+template<>
+struct mutation_consume_result<void> {
+    stop_iteration stop;
+};
+
+enum class consume_in_reverse {
+    no = 0,
+    yes,
+};
 
 class mutation final {
 private:
@@ -95,26 +113,11 @@ public:
     bool operator==(const mutation&) const;
     bool operator!=(const mutation&) const;
 public:
-    // The supplied partition_slice must be governed by this mutation's schema
-    query::result query(const query::partition_slice&,
-        query::result_memory_accounter&& accounter,
-        query::result_options opts = query::result_options::only_result(),
-        gc_clock::time_point now = gc_clock::now(),
-        uint64_t row_limit = query::max_rows) &&;
-
-    // The supplied partition_slice must be governed by this mutation's schema
-    // FIXME: Slower than the r-value version
-    query::result query(const query::partition_slice&,
-        query::result_memory_accounter&& accounter,
-        query::result_options opts = query::result_options::only_result(),
-        gc_clock::time_point now = gc_clock::now(),
-        uint64_t row_limit = query::max_rows) const&;
-
-    // The supplied partition_slice must be governed by this mutation's schema
-    void query(query::result::builder& builder,
-        const query::partition_slice& slice,
-        gc_clock::time_point now = gc_clock::now(),
-        uint64_t row_limit = query::max_rows) &&;
+    // Consumes the mutation's content.
+    //
+    // The mutation is in a moved-from alike state after consumption.
+    template<FlattenedConsumer Consumer>
+    auto consume(Consumer& consumer, consume_in_reverse reverse) && -> mutation_consume_result<decltype(consumer.consume_end_of_stream())>;
 
     // See mutation_partition::live_row_count()
     uint64_t live_row_count(gc_clock::time_point query_time = gc_clock::time_point::min()) const;
@@ -133,6 +136,90 @@ public:
 private:
     friend std::ostream& operator<<(std::ostream& os, const mutation& m);
 };
+
+namespace {
+
+template<consume_in_reverse reverse, FlattenedConsumer Consumer>
+stop_iteration consume_clustering_fragments(const schema& s, mutation_partition& partition, Consumer& consumer) {
+    using crs_type = mutation_partition::rows_type;
+    using crs_iterator_type = std::conditional_t<reverse == consume_in_reverse::yes, crs_type::reverse_iterator, crs_type::iterator>;
+    using rts_type = range_tombstone::container_type;
+    using rts_iterator_type = std::conditional_t<reverse == consume_in_reverse::yes, rts_type::reverse_iterator, rts_type::iterator>;
+
+    crs_iterator_type crs_it, crs_end;
+    rts_iterator_type rts_it, rts_end;
+    if constexpr (reverse == consume_in_reverse::yes) {
+        crs_it = partition.clustered_rows().rbegin();
+        crs_end = partition.clustered_rows().rend();
+        rts_it = partition.row_tombstones().rbegin();
+        rts_end = partition.row_tombstones().rend();
+    } else {
+        crs_it = partition.clustered_rows().begin();
+        crs_end = partition.clustered_rows().end();
+        rts_it = partition.row_tombstones().begin();
+        rts_end = partition.row_tombstones().end();
+    }
+
+    stop_iteration stop = stop_iteration::no;
+
+    position_in_partition::tri_compare cmp(s);
+
+    while (!stop && (crs_it != crs_end || rts_it != rts_end)) {
+        bool emit_rt;
+        if (crs_it != crs_end && rts_it != rts_end) {
+            const auto cmp_res = cmp(rts_it->position(), crs_it->position());
+            if constexpr (reverse == consume_in_reverse::yes) {
+                emit_rt = cmp_res > 0;
+            } else {
+                emit_rt = cmp_res < 0;
+            }
+        } else {
+            emit_rt = rts_it != rts_end;
+        }
+        if (emit_rt) {
+            stop = consumer.consume(std::move(*rts_it));
+            ++rts_it;
+        } else {
+            stop = consumer.consume(clustering_row(std::move(*crs_it)));
+            ++crs_it;
+        }
+    }
+
+    return stop;
+}
+
+} // anonymous namespace
+
+template<FlattenedConsumer Consumer>
+auto mutation::consume(Consumer& consumer, consume_in_reverse reverse) && -> mutation_consume_result<decltype(consumer.consume_end_of_stream())> {
+    consumer.consume_new_partition(_ptr->_dk);
+
+    auto& partition = _ptr->_p;
+
+    if (partition.partition_tombstone()) {
+        consumer.consume(partition.partition_tombstone());
+    }
+
+    stop_iteration stop = stop_iteration::no;
+    if (!partition.static_row().empty()) {
+        stop = consumer.consume(static_row(std::move(partition.static_row().get_existing())));
+    }
+
+    if (reverse == consume_in_reverse::yes) {
+        stop = consume_clustering_fragments<consume_in_reverse::yes>(*_ptr->_schema, partition, consumer);
+    } else {
+        stop = consume_clustering_fragments<consume_in_reverse::no>(*_ptr->_schema, partition, consumer);
+    }
+
+    const auto stop_consuming = consumer.consume_end_of_partition();
+    using consume_res_type = decltype(consumer.consume_end_of_stream());
+    if constexpr (std::is_same_v<consume_res_type, void>) {
+        consumer.consume_end_of_stream();
+        return mutation_consume_result<void>{stop_consuming};
+    } else {
+        return mutation_consume_result<consume_res_type>{stop_consuming, consumer.consume_end_of_stream()};
+    }
+}
 
 struct mutation_equals_by_key {
     bool operator()(const mutation& m1, const mutation& m2) const {

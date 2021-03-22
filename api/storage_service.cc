@@ -36,6 +36,7 @@
 #include "transport/controller.hh"
 #include "thrift/controller.hh"
 #include "locator/token_metadata.hh"
+#include "cdc/generation_service.hh"
 
 namespace api {
 
@@ -149,7 +150,7 @@ void unset_rpc_controller(http_context& ctx, routes& r) {
 void set_repair(http_context& ctx, routes& r, sharded<netw::messaging_service>& ms) {
     ss::repair_async.set(r, [&ctx, &ms](std::unique_ptr<request> req) {
         static std::vector<sstring> options = {"primaryRange", "parallelism", "incremental",
-                "jobThreads", "ranges", "columnFamilies", "dataCenters", "hosts", "trace",
+                "jobThreads", "ranges", "columnFamilies", "dataCenters", "hosts", "ignore_nodes", "trace",
                 "startToken", "endToken" };
         std::unordered_map<sstring, sstring> options_map;
         for (auto o : options) {
@@ -390,7 +391,7 @@ void set_storage_service(http_context& ctx, routes& r) {
     });
 
     ss::cdc_streams_check_and_repair.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return service::get_local_storage_service().check_and_repair_cdc_streams().then([] {
+        return service::get_local_storage_service().get_cdc_generation_service().check_and_repair_cdc_streams().then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
     });
@@ -721,11 +722,19 @@ void set_storage_service(http_context& ctx, routes& r) {
     ss::load_new_ss_tables.set(r, [&ctx](std::unique_ptr<request> req) {
         auto ks = validate_keyspace(ctx, req->param);
         auto cf = req->get_query_param("cf");
+        auto stream = req->get_query_param("load_and_stream");
+        auto primary_replica = req->get_query_param("primary_replica_only");
+        boost::algorithm::to_lower(stream);
+        boost::algorithm::to_lower(primary_replica);
+        bool load_and_stream = stream == "true" || stream == "1";
+        bool primary_replica_only = primary_replica == "true" || primary_replica == "1";
         // No need to add the keyspace, since all we want is to avoid always sending this to the same
         // CPU. Even then I am being overzealous here. This is not something that happens all the time.
         auto coordinator = std::hash<sstring>()(cf) % smp::count;
-        return service::get_storage_service().invoke_on(coordinator, [ks = std::move(ks), cf = std::move(cf)] (service::storage_service& s) {
-            return s.load_new_sstables(ks, cf);
+        return service::get_storage_service().invoke_on(coordinator,
+                [ks = std::move(ks), cf = std::move(cf),
+                load_and_stream, primary_replica_only] (service::storage_service& s) {
+            return s.load_new_sstables(ks, cf, load_and_stream, primary_replica_only);
         }).then_wrapped([] (auto&& f) {
             if (f.failed()) {
                 auto msg = fmt::format("Failed to load new sstables: {}", f.get_exception());
@@ -968,7 +977,7 @@ void set_storage_service(http_context& ctx, routes& r) {
                         tst.keyspace = schema->ks_name();
                         tst.table = schema->cf_name();
 
-                        for (auto sstable : *t->get_sstables_including_compacted_undeleted()) {
+                        for (auto sstables = t->get_sstables_including_compacted_undeleted(); auto sstable : *sstables) {
                             auto ts = db_clock::to_time_t(sstable->data_file_write_time());
                             ::tm t;
                             ::gmtime_r(&ts, &t);

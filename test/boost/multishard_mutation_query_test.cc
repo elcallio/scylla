@@ -20,6 +20,7 @@
 #include "test/lib/test_table.hh"
 #include "test/lib/log.hh"
 #include "test/lib/test_utils.hh"
+#include "test/lib/random_utils.hh"
 
 #include <seastar/testing/thread_test_case.hh>
 
@@ -250,7 +251,6 @@ SEASTAR_THREAD_TEST_CASE(test_read_all) {
         tests::require_equal(aggregate_querier_cache_stat(env.db(), &query::querier_cache::stats::misses), 0u);
         tests::require_equal(aggregate_querier_cache_stat(env.db(), &query::querier_cache::stats::time_based_evictions), 0u);
         tests::require_equal(aggregate_querier_cache_stat(env.db(), &query::querier_cache::stats::resource_based_evictions), 0u);
-        tests::require_equal(aggregate_querier_cache_stat(env.db(), &query::querier_cache::stats::memory_based_evictions), 0u);
 
         require_eventually_empty_caches(env.db());
 
@@ -296,7 +296,6 @@ SEASTAR_THREAD_TEST_CASE(test_evict_a_shard_reader_on_each_page) {
         tests::require_equal(aggregate_querier_cache_stat(env.db(), &query::querier_cache::stats::drops), 0u);
         tests::require_equal(aggregate_querier_cache_stat(env.db(), &query::querier_cache::stats::time_based_evictions), 0u);
         tests::require_equal(aggregate_querier_cache_stat(env.db(), &query::querier_cache::stats::resource_based_evictions), npages);
-        tests::require_equal(aggregate_querier_cache_stat(env.db(), &query::querier_cache::stats::memory_based_evictions), 0u);
 
         require_eventually_empty_caches(env.db());
 
@@ -422,12 +421,11 @@ static bytes make_payload(const schema& schema, size_t size, const partition_key
     return std::move(buf_os).detach();
 }
 
-static bool validate_payload(const schema& schema, data::value_view payload_view, const partition_key& pk, const clustering_key* const ck) {
-    auto istream = fragmented_memory_input_stream(payload_view.begin(), payload_view.size_bytes());
-
+static bool validate_payload(const schema& schema, atomic_cell_value_view payload_view, const partition_key& pk, const clustering_key* const ck) {
+    auto istream = fragmented_memory_input_stream(fragment_range(payload_view).begin(), payload_view.size());
     auto head = ser::deserialize(istream, boost::type<blob_header>{});
 
-    const size_t actual_size = payload_view.size_bytes();
+    const size_t actual_size = payload_view.size();
 
     if (head.size != actual_size) {
         testlog.error("Validating payload for pk={}, ck={} failed, sizes differ: stored={}, actual={}", pk, seastar::lazy_deref(ck), head.size,
@@ -945,7 +943,7 @@ SEASTAR_THREAD_TEST_CASE(fuzzy_test) {
 
     do_with_cql_env([] (cql_test_env& env) -> future<> {
         // REPLACE RANDOM SEED HERE.
-        const auto seed = std::random_device{}();
+        const auto seed = tests::random::get_int<uint32_t>();
         testlog.info("fuzzy test seed: {}", seed);
 
         auto rnd_engine = std::mt19937(seed);

@@ -34,6 +34,7 @@
 #include "repair/repair.hh"
 #include "digest_algorithm.hh"
 #include "service/paxos/proposal.hh"
+#include "serializer.hh"
 #include "idl/consistency_level.dist.hh"
 #include "idl/tracing.dist.hh"
 #include "idl/result.dist.hh"
@@ -55,6 +56,7 @@
 #include "idl/mutation.dist.hh"
 #include "idl/messaging_service.dist.hh"
 #include "idl/paxos.dist.hh"
+#include "idl/raft.dist.hh"
 #include "serializer_impl.hh"
 #include "serialization_visitors.hh"
 #include "idl/consistency_level.dist.impl.hh"
@@ -77,6 +79,7 @@
 #include "idl/mutation.dist.impl.hh"
 #include "idl/messaging_service.dist.impl.hh"
 #include "idl/paxos.dist.impl.hh"
+#include "idl/raft.dist.impl.hh"
 #include <seastar/rpc/lz4_compressor.hh>
 #include <seastar/rpc/lz4_fragmented_compressor.hh>
 #include <seastar/rpc/multi_algo_compressor_factory.hh>
@@ -141,7 +144,30 @@ static rpc::multi_algo_compressor_factory compressor_factory {
     &lz4_compressor_factory,
 };
 
-struct messaging_service::rpc_protocol_wrapper : public rpc_protocol { using rpc_protocol::rpc_protocol; };
+class messaging_service::rpc_protocol_wrapper {
+    rpc_protocol _impl;
+public:
+    explicit rpc_protocol_wrapper(serializer&& s) : _impl(std::move(s)) {}
+
+    rpc_protocol& protocol() { return _impl; }
+
+    template<typename Func>
+    auto make_client(messaging_verb t) { return _impl.make_client<Func>(t); }
+
+    template<typename Func>
+    auto register_handler(messaging_verb t, Func&& func) { return _impl.register_handler(t, std::forward<Func>(func)); }
+
+    template<typename Func>
+    auto register_handler(messaging_verb t, scheduling_group sg, Func&& func) { return _impl.register_handler(t, sg, std::forward<Func>(func)); }
+
+    future<> unregister_handler(messaging_verb t) { return _impl.unregister_handler(t); }
+
+    void set_logger(::seastar::logger* logger) { _impl.set_logger(logger); }
+
+    bool has_handler(messaging_verb msg_id) { return _impl.has_handler(msg_id); }
+
+    bool has_handlers() const noexcept { return _impl.has_handlers(); }
+};
 
 // This wrapper pretends to be rpc_protocol::client, but also handles
 // stopping it before destruction, in case it wasn't stopped already.
@@ -322,11 +348,31 @@ void messaging_service::do_start_listen() {
         cfg.sched_group = scheduling_group_for_isolation_cookie(isolation_cookie);
         return cfg;
     };
-    if (!_server[0]) {
+    if (!_server[0] && _cfg.encrypt != encrypt_what::all) {
         auto listen = [&] (const gms::inet_address& a, rpc::streaming_domain_type sdomain) {
             so.streaming_domain = sdomain;
+            so.filter_connection = {};
+            switch (_cfg.encrypt) {
+                default:
+                case encrypt_what::none:
+                    break;
+                case encrypt_what::dc:
+                    so.filter_connection = [](const seastar::socket_address& addr) {
+                        auto& snitch = locator::i_endpoint_snitch::get_local_snitch_ptr();
+                        return snitch->get_datacenter(addr) == snitch->get_datacenter(utils::fb_utilities::get_broadcast_address());
+                    };
+                    break;
+                case encrypt_what::rack:
+                    so.filter_connection = [](const seastar::socket_address& addr) {
+                        auto& snitch = locator::i_endpoint_snitch::get_local_snitch_ptr();
+                        return snitch->get_datacenter(addr) == snitch->get_datacenter(utils::fb_utilities::get_broadcast_address())
+                            && snitch->get_rack(addr) == snitch->get_rack(utils::fb_utilities::get_broadcast_address())
+                            ;
+                    };
+                    break;
+            }
             auto addr = socket_address{a, _cfg.port};
-            return std::unique_ptr<rpc_protocol_server_wrapper>(new rpc_protocol_server_wrapper(*_rpc,
+            return std::unique_ptr<rpc_protocol_server_wrapper>(new rpc_protocol_server_wrapper(_rpc->protocol(),
                     so, addr, limits));
         };
         _server[0] = listen(_cfg.ip, rpc::streaming_domain_type(0x55AA));
@@ -334,9 +380,10 @@ void messaging_service::do_start_listen() {
             _server[1] = listen(utils::fb_utilities::get_broadcast_address(), rpc::streaming_domain_type(0x66BB));
         }
     }
-
+    
     if (!_server_tls[0]) {
         auto listen = [&] (const gms::inet_address& a, rpc::streaming_domain_type sdomain) {
+            so.filter_connection = {};
             so.streaming_domain = sdomain;
             return std::unique_ptr<rpc_protocol_server_wrapper>(
                     [this, &so, &a, limits] () -> std::unique_ptr<rpc_protocol_server_wrapper>{
@@ -350,7 +397,7 @@ void messaging_service::do_start_listen() {
                 lo.reuse_address = true;
                 lo.lba =  server_socket::load_balancing_algorithm::port;
                 auto addr = socket_address{a, _cfg.ssl_port};
-                return std::make_unique<rpc_protocol_server_wrapper>(*_rpc,
+                return std::make_unique<rpc_protocol_server_wrapper>(_rpc->protocol(),
                         so, seastar::tls::listen(_credentials, addr, lo), limits);
             }());
         };
@@ -470,6 +517,7 @@ static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     // as well as reduce latency as there are potentially many requests
     // blocked on schema version request.
     case messaging_verb::GOSSIP_DIGEST_SYN:
+    case messaging_verb::GOSSIP_DIGEST_ACK:
     case messaging_verb::GOSSIP_DIGEST_ACK2:
     case messaging_verb::GOSSIP_SHUTDOWN:
     case messaging_verb::GOSSIP_ECHO:
@@ -505,7 +553,6 @@ static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     case messaging_verb::READ_DATA:
     case messaging_verb::READ_MUTATION_DATA:
     case messaging_verb::READ_DIGEST:
-    case messaging_verb::GOSSIP_DIGEST_ACK:
     case messaging_verb::DEFINITIONS_UPDATE:
     case messaging_verb::TRUNCATE:
     case messaging_verb::MIGRATION_REQUEST:
@@ -517,6 +564,11 @@ static constexpr unsigned do_get_rpc_client_idx(messaging_verb verb) {
     case messaging_verb::PAXOS_ACCEPT:
     case messaging_verb::PAXOS_LEARN:
     case messaging_verb::PAXOS_PRUNE:
+    case messaging_verb::RAFT_SEND_SNAPSHOT:
+    case messaging_verb::RAFT_APPEND_ENTRIES:
+    case messaging_verb::RAFT_APPEND_ENTRIES_REPLY:
+    case messaging_verb::RAFT_VOTE_REQUEST:
+    case messaging_verb::RAFT_VOTE_REPLY:
         return 2;
     case messaging_verb::MUTATION_DONE:
     case messaging_verb::MUTATION_FAILED:
@@ -719,7 +771,7 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
         }
         remove_error_rpc_client(verb, id);
     }
-    auto must_encrypt = [&id, this] {
+    auto must_encrypt = [&id, &verb, this] {
         if (_cfg.encrypt == encrypt_what::none) {
             return false;
         }
@@ -727,14 +779,23 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
             return true;
         }
 
+        // if we have dc/rack encryption but this is gossip, we should
+        // use tls anyway, to avoid having mismatched ideas on which 
+        // group we/client are in. 
+        if (verb >= messaging_verb::GOSSIP_DIGEST_SYN && verb <= messaging_verb::GOSSIP_SHUTDOWN) {
+            return true;
+        }
+
         auto& snitch_ptr = locator::i_endpoint_snitch::get_local_snitch_ptr();
 
-        if (_cfg.encrypt == encrypt_what::dc) {
-            return snitch_ptr->get_datacenter(id.addr)
-                            != snitch_ptr->get_datacenter(utils::fb_utilities::get_broadcast_address());
+        // either rack/dc need to be in same dc to use non-tls
+        if (snitch_ptr->get_datacenter(id.addr) != snitch_ptr->get_datacenter(utils::fb_utilities::get_broadcast_address())) {
+            return true;
         }
-        return snitch_ptr->get_rack(id.addr)
-                        != snitch_ptr->get_rack(utils::fb_utilities::get_broadcast_address());
+        // if cross-rack tls, check rack.
+        return _cfg.encrypt == encrypt_what::rack &&
+            snitch_ptr->get_rack(id.addr) != snitch_ptr->get_rack(utils::fb_utilities::get_broadcast_address())
+            ;
     }();
 
     auto must_compress = [&id, this] {
@@ -778,11 +839,12 @@ shared_ptr<messaging_service::rpc_protocol_client_wrapper> messaging_service::ge
         opts.isolation_cookie = _scheduling_info_for_connection_index[idx].isolation_cookie;
     }
 
+    auto baddr = socket_address(utils::fb_utilities::get_broadcast_address(), 0);
     auto client = must_encrypt ?
-                    ::make_shared<rpc_protocol_client_wrapper>(*_rpc, std::move(opts),
-                                    remote_addr, socket_address(), _credentials) :
-                    ::make_shared<rpc_protocol_client_wrapper>(*_rpc, std::move(opts),
-                                    remote_addr);
+                    ::make_shared<rpc_protocol_client_wrapper>(_rpc->protocol(), std::move(opts),
+                                    remote_addr, baddr, _credentials) :
+                    ::make_shared<rpc_protocol_client_wrapper>(_rpc->protocol(), std::move(opts),
+                                    remote_addr, baddr);
 
     auto res = _clients[idx].emplace(id, shard_info(std::move(client)));
     assert(res.second);
@@ -1518,6 +1580,56 @@ future<> messaging_service::send_hint_mutation(msg_addr id, clock_type::time_poi
         inet_address reply_to, unsigned shard, response_id_type response_id, std::optional<tracing::trace_info> trace_info) {
     return send_message_oneway_timeout(this, timeout, messaging_verb::HINT_MUTATION, std::move(id), fm, std::move(forward),
         std::move(reply_to), shard, std::move(response_id), std::move(trace_info));
+}
+
+void messaging_service::register_raft_send_snapshot(std::function<future<> (const rpc::client_info&, rpc::opt_time_point, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, raft::install_snapshot)>&& func) {
+   register_handler(this, netw::messaging_verb::RAFT_SEND_SNAPSHOT, std::move(func));
+}
+future<> messaging_service::unregister_raft_send_snapshot() {
+   return unregister_handler(netw::messaging_verb::RAFT_SEND_SNAPSHOT);
+}
+future<> messaging_service::send_raft_send_snapshot(msg_addr id, clock_type::time_point timeout, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, const raft::install_snapshot& install_snapshot) {
+   return send_message_timeout<void>(this, messaging_verb::RAFT_SEND_SNAPSHOT, std::move(id), timeout, group_id, std::move(from_id), std::move(dst_id), install_snapshot);
+}
+
+void messaging_service::register_raft_append_entries(std::function<future<> (const rpc::client_info&, rpc::opt_time_point, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, raft::append_request)>&& func) {
+   register_handler(this, netw::messaging_verb::RAFT_APPEND_ENTRIES, std::move(func));
+}
+future<> messaging_service::unregister_raft_append_entries() {
+   return unregister_handler(netw::messaging_verb::RAFT_APPEND_ENTRIES);
+}
+future<> messaging_service::send_raft_append_entries(msg_addr id, clock_type::time_point timeout, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, const raft::append_request& append_request) {
+   return send_message_oneway_timeout(this, timeout, messaging_verb::RAFT_APPEND_ENTRIES, std::move(id), group_id, std::move(from_id), std::move(dst_id), append_request);
+}
+
+void messaging_service::register_raft_append_entries_reply(std::function<future<> (const rpc::client_info&, rpc::opt_time_point, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, raft::append_reply)>&& func) {
+   register_handler(this, netw::messaging_verb::RAFT_APPEND_ENTRIES_REPLY, std::move(func));
+}
+future<> messaging_service::unregister_raft_append_entries_reply() {
+   return unregister_handler(netw::messaging_verb::RAFT_APPEND_ENTRIES_REPLY);
+}
+future<> messaging_service::send_raft_append_entries_reply(msg_addr id, clock_type::time_point timeout, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, const raft::append_reply& reply) {
+   return send_message_oneway_timeout(this, timeout, messaging_verb::RAFT_APPEND_ENTRIES_REPLY, std::move(id), group_id, std::move(from_id), std::move(dst_id), reply);
+}
+
+void messaging_service::register_raft_vote_request(std::function<future<> (const rpc::client_info&, rpc::opt_time_point, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, raft::vote_request)>&& func) {
+   register_handler(this, netw::messaging_verb::RAFT_VOTE_REQUEST, std::move(func));
+}
+future<> messaging_service::unregister_raft_vote_request() {
+   return unregister_handler(netw::messaging_verb::RAFT_VOTE_REQUEST);
+}
+future<> messaging_service::send_raft_vote_request(msg_addr id, clock_type::time_point timeout, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, const raft::vote_request& vote_request) {
+   return send_message_oneway_timeout(this, timeout, messaging_verb::RAFT_VOTE_REQUEST, std::move(id), group_id, std::move(from_id), std::move(dst_id), vote_request);
+}
+
+void messaging_service::register_raft_vote_reply(std::function<future<> (const rpc::client_info&, rpc::opt_time_point, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, raft::vote_reply)>&& func) {
+   register_handler(this, netw::messaging_verb::RAFT_VOTE_REPLY, std::move(func));
+}
+future<> messaging_service::unregister_raft_vote_reply() {
+   return unregister_handler(netw::messaging_verb::RAFT_VOTE_REPLY);
+}
+future<> messaging_service::send_raft_vote_reply(msg_addr id, clock_type::time_point timeout, uint64_t group_id, raft::server_id from_id, raft::server_id dst_id, const raft::vote_reply& vote_reply) {
+   return send_message_oneway_timeout(this, timeout, messaging_verb::RAFT_VOTE_REPLY, std::move(id), group_id, std::move(from_id), std::move(dst_id), vote_reply);
 }
 
 void init_messaging_service(sharded<messaging_service>& ms,

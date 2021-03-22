@@ -73,11 +73,12 @@ public:
     }
 };
 
-query_processor::query_processor(service::storage_proxy& proxy, database& db, service::migration_notifier& mn, query_processor::memory_config mcfg, cql_config& cql_cfg, sharded<qos::service_level_controller>& sl_controller)
+query_processor::query_processor(service::storage_proxy& proxy, database& db, service::migration_notifier& mn, service::migration_manager& mm, query_processor::memory_config mcfg, cql_config& cql_cfg, sharded<qos::service_level_controller>& sl_controller)
         : _migration_subscriber{std::make_unique<migration_subscriber>(this)}
         , _proxy(proxy)
         , _db(db)
         , _mnotifier(mn)
+        , _mm(mm)
         , _cql_config(cql_cfg)
         , _internal_state(new internal_state(sl_controller.local()))
         , _prepared_cache(prep_cache_log, mcfg.prepared_statment_cache_size)
@@ -524,7 +525,7 @@ query_processor::process_authorized_statement(const ::shared_ptr<cql_statement> 
 
     statement->validate(_proxy, client_state);
 
-    auto fut = statement->execute(_proxy, query_state, options);
+    auto fut = statement->execute(*this, query_state, options);
 
     return fut.then([statement] (auto msg) {
         if (msg) {
@@ -621,7 +622,6 @@ query_options query_processor::make_internal_options(
         const statements::prepared_statement::checked_weak_ptr& p,
         const std::initializer_list<data_value>& values,
         db::consistency_level cl,
-        const timeout_config& timeout_config,
         int32_t page_size) const {
     if (p->bound_names.size() != values.size()) {
         throw std::invalid_argument(
@@ -645,11 +645,10 @@ query_options query_processor::make_internal_options(
         api::timestamp_type ts = api::missing_timestamp;
         return query_options(
                 cl,
-                timeout_config,
                 bound_values,
                 cql3::query_options::specific_options{page_size, std::move(paging_state), serial_consistency, ts});
     }
-    return query_options(cl, timeout_config, bound_values);
+    return query_options(cl, bound_values);
 }
 
 statements::prepared_statement::checked_weak_ptr query_processor::prepare_internal(const sstring& query_string) {
@@ -670,10 +669,13 @@ struct internal_query_state {
     bool more_results = true;
 };
 
-::shared_ptr<internal_query_state> query_processor::create_paged_state(const sstring& query_string,
-        const std::initializer_list<data_value>& values, int32_t page_size) {
+::shared_ptr<internal_query_state> query_processor::create_paged_state(
+        const sstring& query_string,
+        db::consistency_level cl,
+        const std::initializer_list<data_value>& values,
+        int32_t page_size) {
     auto p = prepare_internal(query_string);
-    auto opts = make_internal_options(p, values, db::consistency_level::ONE, infinite_timeout_config, page_size);
+    auto opts = make_internal_options(p, values, cl, page_size);
     ::shared_ptr<internal_query_state> res = ::make_shared<internal_query_state>(
             internal_query_state{
                     query_string,
@@ -752,7 +754,7 @@ future<> query_processor::for_each_cql_result(
 
 future<::shared_ptr<untyped_result_set>>
 query_processor::execute_paged_internal(::shared_ptr<internal_query_state> state) {
-    return state->p->statement->execute(_proxy, *_internal_state, *state->opts).then(
+    return state->p->statement->execute(*this, *_internal_state, *state->opts).then(
             [state, this](::shared_ptr<cql_transport::messages::result_message> msg) mutable {
         class visitor : public result_message::visitor_base {
             ::shared_ptr<internal_query_state> _state;
@@ -791,11 +793,11 @@ future<::shared_ptr<cql_transport::messages::result_message>>
 query_processor::process_internal(
         statements::prepared_statement::checked_weak_ptr p,
         db::consistency_level cl,
-        const timeout_config& timeout_config,
+        service::query_state& state,
         const std::initializer_list<data_value>& values) {
-    auto opts = make_internal_options(p, values, cl, timeout_config);
-    return do_with(std::move(opts), [this, p = std::move(p)](auto & opts) {
-        return p->statement->execute(_proxy, *_internal_state, opts);
+    auto opts = make_internal_options(p, values, cl);
+    return do_with(std::move(opts), [this, p = std::move(p), &state](auto & opts) {
+        return p->statement->execute(*this, state, opts);
     });
 }
 
@@ -803,7 +805,16 @@ future<::shared_ptr<untyped_result_set>>
 query_processor::execute_internal(
         const sstring& query_string,
         db::consistency_level cl,
-        const timeout_config& timeout_config,
+        const std::initializer_list<data_value>& values,
+        bool cache) {
+    return execute_internal(query_string, cl, *_internal_state, values, cache);
+}
+
+future<::shared_ptr<untyped_result_set>>
+query_processor::execute_internal(
+        const sstring& query_string,
+        db::consistency_level cl,
+        service::query_state& query_state,
         const std::initializer_list<data_value>& values,
         bool cache) {
 
@@ -811,13 +822,13 @@ query_processor::execute_internal(
         log.trace("execute_internal: {}\"{}\" ({})", cache ? "(cached) " : "", query_string, ::join(", ", values));
     }
     if (cache) {
-        return execute_with_params(prepare_internal(query_string), cl, timeout_config, values);
+        return execute_with_params(prepare_internal(query_string), cl, query_state, values);
     } else {
         auto p = parse_statement(query_string)->prepare(_db, _cql_stats);
         p->statement->raw_cql_statement = query_string;
         p->statement->validate(_proxy, *_internal_state);
         auto checked_weak_ptr = p->checked_weak_from_this();
-        return execute_with_params(std::move(checked_weak_ptr), cl, timeout_config, values).finally([p = std::move(p)] {});
+        return execute_with_params(std::move(checked_weak_ptr), cl, query_state, values).finally([p = std::move(p)] {});
     }
 }
 
@@ -825,11 +836,11 @@ future<::shared_ptr<untyped_result_set>>
 query_processor::execute_with_params(
         statements::prepared_statement::checked_weak_ptr p,
         db::consistency_level cl,
-        const timeout_config& timeout_config,
+        service::query_state& query_state,
         const std::initializer_list<data_value>& values) {
-    auto opts = make_internal_options(p, values, cl, timeout_config);
-    return do_with(std::move(opts), [this, p = std::move(p)](auto & opts) {
-        return p->statement->execute(_proxy, *_internal_state, opts).then([](auto msg) {
+    auto opts = make_internal_options(p, values, cl);
+    return do_with(std::move(opts), [this, &query_state, p = std::move(p)](auto & opts) {
+        return p->statement->execute(*this, query_state, opts).then([](auto msg) {
             return make_ready_future<::shared_ptr<untyped_result_set>>(::make_shared<untyped_result_set>(msg));
         });
     });
@@ -862,7 +873,7 @@ query_processor::execute_batch(
                 }
                 log.trace("execute_batch({}): {}", batch->get_statements().size(), oss.str());
             }
-            return batch->execute(_proxy, query_state, options);
+            return batch->execute(*this, query_state, options);
 	  });
         });
     });
@@ -955,17 +966,19 @@ bool query_processor::migration_subscriber::should_invalidate(
     return statement->depends_on_keyspace(ks_name) && (!cf_name || statement->depends_on_column_family(*cf_name));
 }
 
-future<> query_processor::query(
+future<> query_processor::query_internal(
         const sstring& query_string,
+        db::consistency_level cl,
         const std::initializer_list<data_value>& values,
+        int32_t page_size,
         noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f) {
-    return for_each_cql_result(create_paged_state(query_string, values), std::move(f));
+    return for_each_cql_result(create_paged_state(query_string, cl, values, page_size), std::move(f));
 }
 
-future<> query_processor::query(
+future<> query_processor::query_internal(
         const sstring& query_string,
         noncopyable_function<future<stop_iteration>(const cql3::untyped_result_set_row&)>&& f) {
-    return for_each_cql_result(create_paged_state(query_string, {}), std::move(f));
+    return query_internal(query_string, db::consistency_level::ONE, {}, 1000, std::move(f));
 }
 
 }

@@ -11,6 +11,8 @@
 #include "alternator/server.hh"
 #include "log.hh"
 #include <seastar/http/function_handlers.hh>
+#include <seastar/http/short_streams.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/json/json_elements.hh>
 #include "seastarx.hh"
 #include "error.hh"
@@ -46,6 +48,40 @@ inline std::vector<std::string_view> split(std::string_view text, char separator
         }
     }
     return tokens;
+}
+
+// Handle CORS (Cross-origin resource sharing) in the HTTP request:
+// If the request has the "Origin" header specifying where the script which
+// makes this request comes from, we need to reply with the header
+// "Access-Control-Allow-Origin: *" saying that this (and any) origin is fine.
+// Additionally, if preflight==true (i.e., this is an OPTIONS request),
+// the script can also "request" in headers that the server allows it to use
+// some HTTP methods and headers in the followup request, and the server
+// should respond by "allowing" them in the response headers.
+// We also add the header "Access-Control-Expose-Headers" to let the script
+// access additional headers in the response.
+// This handle_CORS() should be used when handling any HTTP method - both the
+// usual GET and POST, and also the "preflight" OPTIONS method.
+static void handle_CORS(const request& req, reply& rep, bool preflight) {
+    if (!req.get_header("origin").empty()) {
+        rep.add_header("Access-Control-Allow-Origin", "*");
+        // This is the list that DynamoDB returns for expose headers. I am
+        // not sure why not just return "*" here, what's the risk?
+        rep.add_header("Access-Control-Expose-Headers", "x-amzn-RequestId,x-amzn-ErrorType,x-amzn-ErrorMessage,Date");
+        if (preflight) {
+            sstring s = req.get_header("Access-Control-Request-Headers");
+            if (!s.empty()) {
+                rep.add_header("Access-Control-Allow-Headers", std::move(s));
+            }
+            s = req.get_header("Access-Control-Request-Method");
+            if (!s.empty()) {
+                rep.add_header("Access-Control-Allow-Methods", std::move(s));
+            }
+            // Our CORS response never change anyway, let the browser cache it
+            // for two hours (Chrome's maximum):
+            rep.add_header("Access-Control-Max-Age", "7200");
+        }
+    }
 }
 
 // DynamoDB HTTP error responses are structured as follows
@@ -99,6 +135,7 @@ public:
     api_handler(const api_handler&) = default;
     future<std::unique_ptr<reply>> handle(const sstring& path,
             std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        handle_CORS(*req, *rep, false);
         return _f_handle(std::move(req), std::move(rep)).then(
                 [this](std::unique_ptr<reply> rep) {
                     rep->done(_type);
@@ -135,6 +172,7 @@ public:
     health_handler(seastar::gate& pending_requests) : gated_handler(pending_requests) {}
 protected:
     virtual future<std::unique_ptr<reply>> do_handle(const sstring& path, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        handle_CORS(*req, *rep, false);
         rep->set_status(reply::status_type::ok);
         rep->write_body("txt", format("healthy: {}", req->get_header("Host")));
         return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
@@ -167,7 +205,23 @@ protected:
     }
 };
 
-future<> server::verify_signature(const request& req) {
+// The CORS (Cross-origin resource sharing) protocol can send an OPTIONS
+// request before ("pre-flight") the main request. The response to this
+// request can be empty, but needs to have the right headers (which we
+// fill with handle_CORS())
+class options_handler : public gated_handler {
+public:
+    options_handler(seastar::gate& pending_requests) : gated_handler(pending_requests) {}
+protected:
+    virtual future<std::unique_ptr<reply>> do_handle(const sstring& path, std::unique_ptr<request> req, std::unique_ptr<reply> rep) override {
+        handle_CORS(*req, *rep, true);
+        rep->set_status(reply::status_type::ok);
+        rep->write_body("txt", sstring(""));
+        return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+    }
+};
+
+future<> server::verify_signature(const request& req, const chunked_content& content) {
     if (!_enforce_authorization) {
         slogger.debug("Skipping authorization");
         return make_ready_future<>();
@@ -235,7 +289,7 @@ future<> server::verify_signature(const request& req) {
     auto cache_getter = [&qp = _qp] (std::string username) {
         return get_key_from_roles(qp, std::move(username));
     };
-    return _key_cache.get_ptr(user, cache_getter).then([this, &req,
+    return _key_cache.get_ptr(user, cache_getter).then([this, &req, &content,
                                                     user = std::move(user),
                                                     host = std::move(host),
                                                     datestamp = std::move(datestamp),
@@ -245,7 +299,7 @@ future<> server::verify_signature(const request& req) {
                                                     service = std::move(service),
                                                     user_signature = std::move(user_signature)] (key_cache::value_ptr key_ptr) {
         std::string signature = get_signature(user, *key_ptr, std::string_view(host), req._method,
-                datestamp, signed_headers_str, signed_headers_map, req.content, region, service, "");
+                datestamp, signed_headers_str, signed_headers_map, content, region, service, "");
 
         if (signature != std::string_view(user_signature)) {
             _key_cache.remove(user);
@@ -254,43 +308,91 @@ future<> server::verify_signature(const request& req) {
     });
 }
 
-future<executor::request_return_type> server::handle_api_request(std::unique_ptr<request>&& req) {
+static tracing::trace_state_ptr create_tracing_session(tracing::tracing& tracing_instance) {
+    tracing::trace_state_props_set props;
+    props.set<tracing::trace_state_props::full_tracing>();
+    props.set_if<tracing::trace_state_props::log_slow_query>(tracing_instance.slow_query_tracing_enabled());
+    return tracing_instance.create_session(tracing::trace_type::QUERY, props);
+}
+
+// truncated_content_view() prints a potentially long chunked_content for
+// debugging purposes. In the common case when the content is not excessively
+// long, it just returns a view into the given content, without any copying.
+// But when the content is very long, it is truncated after some arbitrary
+// max_len (or one chunk, whichever comes first), with "<truncated>" added at
+// the end. To do this modification to the string, we need to create a new
+// std::string, so the caller must pass us a reference to one, "buf", where
+// we can store the content. The returned view is only alive for as long this
+// buf is kept alive.
+static std::string_view truncated_content_view(const chunked_content& content, std::string& buf) {
+    constexpr size_t max_len = 1024;
+    if (content.empty()) {
+        return std::string_view();
+    } else if (content.size() == 1 && content.begin()->size() <= max_len) {
+        return std::string_view(content.begin()->get(), content.begin()->size());
+    } else {
+        buf = std::string(content.begin()->get(), std::min(content.begin()->size(), max_len)) + "<truncated>";
+        return std::string_view(buf);
+    }
+}
+
+static tracing::trace_state_ptr maybe_trace_query(service::client_state& client_state, sstring_view op, const chunked_content& query) {
+    tracing::trace_state_ptr trace_state;
+    tracing::tracing& tracing_instance = tracing::tracing::get_local_tracing_instance();
+    if (tracing_instance.trace_next_query() || tracing_instance.slow_query_tracing_enabled()) {
+        trace_state = create_tracing_session(tracing_instance);
+        std::string buf;
+        tracing::add_session_param(trace_state, "alternator_op", op);
+        tracing::add_query(trace_state, truncated_content_view(query, buf));
+        tracing::begin(trace_state, format("Alternator {}", op), client_state.get_client_address());
+    }
+    return trace_state;
+}
+
+future<executor::request_return_type> server::handle_api_request(std::unique_ptr<request> req) {
     _executor._stats.total_operations++;
     sstring target = req->get_header(TARGET);
     std::vector<std::string_view> split_target = split(target, '.');
     //NOTICE(sarna): Target consists of Dynamo API version followed by a dot '.' and operation type (e.g. CreateTable)
     std::string op = split_target.empty() ? std::string() : std::string(split_target.back());
-    slogger.trace("Request: {} {} {}", op, req->content, req->_headers);
-    return verify_signature(*req).then([this, op, req = std::move(req)] () mutable {
-        auto callback_it = _callbacks.find(op);
-        if (callback_it == _callbacks.end()) {
-            _executor._stats.unsupported_operations++;
-            throw api_error::unknown_operation(format("Unsupported operation {}", op));
-        }
-        return with_gate(_pending_requests, [this, callback_it = std::move(callback_it), op = std::move(op), req = std::move(req)] () mutable {
-            //FIXME: Client state can provide more context, e.g. client's endpoint address
-            // We use unique_ptr because client_state cannot be moved or copied
-            return do_with(std::make_unique<executor::client_state>(executor::client_state::internal_tag()),
-                    [this, callback_it = std::move(callback_it), op = std::move(op), req = std::move(req)] (std::unique_ptr<executor::client_state>& client_state) mutable {
-                tracing::trace_state_ptr trace_state = executor::maybe_trace_query(*client_state, op, req->content);
-                tracing::trace(trace_state, op);
-                // JSON parsing can allocate up to roughly 2x the size of the raw document, + a couple of bytes for maintenance.
-                // FIXME: by this time, the whole HTTP request was already read, so some memory is already occupied.
-                // Once HTTP allows working on streams, we should grab the permit *before* reading the HTTP payload.
-                size_t mem_estimate = req->content.size() * 3 + 8000;
-                auto units_fut = get_units(*_memory_limiter, mem_estimate);
-                if (_memory_limiter->waiters()) {
-                    ++_executor._stats.requests_blocked_memory;
-                }
-                return units_fut.then([this, callback_it = std::move(callback_it), &client_state, trace_state, req = std::move(req)] (semaphore_units<> units) mutable {
-                    return _json_parser.parse(req->content).then([this, callback_it = std::move(callback_it), &client_state, trace_state,
-                            units = std::move(units), req = std::move(req)] (rjson::value json_request) mutable {
-                        return callback_it->second(_executor, *client_state, trace_state, make_service_permit(std::move(units)), std::move(json_request), std::move(req)).finally([trace_state] {});
-                    });
-                });
-            });
-        });
-    });
+    // JSON parsing can allocate up to roughly 2x the size of the raw
+    // document, + a couple of bytes for maintenance.
+    // TODO: consider the case where req->content_length is missing. Maybe
+    // we need to take the content_length_limit and return some of the units
+    // when we finish read_content_and_verify_signature?
+    size_t mem_estimate = req->content_length * 2 + 8000;
+    auto units_fut = get_units(*_memory_limiter, mem_estimate);
+    if (_memory_limiter->waiters()) {
+        ++_executor._stats.requests_blocked_memory;
+    }
+    auto units = co_await std::move(units_fut);
+    assert(req->content_stream);
+    chunked_content content = co_await httpd::read_entire_stream(*req->content_stream);
+    co_await verify_signature(*req, content);
+
+    if (slogger.is_enabled(log_level::trace)) {
+        std::string buf;
+        slogger.trace("Request: {} {} {}", op, truncated_content_view(content, buf), req->_headers);
+    }
+    auto callback_it = _callbacks.find(op);
+    if (callback_it == _callbacks.end()) {
+        _executor._stats.unsupported_operations++;
+        co_return api_error::unknown_operation(format("Unsupported operation {}", op));
+    }
+    if (_pending_requests.get_count() >= _max_concurrent_requests) {
+        _executor._stats.requests_shed++;
+        co_return api_error::request_limit_exceeded(format("too many in-flight requests (configured via max_concurrent_requests_per_shard): {}", _pending_requests.get_count()));
+    }
+    _pending_requests.enter();
+    auto leave = defer([this] { _pending_requests.leave(); });
+    //FIXME: Client state can provide more context, e.g. client's endpoint address
+    // We use unique_ptr because client_state cannot be moved or copied
+    executor::client_state client_state{executor::client_state::internal_tag()};
+    tracing::trace_state_ptr trace_state = maybe_trace_query(client_state, op, content);
+    tracing::trace(trace_state, op);
+    rjson::value json_request = co_await _json_parser.parse(std::move(content));
+    co_return co_await callback_it->second(_executor, client_state, trace_state,
+            make_service_permit(std::move(units)), std::move(json_request), std::move(req));
 }
 
 void server::set_routes(routes& r) {
@@ -312,6 +414,7 @@ void server::set_routes(routes& r) {
     // scan an entire subnet for nodes responding to the health request,
     // or even just scan for open ports.
     r.put(operation_type::GET, "/localnodes", new local_nodelist_handler(_pending_requests));
+    r.put(operation_type::OPTIONS, "/", new options_handler(_pending_requests));
 }
 
 //FIXME: A way to immediately invalidate the cache should be considered,
@@ -394,9 +497,10 @@ server::server(executor& exec, cql3::query_processor& qp)
 }
 
 future<> server::init(net::inet_address addr, std::optional<uint16_t> port, std::optional<uint16_t> https_port, std::optional<tls::credentials_builder> creds,
-        bool enforce_authorization, semaphore* memory_limiter) {
+        bool enforce_authorization, semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests) {
     _memory_limiter = memory_limiter;
     _enforce_authorization = enforce_authorization;
+    _max_concurrent_requests = std::move(max_concurrent_requests);
     if (!port && !https_port) {
         return make_exception_future<>(std::runtime_error("Either regular port or TLS port"
                 " must be specified in order to init an alternator HTTP server instance"));
@@ -408,12 +512,14 @@ future<> server::init(net::inet_address addr, std::optional<uint16_t> port, std:
             if (port) {
                 set_routes(_http_server._routes);
                 _http_server.set_content_length_limit(server::content_length_limit);
+                _http_server.set_content_streaming(true);
                 _http_server.listen(socket_address{addr, *port}).get();
                 _enabled_servers.push_back(std::ref(_http_server));
             }
             if (https_port) {
                 set_routes(_https_server._routes);
                 _https_server.set_content_length_limit(server::content_length_limit);
+                _https_server.set_content_streaming(true);
                 _https_server.set_tls_credentials(creds->build_reloadable_server_credentials([](const std::unordered_set<sstring>& files, std::exception_ptr ep) {
                     if (ep) {
                         slogger.warn("Exception loading {}: {}", files, ep);
@@ -451,7 +557,7 @@ server::json_parser::json_parser() : _run_parse_json_thread(async([this] {
                 return;
             }
             try {
-                _parsed_document = rjson::parse_yieldable(_raw_document);
+                _parsed_document = rjson::parse_yieldable(std::move(_raw_document));
                 _current_exception = nullptr;
             } catch (...) {
                 _current_exception = std::current_exception();
@@ -461,12 +567,12 @@ server::json_parser::json_parser() : _run_parse_json_thread(async([this] {
     })) {
 }
 
-future<rjson::value> server::json_parser::parse(std::string_view content) {
+future<rjson::value> server::json_parser::parse(chunked_content&& content) {
     if (content.size() < yieldable_parsing_threshold) {
-        return make_ready_future<rjson::value>(rjson::parse(content));
+        return make_ready_future<rjson::value>(rjson::parse(std::move(content)));
     }
-    return with_semaphore(_parsing_sem, 1, [this, content] {
-        _raw_document = content;
+    return with_semaphore(_parsing_sem, 1, [this, content = std::move(content)] () mutable {
+        _raw_document = std::move(content);
         _document_waiting.signal();
         return _document_parsed.wait().then([this] {
             if (_current_exception) {

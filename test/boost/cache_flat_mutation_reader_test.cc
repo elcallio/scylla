@@ -66,7 +66,7 @@ static void add_tombstone(mutation& m, range_tombstone rt) {
 }
 
 static void set_row_continuous(mutation_partition& mp, int ck, is_continuous value) {
-    auto it = mp.clustered_rows().find(make_ck(ck), rows_entry::compare(*SCHEMA));
+    auto it = mp.clustered_rows().find(make_ck(ck), rows_entry::tri_compare(*SCHEMA));
     assert(it != mp.clustered_rows().end());
     it->set_continuous(value);
 }
@@ -183,10 +183,8 @@ class cache_tester {
 public:
     static partition_snapshot_ptr snapshot_for_key(row_cache& rc, const dht::decorated_key& dk) {
         return rc._read_section(rc._tracker.region(), [&] {
-            return with_linearized_managed_bytes([&] {
-                cache_entry& e = rc.lookup(dk);
-                return e.partition().read(rc._tracker.region(), rc._tracker.cleaner(), e.schema(), &rc._tracker);
-            });
+            cache_entry& e = rc.lookup(dk);
+            return e.partition().read(rc._tracker.region(), rc._tracker.cleaner(), e.schema(), &rc._tracker);
         });
     }
 };

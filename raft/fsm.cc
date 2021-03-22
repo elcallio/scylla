@@ -30,16 +30,21 @@ fsm::fsm(server_id id, term_t current_term, server_id voted_for, log log,
         _log(std::move(log)), _failure_detector(failure_detector), _config(config) {
 
     _observed.advance(*this);
-    set_configuration(_log.get_snapshot().config);
     logger.trace("{}: starting log length {}", _my_id, _log.last_idx());
+    reset_election_timeout();
 
     assert(!bool(_current_leader));
 }
 
-future<> fsm::wait() {
+future<> fsm::wait_max_log_size() {
     check_is_leader();
 
    return _log_limiter_semaphore->sem.wait();
+}
+
+const configuration& fsm::get_configuration() const {
+    check_is_leader();
+    return _log.get_configuration();
 }
 
 template<typename T>
@@ -47,13 +52,50 @@ const log_entry& fsm::add_entry(T command) {
     // It's only possible to add entries on a leader.
     check_is_leader();
 
-    _log.emplace_back(log_entry{_current_term, _log.next_idx(), std::move(command)});
+    if constexpr (std::is_same_v<T, configuration>) {
+        if (_log.last_conf_idx() > _commit_idx ||
+            _log.get_configuration().is_joint()) {
+            // 4.1. Cluster membership changes/Safety.
+            //
+            // Leaders avoid overlapping configuration changes by
+            // not beginning a new change until the previous
+            // change’s entry has committed. It is only safe to
+            // start another membership change once a majority of
+            // the old cluster has moved to operating under the
+            // rules of C_new.
+            throw conf_change_in_progress();
+        }
+        // 4.3. Arbitrary configuration changes using joint consensus
+        //
+        // When the leader receives a request to change the
+        // configuration from C_old to C_new , it stores the
+        // configuration for joint consensus (C_old,new) as a log
+        // entry and replicates that entry using the normal Raft
+        // mechanism.
+        configuration tmp(_log.get_configuration());
+        tmp.enter_joint(command.current);
+        command = std::move(tmp);
+    }
+
+    _log.emplace_back(seastar::make_lw_shared<log_entry>({_current_term, _log.next_idx(), std::move(command)}));
     _sm_events.signal();
+
+    if constexpr (std::is_same_v<T, configuration>) {
+        // 4.1. Cluster membership changes/Safety.
+        //
+        // The new configuration takes effect on each server as
+        // soon as it is added to that server’s log: the C_new
+        // entry is replicated to the C_new servers, and
+        // a majority of the new configuration is used to
+        // determine the C_new entry’s commitment.
+        leader_state().tracker.set_configuration(_log.get_configuration(), _log.last_idx());
+    }
 
     return *_log[_log.last_idx()];
 }
 
 template const log_entry& fsm::add_entry(command command);
+template const log_entry& fsm::add_entry(configuration command);
 template const log_entry& fsm::add_entry(log_entry::dummy dummy);
 
 void fsm::advance_commit_idx(index_t leader_commit_idx) {
@@ -77,52 +119,53 @@ void fsm::update_current_term(term_t current_term)
     assert(_current_term < current_term);
     _current_term = current_term;
     _voted_for = server_id{};
+}
 
+void fsm::reset_election_timeout() {
     static thread_local std::default_random_engine re{std::random_device{}()};
     static thread_local std::uniform_int_distribution<> dist(1, ELECTION_TIMEOUT.count());
-    // Reset the randomized election timeout on each term
-    // change, even if we do not plan to campaign during this
-    // term: the main purpose of the timeout is to avoid
-    // starting our campaign simultaneously with other followers.
     _randomized_election_timeout = ELECTION_TIMEOUT + logical_clock::duration{dist(re)};
 }
 
 void fsm::become_leader() {
     assert(!std::holds_alternative<leader>(_state));
-    assert(!_tracker);
-    _state = leader{};
+    _state = leader(_my_id);
     _current_leader = _my_id;
-    _votes = std::nullopt;
-    _tracker.emplace(_my_id);
     _log_limiter_semaphore.emplace(this);
-    _log_limiter_semaphore->sem.consume(_log.non_snapshoted_length());
-    _tracker->set_configuration(_current_config.servers, _log.next_idx());
+    _log_limiter_semaphore->sem.consume(_log.in_memory_size());
     _last_election_time = _clock.now();
     // a new leader needs to commit at lease one entry to make sure that
-    // all existing entries in its log are commited as well. Also it should
-    // send append entries rpc as soon as possible to establish its leqdership
-    // (3.4).  Do both of those by commiting a dummy entry.
+    // all existing entries in its log are committed as well. Also it should
+    // send append entries RPC as soon as possible to establish its leadership
+    // (3.4). Do both of those by committing a dummy entry.
     add_entry(log_entry::dummy());
+    // set_configuration() begins replicating from the last entry
+    // in the log.
+    leader_state().tracker.set_configuration(_log.get_configuration(), _log.last_idx());
     replicate();
 }
 
 void fsm::become_follower(server_id leader) {
     _current_leader = leader;
     _state = follower{};
-    _tracker = std::nullopt;
     _log_limiter_semaphore = std::nullopt;
-    _votes = std::nullopt;
     if (_current_leader) {
         _last_election_time = _clock.now();
     }
 }
 
-void fsm::become_candidate() {
-    _state = candidate{};
-    _tracker = std::nullopt;
+void fsm::become_candidate(bool is_prevote) {
+    // When starting a campain we need to reset current leader otherwise
+    // disruptive server prevention will stall an election if quorum of nodes
+    // start election together since each one will ignore vote requests from others
+    _current_leader = {};
+    _state = candidate(_log.get_configuration(), is_prevote);
+
+    reset_election_timeout();
+
     _log_limiter_semaphore = std::nullopt;
-    update_current_term(term_t{_current_term + 1});
     // 3.4 Leader election
+    //
     // A possible outcome is that a candidate neither wins nor
     // loses the election: if many followers become candidates at
     // the same time, votes could be split so that no candidate
@@ -130,24 +173,46 @@ void fsm::become_candidate() {
     // time out and start a new election by incrementing its term
     // and initiating another round of RequestVote RPCs.
     _last_election_time = _clock.now();
-    _votes.emplace();
-    _votes->set_configuration(_current_config.servers);
-    _voted_for = _my_id;
 
-    if (_votes->tally_votes() == vote_result::WON) {
-        // A single node cluster.
-        become_leader();
+    auto& votes = candidate_state().votes;
+
+    const auto& voters = votes.voters();
+    if (!voters.contains(server_address{_my_id})) {
+        // If the server is not part of the current configuration,
+        // revert to the follower state without increasing
+        // the current term.
+        become_follower(server_id{});
         return;
     }
 
-    for (const auto& server : _current_config.servers) {
+    term_t term{_current_term + 1};
+    if (!is_prevote) {
+        update_current_term(term);
+    }
+    // Replicate RequestVote
+    for (const auto& server : voters) {
         if (server.id == _my_id) {
+            // Vote for self.
+            votes.register_vote(server.id, true);
+            if (!is_prevote) {
+                // Only record real votes
+                _voted_for = _my_id;
+            }
+            // Already signaled _sm_events in update_current_term()
             continue;
         }
-        logger.trace("{} [term: {}, index: {}, last log term: {}] sent vote request to {}",
-            _my_id, _current_term, _log.last_idx(), _log.last_term(), server.id);
+        logger.trace("{} [term: {}, index: {}, last log term: {}{}] sent vote request to {}",
+            _my_id, term, _log.last_idx(), _log.last_term(), is_prevote ? ", prevote" : "", server.id);
 
-        send_to(server.id, vote_request{_current_term, _log.last_idx(), _log.last_term()});
+        send_to(server.id, vote_request{term, _log.last_idx(), _log.last_term(), is_prevote});
+    }
+    if (votes.tally_votes() == vote_result::WON) {
+        // A single node cluster.
+        if (is_prevote) {
+            become_candidate(false);
+        } else {
+            become_leader();
+        }
     }
 }
 
@@ -184,8 +249,7 @@ fsm_output fsm::get_output() {
     }
 
     if (_observed._current_term != _current_term || _observed._voted_for != _voted_for) {
-        output.term = _current_term;
-        output.vote = _voted_for;
+        output.term_and_vote = {_current_term, _voted_for};
     }
 
     // see if there was a new snapshot that has to be handled
@@ -195,7 +259,7 @@ fsm_output fsm::get_output() {
 
     // Return committed entries.
     // Observer commit index may be smaller than snapshot index
-    // in which case we should not attemp commiting entries belonging
+    // in which case we should not attempt committing entries belonging
     // to a snapshot.
     auto observed_ci =  std::max(_observed._commit_idx, _log.get_snapshot().idx);
     if (observed_ci < _commit_idx) {
@@ -210,7 +274,7 @@ fsm_output fsm::get_output() {
     }
 
     // Get a snapshot of all unsent messages.
-    // Do it after populting log_entries and committed arrays
+    // Do it after populating log_entries and committed arrays
     // to not lose messages in case arrays population throws
     std::swap(output.messages, _messages);
 
@@ -233,22 +297,25 @@ fsm_output fsm::get_output() {
 
 void fsm::advance_stable_idx(index_t idx) {
     _log.stable_to(idx);
-    if (is_leader()) {
-        auto& progress = _tracker->find(_my_id);
-        progress.match_idx = idx;
-        progress.next_idx = index_t{idx + 1};
+    // If this server is leader and is part of the current
+    // configuration, update it's progress and optionally
+    // commit new entries.
+    if (is_leader() && leader_state().tracker.leader_progress()) {
+        leader_state().tracker.leader_progress()->accepted(idx);
         replicate();
-        check_committed();
+        maybe_commit();
     }
 }
 
-void fsm::check_committed() {
+void fsm::maybe_commit() {
 
-    index_t new_commit_idx = _tracker->committed(_commit_idx);
+    index_t new_commit_idx = leader_state().tracker.committed(_commit_idx);
 
     if (new_commit_idx <= _commit_idx) {
         return;
     }
+    bool committed_conf_change = _commit_idx < _log.last_conf_idx() &&
+        new_commit_idx >= _log.last_conf_idx();
 
     if (_log[new_commit_idx]->term != _current_term) {
 
@@ -259,15 +326,54 @@ void fsm::check_committed() {
         // an entry from the current term has been committed in
         // this way, then all prior entries are committed
         // indirectly because of the Log Matching Property.
-        logger.trace("check_committed[{}]: cannot commit because of term {} != {}",
+        logger.trace("maybe_commit[{}]: cannot commit because of term {} != {}",
             _my_id, _log[new_commit_idx]->term, _current_term);
         return;
     }
-    logger.trace("check_committed[{}]: commit {}", _my_id, new_commit_idx);
+    logger.trace("maybe_commit[{}]: commit {}", _my_id, new_commit_idx);
+
     _commit_idx = new_commit_idx;
     // We have a quorum of servers with match_idx greater than the
     // current commit index. Commit && apply more entries.
     _sm_events.signal();
+
+    if (committed_conf_change) {
+        if (_log.get_configuration().is_joint()) {
+            // 4.3. Arbitrary configuration changes using joint consensus
+            //
+            // Once the joint consensus has been committed, the
+            // system then transitions to the new configuration.
+            configuration cfg(_log.get_configuration());
+            cfg.leave_joint();
+            _log.emplace_back(seastar::make_lw_shared<log_entry>({_current_term, _log.next_idx(), std::move(cfg)}));
+            leader_state().tracker.set_configuration(_log.get_configuration(), _log.last_idx());
+            // Leaving joint configuration may commit more entries
+            // even if we had no new acks. Imagine the cluster is
+            // in joint configuration {{A, B}, {A, B, C, D, E}}.
+            // The leader's view of stable indexes is:
+            //
+            // Server  Match Index
+            // A       5
+            // B       5
+            // C       6
+            // D       7
+            // E       8
+            //
+            // The commit index would be 5 if we use joint
+            // configuration, and 6 if we assume we left it. Let
+            // it happen without an extra FSM step.
+            maybe_commit();
+        } else if (leader_state().tracker.leader_progress() == nullptr) {
+            // 4.2.2 Removing the current leader
+            //
+            // A leader that is removed from the configuration
+            // steps down once the C_new entry is committed.
+            //
+            // @todo: when leadership transfer extension is
+            // implemented, send TimeoutNow to a member of C_new
+            become_follower(server_id{});
+        }
+    }
 }
 
 void fsm::tick_leader() {
@@ -281,7 +387,7 @@ void fsm::tick_leader() {
     }
 
     size_t active = 1; // +1 for self
-    for (auto& [id, progress] : *_tracker) {
+    for (auto& [id, progress] : leader_state().tracker) {
         if (progress.id != _my_id) {
             if (_failure_detector.is_alive(progress.id)) {
                 active++;
@@ -303,7 +409,7 @@ void fsm::tick_leader() {
             }
         }
     }
-    if (active >= _tracker->size()/2 + 1) {
+    if (active >= leader_state().tracker.size()/2 + 1) {
         // Advance last election time if we heard from
         // the quorum during this tick.
         _last_election_time = _clock.now();
@@ -322,14 +428,14 @@ void fsm::tick() {
     } else if (is_past_election_timeout()) {
         logger.trace("tick[{}]: becoming a candidate, last election: {}, now: {}", _my_id,
             _last_election_time, _clock.now());
-        become_candidate();
+        become_candidate(_config.enable_prevoting);
     }
 }
 
-void fsm::append_entries(server_id from, append_request_recv&& request) {
+void fsm::append_entries(server_id from, append_request&& request) {
     logger.trace("append_entries[{}] received ct={}, prev idx={} prev term={} commit idx={}, idx={} num entries={}",
             _my_id, request.current_term, request.prev_log_idx, request.prev_log_term,
-            request.leader_commit_idx, request.entries.size() ? request.entries[0].idx : index_t(0), request.entries.size());
+            request.leader_commit_idx, request.entries.size() ? request.entries[0]->idx : index_t(0), request.entries.size());
 
     assert(is_follower());
     // 3.4. Leader election
@@ -370,7 +476,13 @@ void fsm::append_entries(server_id from, append_request_recv&& request) {
 void fsm::append_entries_reply(server_id from, append_reply&& reply) {
     assert(is_leader());
 
-    follower_progress& progress = _tracker->find(from);
+    follower_progress* opt_progress = leader_state().tracker.find(from);
+    if (opt_progress == nullptr) {
+        // A message from a follower removed from the
+        // configuration.
+        return;
+    }
+    follower_progress& progress = *opt_progress;
 
     if (progress.state == follower_progress::state::PIPELINE) {
         if (progress.in_flight) {
@@ -393,14 +505,18 @@ void fsm::append_entries_reply(server_id from, append_reply&& reply) {
         logger.trace("append_entries_reply[{}->{}]: accepted match={} last index={}",
             _my_id, from, progress.match_idx, last_idx);
 
-        progress.match_idx = std::max(progress.match_idx, last_idx);
-        // out next_idx may be large because of optimistic increase in pipeline mode
-        progress.next_idx = std::max(progress.next_idx, index_t(last_idx + 1));
+        progress.accepted(last_idx);
 
         progress.become_pipeline();
 
         // check if any new entry can be committed
-        check_committed();
+        maybe_commit();
+
+        // We may have resigned leadership if committed a new
+        // configuration.
+        if (!is_leader()) {
+            return;
+        }
     } else {
         // rejected
         append_reply::rejected rejected = std::get<append_reply::rejected>(reply.result);
@@ -425,10 +541,15 @@ void fsm::append_entries_reply(server_id from, append_reply&& reply) {
         assert(progress.next_idx != progress.match_idx);
     }
 
-    logger.trace("append_entries_reply[{}->{}]: next_idx={}, match_idx={}",
-        _my_id, from, progress.next_idx, progress.match_idx);
+    // We may have just applied a configuration that removes this
+    // follower, so re-track it.
+    opt_progress = leader_state().tracker.find(from);
+    if (opt_progress != nullptr) {
+        logger.trace("append_entries_reply[{}->{}]: next_idx={}, match_idx={}",
+            _my_id, from, opt_progress->next_idx, opt_progress->match_idx);
 
-    replicate_to(progress, false);
+        replicate_to(*opt_progress, false);
+    }
 }
 
 void fsm::request_vote(server_id from, vote_request&& request) {
@@ -436,13 +557,17 @@ void fsm::request_vote(server_id from, vote_request&& request) {
     // We can cast a vote in any state. If the candidate's term is
     // lower than ours, we ignore the request. Otherwise we first
     // update our current term and convert to a follower.
-    assert(_current_term == request.current_term);
+    assert(request.is_prevote || _current_term == request.current_term);
 
     bool can_vote =
-	    // We can vote if this is a repeat of a vote we've already cast...
+        // We can vote if this is a repeat of a vote we've already cast...
         _voted_for == from ||
         // ...we haven't voted and we don't think there's a leader yet in this term...
-        (_voted_for == server_id{} && _current_leader == server_id{});
+        (_voted_for == server_id{} && _current_leader == server_id{}) ||
+        // ...this is prevote for a future term...
+        // (we will get here if the node does not know any leader yet and already
+        //  voted for some other node, but now it get even newer prevote request)
+        (request.is_prevote && request.current_term > _current_term);
 
     // ...and we believe the candidate is up to date.
     if (can_vote && _log.is_up_to_date(request.last_log_idx, request.last_log_term)) {
@@ -451,23 +576,34 @@ void fsm::request_vote(server_id from, vote_request&& request) {
             "voted for {} [log_term: {}, log_index: {}]",
             _my_id, _current_term, _log.last_idx(), _log.last_term(), _voted_for,
             from, request.last_log_term, request.last_log_idx);
-        // If a server grants a vote, it must reset its election
-        // timer. See Raft Summary.
-        _last_election_time = _clock.now();
-        _voted_for = from;
-
-        send_to(from, vote_reply{_current_term, true});
+        if (!request.is_prevote) { // Only record real votes
+            // If a server grants a vote, it must reset its election
+            // timer. See Raft Summary.
+            _last_election_time = _clock.now();
+            _voted_for = from;
+        }
+        // The term in the original message and current local term are the
+        // same in the case of regular votes, but different for pre-votes.
+        //
+        // When responding to {Pre,}Vote messages we include the term
+        // from the message, not the local term. To see why, consider the
+        // case where a single node was previously partitioned away and
+        // its local term is now out of date. If we include the local term
+        // (recall that for pre-votes we don't update the local term), the
+        // (pre-)campaigning node on the other end will proceed to ignore
+        // the message (it ignores all out of date messages).
+        send_to(from, vote_reply{request.current_term, true, request.is_prevote});
     } else {
         // If a vote is not granted, this server is a potential
         // viable candidate, so it should not reset its election
         // timer, to avoid election disruption by non-viable
         // candidates.
         logger.trace("{} [term: {}, index: {}, log_term: {}, voted_for: {}] "
-            "rejected vote for {} [log_term: {}, log_index: {}]",
+            "rejected vote for {} [current_term: {}, log_term: {}, log_index: {}, is_prevote: {}]",
             _my_id, _current_term, _log.last_idx(), _log.last_term(), _voted_for,
-            from, request.last_log_term, request.last_log_idx);
+            from, request.current_term, request.last_log_term, request.last_log_idx, request.is_prevote);
 
-        send_to(from, vote_reply{_current_term, false});
+        send_to(from, vote_reply{_current_term, false, request.is_prevote});
     }
 }
 
@@ -476,13 +612,18 @@ void fsm::request_vote_reply(server_id from, vote_reply&& reply) {
 
     logger.trace("{} received a {} vote from {}", _my_id, reply.vote_granted ? "yes" : "no", from);
 
-    _votes->register_vote(from, reply.vote_granted);
+    auto& state = std::get<candidate>(_state);
+    state.votes.register_vote(from, reply.vote_granted);
 
-    switch (_votes->tally_votes()) {
+    switch (state.votes.tally_votes()) {
     case vote_result::UNKNOWN:
         break;
     case vote_result::WON:
-        become_leader();
+        if (state.is_prevote) {
+            become_candidate(false);
+        } else {
+            become_leader();
+        }
         break;
     case vote_result::LOST:
         become_follower(server_id{});
@@ -497,7 +638,7 @@ static size_t entry_size(const log_entry& e) {
         }
         size_t operator()(const configuration& c) {
             size_t size = 0;
-            for (auto& s : c.servers) {
+            for (auto& s : c.current) {
                 size += sizeof(s.id);
                 size += s.info.size();
             }
@@ -529,34 +670,38 @@ void fsm::replicate_to(follower_progress& progress, bool allow_empty) {
 
         allow_empty = false; // allow only one empty message
 
-        if (progress.next_idx < _log.start_idx()) {
-            // The next index to be sent points to a snapshot so
-            // we need to transfer the snasphot before we can
+        // A log containing a snapshot, a few trailing entries and
+        // a few new entries may look like this:
+        // E - log entry
+        // S_idx - snapshot index
+        // E_i1 E_i2 E_i3 Ei_4 E_i5 E_i6
+        //      ^
+        //      S_idx = i2
+        // If the follower's next_idx is i1 we need to
+        // enter snapshot transfer mode even when we have
+        // i1 in the log, since it is not possible to get the term of
+        // the entry previous to i1 and verify that the follower's tail
+        // contains no uncommitted entries.
+        index_t prev_idx = progress.next_idx - index_t{1};
+        std::optional<term_t> prev_term = _log.term_for(prev_idx);
+        if (!prev_term) {
+            const snapshot& snapshot = _log.get_snapshot();
+            // We need to transfer the snapshot before we can
             // continue syncing the log.
             progress.become_snapshot();
-            send_to(progress.id, install_snapshot{_current_term, _log.get_snapshot()});
+            send_to(progress.id, install_snapshot{_current_term, snapshot});
             logger.trace("replicate_to[{}->{}]: send snapshot next={} snapshot={}",
-                    _my_id, progress.id, progress.next_idx,  _log.get_snapshot().idx);
+                    _my_id, progress.id, progress.next_idx,  snapshot.idx);
             return;
         }
 
-        index_t prev_idx = index_t(0);
-        term_t prev_term = _current_term;
-        if (progress.next_idx != 1) {
-            auto& s =  _log.get_snapshot();
-            prev_idx = index_t(progress.next_idx - 1);
-            assert (prev_idx >= s.idx);
-            prev_term = s.idx == prev_idx ? s.term : _log[prev_idx]->term;
-        }
-
-        append_request_send req = {{
-                .current_term = _current_term,
-                .leader_id = _my_id,
-                .prev_log_idx = prev_idx,
-                .prev_log_term = prev_term,
-                .leader_commit_idx = _commit_idx
-            },
-            std::vector<log_entry_ptr>()
+        append_request req = {
+            .current_term = _current_term,
+            .leader_id = _my_id,
+            .prev_log_idx = prev_idx,
+            .prev_log_term = prev_term.value(),
+            .leader_commit_idx = _commit_idx,
+            .entries = std::vector<log_entry_ptr>()
         };
 
         if (next_idx) {
@@ -594,7 +739,7 @@ void fsm::replicate_to(follower_progress& progress, bool allow_empty) {
 
 void fsm::replicate() {
     assert(is_leader());
-    for (auto& [id, progress] : *_tracker) {
+    for (auto& [id, progress] : leader_state().tracker) {
         if (progress.id != _my_id) {
             replicate_to(progress, false);
         }
@@ -613,7 +758,7 @@ bool fsm::can_read() {
     // but in the future we may return true here if we can guaranty leadership
     // by means of a "stable leader" optimization. "Stable leader" ensures that
     // a follower does not vote for other leader if it recently (during a couple
-    // of last ticks) heard from existing one, so if the leader is already committed 
+    // of last ticks) heard from existing one, so if the leader is already committed
     // entries during this tick it guaranties that it communicated with
     // majority of nodes and no other leader could have been elected.
 
@@ -621,7 +766,7 @@ bool fsm::can_read() {
 }
 
 void fsm::snapshot_status(server_id id, std::optional<index_t> idx) {
-    auto& progress = _tracker->find(id);
+    follower_progress& progress = *leader_state().tracker.find(id);
 
     if (progress.state != follower_progress::state::SNAPSHOT) {
         logger.trace("snasphot_status[{}]: called not in snapshot state", _my_id);
@@ -633,10 +778,10 @@ void fsm::snapshot_status(server_id id, std::optional<index_t> idx) {
 
     if (idx) {
         progress.next_idx = *idx + index_t(1);
-        // If snapshot was successfully transfered start replication immediately
+        // If snapshot was successfully transferred start replication immediately
         replicate_to(progress, false);
     }
-    // Otherwise wait for a heartbeat. Next attempt will move us to snapshotting state
+    // Otherwise wait for a heartbeat. Next attempt will move us to SNAPSHOT state
     // again and snapshot transfer will be attempted one more time.
 }
 
@@ -672,15 +817,10 @@ std::ostream& operator<<(std::ostream& os, const fsm& f) {
     os << "commit index: " << f._observed._commit_idx << "), ";
     os << "current time: " << f._clock.now() << ", ";
     os << "last election time: " << f._last_election_time << ", ";
-    if (f._votes) {
-        os << "votes (" << *f._votes << "), ";
+    if (f.is_candidate()) {
+        os << "votes (" << f.candidate_state().votes << "), ";
     }
     os << "messages: " << f._messages.size() << ", ";
-    os << "current_config (";
-    for (auto& server: f._current_config.servers) {
-        os << server.id << ", ";
-    }
-    os << "), ";
 
     if (std::holds_alternative<leader>(f._state)) {
         os << "leader, ";
@@ -689,9 +829,9 @@ std::ostream& operator<<(std::ostream& os, const fsm& f) {
     } else if (std::holds_alternative<follower>(f._state)) {
         os << "follower";
     }
-    if (f._tracker) {
+    if (f.is_leader()) {
         os << "followers (";
-        for (const auto& [server_id, follower_progress]: *f._tracker) {
+        for (const auto& [server_id, follower_progress]: f.leader_state().tracker) {
             os << server_id << ", ";
             os << follower_progress.next_idx << ", ";
             os << follower_progress.match_idx << ", ";

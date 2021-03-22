@@ -124,7 +124,7 @@ struct clustering_block {
     constexpr static size_t max_block_size = 32;
     uint64_t header = 0;
     struct described_value {
-        bytes_view value;
+        managed_bytes_view value;
         std::reference_wrapper<const abstract_type> type;
     };
     boost::container::static_vector<described_value, clustering_block::max_block_size> values;
@@ -162,7 +162,7 @@ public:
         while (_offset < limit) {
             auto shift = _offset % clustering_block::max_block_size;
             if (_offset < _prefix.size(_schema)) {
-                bytes_view value = _prefix.get_component(_schema, _offset);
+                managed_bytes_view value = _prefix.get_component(_schema, _offset);
                 if (value.empty()) {
                     _current_block.header |= (uint64_t(1) << (shift * 2));
                 } else {
@@ -203,8 +203,8 @@ template <typename W>
 requires Writer<W>
 static void write(sstable_version_types v, W& out, const clustering_block& block) {
     write_vint(out, block.header);
-    for (const auto& [value, type]: block.values) {
-        write_cell_value(v, out, type, value);
+    for (const auto& block_value: block.values) {
+        write_cell_value(v, out, block_value.type, block_value.value);
     }
 }
 
@@ -1122,10 +1122,9 @@ void writer::write_cell(bytes_ostream& writer, const clustering_key_prefix* clus
     if (cdef.is_counter()) {
         if (!is_deleted) {
             assert(!cell.is_counter_update());
-            counter_cell_view::with_linearized(cell, [&] (counter_cell_view ccv) {
-                write_counter_value(ccv, writer, _sst.get_version(), [] (bytes_ostream& out, uint32_t value) {
-                    return write_vint(out, value);
-                });
+            auto ccv = counter_cell_view(cell);
+            write_counter_value(ccv, writer, _sst.get_version(), [] (bytes_ostream& out, uint32_t value) {
+                return write_vint(out, value);
             });
         }
     } else {
@@ -1469,10 +1468,6 @@ stop_iteration writer::consume_end_of_partition() {
 }
 
 void writer::consume_end_of_stream() {
-    if (_partition_key) {
-        on_internal_error(sstlog, "Mutation stream ends with unclosed partition during write");
-    }
-
     _cfg.monitor->on_data_write_completed();
 
     seal_summary(_sst._components->summary, std::move(_first_key), std::move(_last_key), _index_sampling_state).get();
@@ -1502,7 +1497,7 @@ void writer::consume_end_of_stream() {
     }
     run_identifier identifier{_run_identifier};
     std::optional<scylla_metadata::large_data_stats> ld_stats(std::move(_large_data_stats));
-    _sst.write_scylla_metadata(_pc, _shard, std::move(features), std::move(identifier), std::move(ld_stats));
+    _sst.write_scylla_metadata(_pc, _shard, std::move(features), std::move(identifier), std::move(ld_stats), _cfg.origin);
     if (!_cfg.leave_unsealed) {
         _sst.seal_sstable(_cfg.backup).get();
     }

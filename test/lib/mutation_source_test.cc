@@ -551,7 +551,7 @@ static void test_streamed_mutation_forwarding_guarantees(populate_fn_ex populate
     }
 
     // Few random ranges
-    std::default_random_engine rnd;
+    auto& rnd = seastar::testing::local_random_engine;
     std::uniform_int_distribution<int> key_dist{0, n_keys - 1};
     for (int i = 0; i < 10; ++i) {
         std::vector<int> indices;
@@ -1659,12 +1659,7 @@ void for_each_mutation(std::function<void(const mutation&)> callback) {
 }
 
 bytes make_blob(size_t blob_size) {
-    static thread_local std::independent_bits_engine<std::default_random_engine, 8, uint8_t> random_bytes;
-    bytes big_blob(bytes::initialized_later(), blob_size);
-    for (auto&& b : big_blob) {
-        b = random_bytes();
-    }
-    return big_blob;
+    return tests::random::get_bytes(blob_size);
 };
 
 class random_mutation_generator::impl {
@@ -1686,7 +1681,7 @@ private:
     generate_uncompactable _uncompactable;
     const size_t _external_blob_size = 128; // Should be enough to force use of external bytes storage
     const size_t n_blobs = 1024;
-    const column_id column_count = row::max_vector_size * 2;
+    const column_id column_count = 64;
     std::mt19937 _gen;
     schema_ptr _schema;
     std::vector<bytes> _blobs;
@@ -1710,7 +1705,6 @@ private:
             auto col_type = type == counter_type || _bool_dist(_gen) ? type : list_type_impl::get_instance(type, true);
             builder.with_column(to_bytes(column_name), col_type, kind);
         };
-        // Create enough columns so that row can overflow its vector storage
         for (column_id i = 0; i < column_count; ++i) {
             add_column(format("v{:d}", i), column_kind::regular_column);
             add_column(format("s{:d}", i), column_kind::static_column);

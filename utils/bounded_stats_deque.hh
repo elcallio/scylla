@@ -44,7 +44,7 @@ public:
         : _max_size(size) {
     }
 
-    int size() {
+    int size() const {
         return _deque.size();
     }
 
@@ -58,11 +58,11 @@ public:
         _sum += i;
     }
 
-    long sum() {
+    long sum() const {
         return _sum;
     }
 
-    double mean() {
+    double mean() const {
         return size() > 0 ? ((double) sum()) / size() : 0;
     }
 

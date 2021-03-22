@@ -19,6 +19,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/thread_cputime_clock.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
@@ -30,6 +31,7 @@
 #include "utils/managed_bytes.hh"
 #include "test/lib/log.hh"
 #include "log.hh"
+#include "test/lib/random_utils.hh"
 
 [[gnu::unused]]
 static auto x = [] {
@@ -66,8 +68,7 @@ SEASTAR_TEST_CASE(test_compaction) {
 
             // Free 1/3 randomly
 
-            std::random_device random_device;
-            std::default_random_engine random(random_device());
+            auto& random = seastar::testing::local_random_engine;
             std::shuffle(_allocated.begin(), _allocated.end(), random);
 
             auto it = _allocated.begin();
@@ -157,7 +158,7 @@ SEASTAR_TEST_CASE(test_compaction_with_multiple_regions) {
 
         // Shuffle, so that we don't free whole segments back to the pool
         // and there's nothing to reclaim.
-        std::default_random_engine random{std::random_device{}()};
+        auto& random = seastar::testing::local_random_engine;
         std::shuffle(allocated2.begin(), allocated2.end(), random);
 
         with_allocator(reg2.allocator(), [&] {
@@ -292,11 +293,11 @@ SEASTAR_TEST_CASE(test_blob) {
             auto src = bytes("123456");
             managed_bytes b(src);
 
-            BOOST_REQUIRE(bytes_view(b) == src);
+            BOOST_REQUIRE(managed_bytes_view(b) == bytes_view(src));
 
             reg.full_compaction();
 
-            BOOST_REQUIRE(bytes_view(b) == src);
+            BOOST_REQUIRE(managed_bytes_view(b) == bytes_view(src));
         });
     });
 }
@@ -349,8 +350,7 @@ SEASTAR_TEST_CASE(test_region_lock) {
 
             // Evict 30% so that region is compactible, but do it randomly so that
             // segments are not released into the standard allocator without compaction.
-            std::random_device random_device;
-            std::default_random_engine random(random_device());
+            auto& random = seastar::testing::local_random_engine;
             std::shuffle(refs.begin(), refs.end(), random);
             for (size_t i = 0; i < refs.size() * 0.3; ++i) {
                 refs.pop_back();
@@ -412,18 +412,18 @@ SEASTAR_TEST_CASE(test_large_allocation) {
         try {
             while (true) {
                 with_allocator(r_evictable.allocator(), [&] {
-                    evictable.push_back(bytes(bytes::initialized_later(),element_size));
+                    evictable.push_back(managed_bytes(bytes(bytes::initialized_later(),element_size)));
                 });
                 with_allocator(r_non_evictable.allocator(), [&] {
-                    non_evictable.push_back(bytes(bytes::initialized_later(),element_size));
+                    non_evictable.push_back(managed_bytes(bytes(bytes::initialized_later(),element_size)));
                 });
             }
         } catch (const std::bad_alloc&) {
             // expected
         }
 
-        std::random_device random;
-        std::shuffle(evictable.begin(), evictable.end(), std::default_random_engine(random()));
+        auto& random = seastar::testing::local_random_engine;
+        std::shuffle(evictable.begin(), evictable.end(), random);
         r_evictable.make_evictable([&] {
             return with_allocator(r_evictable.allocator(), [&] {
                 if (evictable.empty()) {
@@ -608,7 +608,7 @@ struct test_region: public logalloc::region  {
     }
     void alloc(size_t size = logalloc::segment_size) {
         with_allocator(allocator(), [this, size] {
-            _alloc.push_back(bytes(bytes::initialized_later(), size));
+            _alloc.push_back(managed_bytes(bytes(bytes::initialized_later(), size)));
         });
     }
 
@@ -780,7 +780,7 @@ SEASTAR_TEST_CASE(test_region_groups_linear_hierarchy_throttling_moving_restrict
         // fill the inner node. Try allocating at child level. Should not be allowed.
         circular_buffer<managed_bytes> big_alloc;
         with_allocator(inner_region->allocator(), [&big_alloc] {
-            big_alloc.push_back(bytes(bytes::initialized_later(), logalloc::segment_size));
+            big_alloc.push_back(managed_bytes(bytes(bytes::initialized_later(), logalloc::segment_size)));
         });
         BOOST_REQUIRE_GE(inner.memory_used(), logalloc::segment_size);
 
@@ -789,7 +789,7 @@ SEASTAR_TEST_CASE(test_region_groups_linear_hierarchy_throttling_moving_restrict
 
         // Now fill the root...
         with_allocator(root_region->allocator(), [&big_alloc] {
-            big_alloc.push_back(bytes(bytes::initialized_later(), logalloc::segment_size));
+            big_alloc.push_back(managed_bytes(bytes(bytes::initialized_later(), logalloc::segment_size)));
         });
         BOOST_REQUIRE_GE(root.memory_used(), logalloc::segment_size);
 
@@ -891,7 +891,7 @@ public:
             , _rg(rg)
     {
         with_allocator(_region.allocator(), [this] {
-            _alloc.push_back(bytes(bytes::initialized_later(), this->_alloc_size));
+            _alloc.push_back(managed_bytes(bytes(bytes::initialized_later(), this->_alloc_size)));
         });
 
     }
@@ -1295,8 +1295,7 @@ SEASTAR_THREAD_TEST_CASE(test_can_reclaim_contiguous_memory_with_mixed_allocatio
     std::vector<managed_bytes> non_evictable_allocs;
     std::vector<std::unique_ptr<char[]>> std_allocs;
 
-    std::random_device rnd_dev;
-    std::default_random_engine rnd(rnd_dev());
+    auto& rnd = seastar::testing::local_random_engine;
 
     auto clean_up = defer([&] {
         with_allocator(evictable.allocator(), [&] {
@@ -1448,6 +1447,89 @@ SEASTAR_THREAD_TEST_CASE(test_decay_reserves) {
     auto slop = 5;
     auto expected_reclaims = expected_reserve_size * slop / small_thing.size();
     BOOST_REQUIRE_LE(reclaims, expected_reclaims);
+}
+
+SEASTAR_THREAD_TEST_CASE(background_reclaim) {
+    prime_segment_pool(memory::stats().total_memory(), memory::min_free_memory()).get();  // if previous test cases muddied the pool
+
+    region evictable;
+    std::vector<managed_bytes> evictable_allocs;
+
+    auto& rnd = seastar::testing::local_random_engine;
+
+    auto clean_up = defer([&] {
+        with_allocator(evictable.allocator(), [&] {
+            evictable_allocs.clear();
+        });
+    });
+
+
+    // Fill up memory with allocations
+    size_t lsa_alloc_size = 300;
+
+    while (true) {
+        try {
+            with_allocator(evictable.allocator(), [&] {
+                evictable_allocs.push_back(managed_bytes(managed_bytes::initialized_later(), lsa_alloc_size));
+            });
+        } catch (std::bad_alloc&) {
+            break;
+        }
+    }
+
+    // make the reclaimer work harder
+    std::shuffle(evictable_allocs.begin(), evictable_allocs.end(), rnd);
+
+    evictable.make_evictable([&] () -> memory::reclaiming_result {
+       if (evictable_allocs.empty()) {
+           return memory::reclaiming_result::reclaimed_nothing;
+       }
+       with_allocator(evictable.allocator(), [&] {
+           evictable_allocs.pop_back();
+       });
+       return memory::reclaiming_result::reclaimed_something;
+    });
+
+    // Set up the background reclaimer
+
+    auto background_reclaim_scheduling_group = create_scheduling_group("background_reclaim", 100).get0();
+    auto kill_sched_group = defer([&] {
+        destroy_scheduling_group(background_reclaim_scheduling_group).get();
+    });
+
+    logalloc::tracker::config st_cfg;
+    st_cfg.defragment_on_idle = false;
+    st_cfg.abort_on_lsa_bad_alloc = false;
+    st_cfg.lsa_reclamation_step = 1;
+    st_cfg.background_reclaim_sched_group = background_reclaim_scheduling_group;
+    logalloc::shard_tracker().configure(st_cfg);
+
+    auto stop_lsa_background_reclaim = defer([&] {
+        return logalloc::shard_tracker().stop().get();
+    });
+
+    sleep(500ms).get(); // sleep a little, to give the reclaimer a head start
+
+    std::vector<managed_bytes> std_allocs;
+    size_t std_alloc_size = 1000000; // note that managed_bytes fragments these, even in std
+    for (int i = 0; i < 50; ++i) {
+        auto compacted_pre = logalloc::memory_compacted();
+        fmt::print("compacted {} items {} (pre)\n", compacted_pre, evictable_allocs.size());
+        std_allocs.emplace_back(managed_bytes::initialized_later(), std_alloc_size);
+        auto compacted_post = logalloc::memory_compacted();
+        fmt::print("compacted {} items {} (post)\n", compacted_post, evictable_allocs.size());
+        BOOST_REQUIRE_EQUAL(compacted_pre, compacted_post);
+    
+        // Pretend to do some work. Sleeping would be too easy, as the background reclaim group would use
+        // all that time.
+        //
+        // Use thread_cputime_clock to prevent overcommitted test machines from stealing CPU time
+        // and causing test failures.
+        auto deadline = thread_cputime_clock::now() + 100ms;
+        while (thread_cputime_clock::now() < deadline) {
+            thread::maybe_yield();
+        }
+    }
 }
 
 #endif

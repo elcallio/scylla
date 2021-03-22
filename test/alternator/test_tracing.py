@@ -31,6 +31,7 @@ import pytest
 import requests
 import re
 import time
+import json
 from botocore.exceptions import ClientError
 from util import random_string, full_scan, full_query, create_test_table
 
@@ -70,6 +71,46 @@ def with_tracing(dynamodb):
     if response.status_code != 200 or response.content.decode('utf-8') != '0':
         pytest.skip('Failed to verify tracing disabled')
 
+# Similarly to the fixture above, slow query logging is enabled only for the run of the
+# test function. Slow logging is set up with threshold equal to 0 microseconds,
+# which effectively means that each query will be qualified as slow and logged.
+@pytest.fixture(scope="function")
+def with_slow_query_logging(dynamodb):
+    print("with_slow_query_logging enabling slow query logging")
+    if dynamodb.meta.client._endpoint.host.endswith('.amazonaws.com'):
+        pytest.skip('Scylla-only feature not supported by AWS')
+    url = dynamodb.meta.client._endpoint.host
+    # The REST API is on port 10000, and always http, not https.
+    url = re.sub(r':[0-9]+(/|$)', ':10000', url)
+    url = re.sub(r'^https:', 'http:', url)
+    slow_query_info = requests.get(url+'/storage_service/slow_query')
+    if slow_query_info.status_code != 200:
+        pytest.skip('Failed to fetch slow query logging info')
+    slow_query_json = json.loads(slow_query_info.text)
+    print(slow_query_json)
+    response = requests.post(url+'/storage_service/slow_query?enable=true')
+    if response.status_code != 200:
+        pytest.skip('Failed to enable slow query logging')
+    response = requests.post(url+'/storage_service/slow_query?threshold=0')
+    if response.status_code != 200:
+        pytest.skip('Failed to enable slow query logging threshold')
+    # verify that logging is really enabled
+    response = requests.get(url+'/storage_service/slow_query')
+    if response.status_code != 200:
+        pytest.skip('Failed to verify slow query logging')
+    response_json = json.loads(response.text)
+    if response_json['enable'] != True or response_json['threshold'] != 0:
+        pytest.skip('Failed to verify slow query logging values')
+    print(response_json)
+    yield
+    print("with_slow_query_logging restoring slow query logging")
+    response = requests.post(url+'/storage_service/slow_query?enable='+str(slow_query_json['enable']))
+    if response.status_code != 200:
+        pytest.fail('Failed to restore slow query logging')
+    response = requests.post(url+'/storage_service/slow_query?threshold='+str(slow_query_json['threshold']))
+    if response.status_code != 200:
+        pytest.fail('Failed to restore slow query logging threshold')
+
 # Unfortunately, we currently have no way of directly finding the tracing
 # session of a specific Alternator request. We could have returned the
 # tracing session ID as a field of the response - but currently we don't.
@@ -90,17 +131,17 @@ def find_tracing_session(dynamodb, str):
     # when looking for the other requests.
     global last_scan
     trace_sessions_table = dynamodb.Table('.scylla.alternator.system_traces.sessions')
-    delay = 0.2
+    start = time.time()
     if last_scan == None:
         # The trace tables have RF=2, even on a one-node test setup, and
         # thus fail reads with ConsistentRead=True (Quorum)...
         last_scan = full_scan(trace_sessions_table, ConsistentRead=False)
-    while delay < 10:
+    while time.time() - start < 30:
         for entry in last_scan:
             if str in entry['parameters']:
+                print(f'find_tracing_session time {time.time()-start}')
                 return entry['session_id']
-        time.sleep(delay)
-        delay = delay * 2
+        time.sleep(0.3)
         last_scan = full_scan(trace_sessions_table, ConsistentRead=False)
     pytest.fail("Couldn't find tracing session")
 
@@ -131,7 +172,7 @@ def get_tracing_events(dynamodb, session_id):
 # even immediately).
 def expect_tracing_events(dynamodb, str, expected_events):
     delay = 0.1
-    while delay < 10:
+    while delay < 60:
         events = get_tracing_events(dynamodb, find_tracing_session(dynamodb, str))
         for event in expected_events:
             if not event in events:
@@ -160,8 +201,8 @@ def test_table_s_isolation_always(dynamodb):
     yield table
     table.delete()
 
-# Because tracing is asynchronous and sometimes appears as much as one
-# second after the request, it is inefficient to have separate tests
+# Because tracing is asynchronous and usually appears as much as two
+# seconds after the request, it is inefficient to have separate tests
 # for separate request types - each of these tests will have a latency
 # of as much as one second. Instead, we write just one test for all the
 # different request types. This test enables tracing, runs a bunch of
@@ -212,3 +253,24 @@ def test_tracing_all(with_tracing, test_table_s_isolation_always, dynamodb):
 # We could use traces to show that the right things actually happen during a
 # request. In issue #6747 we suspected that maybe GetItem doesn't read just
 # the requested item, and a tracing test can prove or disprove that hunch.
+
+def test_slow_query_log(with_slow_query_logging, test_table_s, dynamodb):
+    table = test_table_s
+    p = random_string(20)
+    print(f"Traced key: {p}")
+    table.put_item(Item={'p': p})
+    table.delete_item(Key={'p': p})
+    # Verify that the operations got logged. Each operation taking more than 0 microseconds is logged,
+    # which effectively logs all requests as slow.
+    slow_query_table = dynamodb.Table('.scylla.alternator.system_traces.node_slow_log')
+    delay = 0.2
+    while delay < 30:
+        results = full_scan(slow_query_table, ConsistentRead=False)
+        put_item_found = any("PutItem" in result['parameters'] and p in result['parameters'] for result in results)
+        delete_item_found = any("DeleteItem" in result['parameters'] and p in result['parameters'] for result in results)
+        if put_item_found and delete_item_found:
+            return
+        else:
+            time.sleep(delay)
+            delay += 1
+    pytest.fail("Slow query entries not found")

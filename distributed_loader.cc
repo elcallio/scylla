@@ -30,9 +30,7 @@
 
 extern logging::logger dblog;
 
-static future<> execute_futures(std::vector<future<>>& futures);
-
-static const std::unordered_set<sstring> system_keyspaces = {
+static const std::unordered_set<std::string_view> system_keyspaces = {
                 db::system_keyspace::NAME, db::schema_tables::NAME
 };
 
@@ -45,19 +43,19 @@ void distributed_loader::mark_keyspace_as_load_prio(const sstring& ks) {
     load_prio_keyspaces.insert(ks);
 }
 
-bool is_system_keyspace(const sstring& name) {
+bool is_system_keyspace(std::string_view name) {
     return system_keyspaces.contains(name);
 }
 
-static const std::unordered_set<sstring> internal_keyspaces = {
+static const std::unordered_set<std::string_view> internal_keyspaces = {
         db::system_distributed_keyspace::NAME,
         db::system_keyspace::NAME,
         db::schema_tables::NAME,
-        sstring(auth::meta::AUTH_KS),
+        auth::meta::AUTH_KS,
         tracing::trace_keyspace_helper::KEYSPACE_NAME
 };
 
-bool is_internal_keyspace(const sstring& name) {
+bool is_internal_keyspace(std::string_view name) {
     return internal_keyspaces.contains(name);
 }
 
@@ -141,14 +139,14 @@ future<> distributed_loader::verify_owner_and_mode(fs::path path) {
 };
 
 future<>
-distributed_loader::process_sstable_dir(sharded<sstables::sstable_directory>& dir) {
+distributed_loader::process_sstable_dir(sharded<sstables::sstable_directory>& dir, bool sort_sstables_according_to_owner) {
     return dir.invoke_on(0, [] (const sstables::sstable_directory& d) {
         return distributed_loader::verify_owner_and_mode(d.sstable_dir());
-    }).then([&dir] {
-      return dir.invoke_on_all([&dir] (sstables::sstable_directory& d) {
+    }).then([&dir, sort_sstables_according_to_owner] {
+      return dir.invoke_on_all([&dir, sort_sstables_according_to_owner] (sstables::sstable_directory& d) {
         // Supposed to be called with the node either down or on behalf of maintenance tasks
         // like nodetool refresh
-        return d.process_sstable_dir(service::get_local_streaming_priority()).then([&dir, &d] {
+        return d.process_sstable_dir(service::get_local_streaming_priority(), sort_sstables_according_to_owner).then([&dir, &d] {
             return d.move_foreign_sstables(dir);
         });
       });
@@ -439,26 +437,37 @@ distributed_loader::process_upload_dir(distributed<database>& db, distributed<db
     });
 }
 
-static future<> execute_futures(std::vector<future<>>& futures) {
-    return seastar::when_all(futures.begin(), futures.end()).then([] (std::vector<future<>> ret) {
-        std::exception_ptr eptr;
+future<std::tuple<utils::UUID, std::vector<std::vector<sstables::shared_sstable>>>>
+distributed_loader::get_sstables_from_upload_dir(distributed<database>& db, sstring ks, sstring cf) {
+    return seastar::async([&db, ks = std::move(ks), cf = std::move(cf)] {
+        global_column_family_ptr global_table(db, ks, cf);
+        sharded<sstables::sstable_directory> directory;
+        auto table_id = global_table->schema()->id();
+        auto upload = fs::path(global_table->dir()) / "upload";
 
-        for (auto& f : ret) {
-            try {
-                if (eptr) {
-                    f.ignore_ready_future();
-                } else {
-                    f.get();
-                }
-            } catch(...) {
-                eptr = std::current_exception();
-            }
-        }
+        directory.start(upload, db.local().get_config().initial_sstable_loading_concurrency(), std::ref(db.local().get_sharded_sst_dir_semaphore()),
+            sstables::sstable_directory::need_mutate_level::yes,
+            sstables::sstable_directory::lack_of_toc_fatal::no,
+            sstables::sstable_directory::enable_dangerous_direct_import_of_cassandra_counters(db.local().get_config().enable_dangerous_direct_import_of_cassandra_counters()),
+            sstables::sstable_directory::allow_loading_materialized_view::no,
+            [&global_table] (fs::path dir, int64_t gen, sstables::sstable_version_types v, sstables::sstable_format_types f) {
+                return global_table->make_sstable(dir.native(), gen, v, f, &error_handler_gen_for_upload_dir);
 
-        if (eptr) {
-            return make_exception_future<>(eptr);
-        }
-        return make_ready_future<>();
+        }).get();
+
+        auto stop = defer([&directory] {
+            directory.stop().get();
+        });
+
+        std::vector<std::vector<sstables::shared_sstable>> sstables_on_shards(smp::count);
+        lock_table(directory, db, ks, cf).get();
+        bool sort_sstables_according_to_owner = false;
+        process_sstable_dir(directory, sort_sstables_according_to_owner).get();
+        directory.invoke_on_all([&sstables_on_shards] (sstables::sstable_directory& d) mutable {
+            sstables_on_shards[this_shard_id()] = d.get_unsorted_sstables();
+        }).get();
+
+        return std::make_tuple(table_id, sstables_on_shards);
     });
 }
 
@@ -475,7 +484,7 @@ future<> distributed_loader::cleanup_column_family_temp_sst_dirs(sstring sstdir)
             }
             return make_ready_future<>();
         }).then([&futures] {
-            return execute_futures(futures);
+            return when_all_succeed(futures.begin(), futures.end()).discard_result();
         });
     });
 }
@@ -502,7 +511,7 @@ future<> distributed_loader::handle_sstables_pending_delete(sstring pending_dele
             }
             return make_ready_future<>();
         }).then([&futures] {
-            return execute_futures(futures);
+            return when_all_succeed(futures.begin(), futures.end()).discard_result();
         });
     });
 }
@@ -628,16 +637,13 @@ future<> distributed_loader::init_system_keyspace(distributed<database>& db) {
         }).get();
 
         db.invoke_on_all([] (database& db) {
-            auto& cfg = db.get_config();
-            bool durable = cfg.data_file_directories().size() > 0;
-            db::system_keyspace::make(db, durable, cfg.volatile_system_keyspace_for_testing());
+            return db::system_keyspace::make(db);
         }).get();
 
         const auto& cfg = db.local().get_config();
         for (auto& data_dir : cfg.data_file_directories()) {
             for (auto ksname : system_keyspaces) {
-                io_check([name = data_dir + "/" + ksname] { return touch_directory(name); }).get();
-                distributed_loader::populate_keyspace(db, data_dir, ksname).get();
+                distributed_loader::populate_keyspace(db, data_dir, sstring(ksname)).get();
             }
         }
 
@@ -661,7 +667,7 @@ future<> distributed_loader::init_system_keyspace(distributed<database>& db) {
 }
 
 future<> distributed_loader::ensure_system_table_directories(distributed<database>& db) {
-    return parallel_for_each(system_keyspaces, [&db](sstring ksname) {
+    return parallel_for_each(system_keyspaces, [&db](std::string_view ksname) {
         auto& ks = db.local().find_keyspace(ksname);
         return parallel_for_each(ks.metadata()->cf_meta_data(), [&ks] (auto& pair) {
             auto cfm = pair.second;
@@ -728,7 +734,7 @@ future<> distributed_loader::init_non_system_keyspaces(distributed<database>& db
             }));
         }
 
-        execute_futures(futures).get();
+        when_all_succeed(futures.begin(), futures.end()).discard_result().get();
 
         db.invoke_on_all([] (database& db) {
             return parallel_for_each(db.get_non_system_column_families(), [] (lw_shared_ptr<table> table) {

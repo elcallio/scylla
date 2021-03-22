@@ -438,9 +438,11 @@ public:
         bool defragment_on_idle;
         bool abort_on_lsa_bad_alloc;
         size_t lsa_reclamation_step;
+        scheduling_group background_reclaim_sched_group;
     };
 
     void configure(const config& cfg);
+    future<> stop();
 
 private:
     std::unique_ptr<impl> _impl;

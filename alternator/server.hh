@@ -17,9 +17,12 @@
 #include <optional>
 #include "alternator/auth.hh"
 #include "utils/small_vector.hh"
+#include "utils/updateable_value.hh"
 #include <seastar/core/units.hh>
 
 namespace alternator {
+
+using chunked_content = rjson::chunked_content;
 
 class server {
     static constexpr size_t content_length_limit = 16*MB;
@@ -39,10 +42,11 @@ class server {
     alternator_callbacks_map _callbacks;
 
     semaphore* _memory_limiter;
+    utils::updateable_value<uint32_t> _max_concurrent_requests;
 
     class json_parser {
         static constexpr size_t yieldable_parsing_threshold = 16*KB;
-        std::string_view _raw_document;
+        chunked_content _raw_document;
         rjson::value _parsed_document;
         std::exception_ptr _current_exception;
         semaphore _parsing_sem{1};
@@ -52,7 +56,10 @@ class server {
         future<> _run_parse_json_thread;
     public:
         json_parser();
-        future<rjson::value> parse(std::string_view content);
+        // Moving a chunked_content into parse() allows parse() to free each
+        // chunk as soon as it is parsed, so when chunks are relatively small,
+        // we don't need to store the sum of unparsed and parsed sizes.
+        future<rjson::value> parse(chunked_content&& content);
         future<> stop();
     };
     json_parser _json_parser;
@@ -61,12 +68,12 @@ public:
     server(executor& executor, cql3::query_processor& qp);
 
     future<> init(net::inet_address addr, std::optional<uint16_t> port, std::optional<uint16_t> https_port, std::optional<tls::credentials_builder> creds,
-            bool enforce_authorization, semaphore* memory_limiter);
+            bool enforce_authorization, semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests);
     future<> stop();
 private:
     void set_routes(seastar::httpd::routes& r);
-    future<> verify_signature(const seastar::httpd::request& r);
-    future<executor::request_return_type> handle_api_request(std::unique_ptr<request>&& req);
+    future<> verify_signature(const seastar::httpd::request&, const chunked_content&);
+    future<executor::request_return_type> handle_api_request(std::unique_ptr<request> req);
 };
 
 }

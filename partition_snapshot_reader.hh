@@ -45,7 +45,7 @@ class partition_snapshot_flat_reader : public flat_mutation_reader::impl, public
     class lsa_partition_reader {
         const schema& _schema;
         reader_permit _permit;
-        rows_entry::compare _cmp;
+        rows_entry::tri_compare _cmp;
         position_in_partition::equal_compare _eq;
         heap_compare _heap_cmp;
 
@@ -62,9 +62,7 @@ class partition_snapshot_flat_reader : public flat_mutation_reader::impl, public
         template<typename Function>
         decltype(auto) in_alloc_section(Function&& fn) {
             return _read_section.with_reclaiming_disabled(_region, [&] {
-                return with_linearized_managed_bytes([&] {
-                    return fn();
-                });
+                return fn();
             });
         }
         void refresh_state(const query::clustering_range& ck_range,
@@ -80,7 +78,7 @@ class partition_snapshot_flat_reader : public flat_mutation_reader::impl, public
             }
 
             for (auto&& v : _snapshot->versions()) {
-                auto cr_end = v.partition().upper_bound(_schema, ck_range);
+                mutation_partition::rows_type::const_iterator cr_end = v.partition().upper_bound(_schema, ck_range);
                 auto cr = [&] () -> mutation_partition::rows_type::const_iterator {
                     if (last_row) {
                         return v.partition().clustered_rows().upper_bound(*last_row, _cmp);
@@ -256,6 +254,9 @@ private:
                 _current_ck_range = std::next(_current_ck_range);
                 on_new_range();
             }
+            if (need_preempt()) {
+                break;
+            }
         }
     }
 public:
@@ -279,6 +280,8 @@ public:
     }
 
     virtual future<> fill_buffer(db::timeout_clock::time_point timeout) override {
+      // FIXME: indentation
+      return do_until([this] { return is_end_of_stream() || is_buffer_full(); }, [this, timeout] {
         _reader.with_reserve([&] {
             if (!_static_row_done) {
                 push_static_row();
@@ -288,12 +291,14 @@ public:
             do_fill_buffer(timeout);
         });
         return make_ready_future<>();
+      });
     }
-    virtual void next_partition() override {
+    virtual future<> next_partition() override {
         clear_buffer_to_next_partition();
         if (is_buffer_empty()) {
             _end_of_stream = true;
         }
+        return make_ready_future<>();
     }
     virtual future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override {
         throw std::runtime_error("This reader can't be fast forwarded to another partition.");

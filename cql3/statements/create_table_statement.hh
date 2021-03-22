@@ -50,6 +50,8 @@
 
 namespace cql3 {
 
+class query_processor;
+
 namespace statements {
 
 /** A <code>CREATE TABLE</code> parsed from a CQL query statement. */
@@ -81,7 +83,7 @@ class create_table_statement : public schema_altering_statement {
     const bool _if_not_exists;
     std::optional<utils::UUID> _id;
 public:
-    create_table_statement(::shared_ptr<cf_name> name,
+    create_table_statement(cf_name name,
                            ::shared_ptr<cf_prop_defs> properties,
                            bool if_not_exists,
                            column_set_type static_columns,
@@ -91,7 +93,7 @@ public:
 
     virtual void validate(service::storage_proxy&, const service::client_state& state) const override;
 
-    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy) const override;
+    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(query_processor& qp) const override;
 
     virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 
@@ -126,7 +128,7 @@ private:
     bool _if_not_exists;
     cf_properties _properties;
 public:
-    raw_statement(::shared_ptr<cf_name> name, bool if_not_exists);
+    raw_statement(cf_name name, bool if_not_exists);
 
     virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 

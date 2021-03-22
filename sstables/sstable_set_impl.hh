@@ -25,6 +25,7 @@
 
 #include "compatible_ring_position.hh"
 #include "sstable_set.hh"
+#include "mutation_reader.hh"
 
 namespace sstables {
 
@@ -39,6 +40,9 @@ public:
     virtual ~sstable_set_impl() {}
     virtual std::unique_ptr<sstable_set_impl> clone() const = 0;
     virtual std::vector<shared_sstable> select(const dht::partition_range& range) const = 0;
+    virtual std::vector<sstable_run> select_sstable_runs(const std::vector<shared_sstable>& sstables) const;
+    virtual lw_shared_ptr<sstable_list> all() const = 0;
+    virtual void for_each_sstable(std::function<void(const shared_sstable&)> func) const = 0;
     virtual void insert(shared_sstable sst) = 0;
     virtual void erase(shared_sstable sst) = 0;
     virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const = 0;
@@ -48,25 +52,12 @@ public:
         schema_ptr,
         reader_permit,
         utils::estimated_histogram&,
-        const dht::ring_position&,
+        const dht::partition_range&,
         const query::partition_slice&,
         const io_priority_class&,
         tracing::trace_state_ptr,
         streamed_mutation::forwarding,
         mutation_reader::forwarding) const;
-};
-
-// default sstable_set, not specialized for anything
-class bag_sstable_set : public sstable_set_impl {
-    // erasing is slow, but select() is fast
-    std::vector<shared_sstable> _sstables;
-public:
-    virtual std::unique_ptr<sstable_set_impl> clone() const override;
-    virtual std::vector<shared_sstable> select(const dht::partition_range& range = query::full_partition_range) const override;
-    virtual void insert(shared_sstable sst) override;
-    virtual void erase(shared_sstable sst) override;
-    virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const override;
-    class incremental_selector;
 };
 
 // specialized when sstables are partitioned in the token range space
@@ -80,6 +71,8 @@ private:
     schema_ptr _schema;
     std::vector<shared_sstable> _unleveled_sstables;
     interval_map_type _leveled_sstables;
+    lw_shared_ptr<sstable_list> _all;
+    std::unordered_map<utils::UUID, sstable_run> _all_runs;
     // Change counter on interval map for leveled sstables which is used by
     // incremental selector to determine whether or not to invalidate iterators.
     uint64_t _leveled_sstables_change_cnt = 0;
@@ -97,10 +90,23 @@ public:
     static dht::ring_position to_ring_position(const compatible_ring_position_or_view& crp);
     static dht::partition_range to_partition_range(const interval_type& i);
     static dht::partition_range to_partition_range(const dht::ring_position_view& pos, const interval_type& i);
-    explicit partitioned_sstable_set(schema_ptr schema, bool use_level_metadata = true);
+
+    partitioned_sstable_set(const partitioned_sstable_set&) = delete;
+    explicit partitioned_sstable_set(schema_ptr schema, lw_shared_ptr<sstable_list> all, bool use_level_metadata = true);
+    // For cloning the partitioned_sstable_set (makes a deep copy, including *_all)
+    explicit partitioned_sstable_set(
+        schema_ptr schema,
+        const std::vector<shared_sstable>& unleveled_sstables,
+        const interval_map_type& leveled_sstables,
+        const lw_shared_ptr<sstable_list>& all,
+        const std::unordered_map<utils::UUID, sstable_run>& all_runs,
+        bool use_level_metadata);
 
     virtual std::unique_ptr<sstable_set_impl> clone() const override;
     virtual std::vector<shared_sstable> select(const dht::partition_range& range) const override;
+    virtual std::vector<sstable_run> select_sstable_runs(const std::vector<shared_sstable>& sstables) const override;
+    virtual lw_shared_ptr<sstable_list> all() const override;
+    virtual void for_each_sstable(std::function<void(const shared_sstable&)> func) const override;
     virtual void insert(shared_sstable sst) override;
     virtual void erase(shared_sstable sst) override;
     virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const override;
@@ -122,6 +128,8 @@ public:
 
     virtual std::unique_ptr<sstable_set_impl> clone() const override;
     virtual std::vector<shared_sstable> select(const dht::partition_range& range = query::full_partition_range) const override;
+    virtual lw_shared_ptr<sstable_list> all() const override;
+    virtual void for_each_sstable(std::function<void(const shared_sstable&)> func) const override;
     virtual void insert(shared_sstable sst) override;
     virtual void erase(shared_sstable sst) override;
     virtual std::unique_ptr<incremental_selector_impl> make_incremental_selector() const override;
@@ -135,7 +143,7 @@ public:
         schema_ptr,
         reader_permit,
         utils::estimated_histogram&,
-        const dht::ring_position&,
+        const dht::partition_range&,
         const query::partition_slice&,
         const io_priority_class&,
         tracing::trace_state_ptr,

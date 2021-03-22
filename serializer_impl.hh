@@ -15,6 +15,9 @@
 #include <boost/range/algorithm/for_each.hpp>
 #include "utils/small_vector.hh"
 #include <absl/container/btree_set.h>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/on_internal_error.hh>
+#include "log.hh"
 
 namespace ser {
 
@@ -488,9 +491,11 @@ public:
 
     [[gnu::always_inline]]
     operator managed_bytes() && {
-        managed_bytes v(managed_bytes::initialized_later(), _stream.size());
-        _stream.read(reinterpret_cast<char*>(v.begin()), _stream.size());
-        return v;
+        managed_bytes mb(managed_bytes::initialized_later(), _stream.size());
+        for (bytes_mutable_view frag : fragment_range(managed_bytes_mutable_view(mb))) {
+            _stream.read(reinterpret_cast<char*>(frag.data()), frag.size());
+        }
+        return mb;
     }
 
     [[gnu::always_inline]]
@@ -518,8 +523,11 @@ struct serializer<bytes> {
         write(out, static_cast<bytes_view>(v));
     }
     template<typename Output>
-    static void write(Output& out, const managed_bytes& v) {
-        write(out, static_cast<bytes_view>(v));
+    static void write(Output& out, const managed_bytes& mb) {
+        safe_serialize_as_uint32(out, uint32_t(mb.size()));
+        for (bytes_view frag : fragment_range(managed_bytes_view(mb))) {
+            out.write(reinterpret_cast<const char*>(frag.data()), frag.size());
+        }
     }
     template<typename Output>
     static void write(Output& out, const bytes_ostream& v) {
@@ -555,6 +563,10 @@ template<typename Output>
 void serialize(Output& out, const bytes_ostream& v) {
     serializer<bytes>::write(out, v);
 }
+template<typename Input>
+bytes_ostream deserialize(Input& in, boost::type<bytes_ostream>) {
+    return serializer<bytes>::read(in);
+}
 template<typename Output, typename FragmentedBuffer>
 requires FragmentRange<FragmentedBuffer>
 void serialize_fragmented(Output& out, FragmentedBuffer&& v) {
@@ -585,6 +597,28 @@ struct serializer<std::optional<T>> {
         if (present) {
             serializer<T>::skip(in);
         }
+    }
+};
+
+extern logging::logger serlog;
+
+// Warning: assumes that pointer is never null
+template<typename T>
+struct serializer<seastar::lw_shared_ptr<T>> {
+    template<typename Input>
+    static seastar::lw_shared_ptr<T> read(Input& in) {
+        return seastar::make_lw_shared<T>(deserialize(in, boost::type<T>()));
+    }
+    template<typename Output>
+    static void write(Output& out, const seastar::lw_shared_ptr<T>& v) {
+        if (!v) {
+            on_internal_error(serlog, "Unexpected nullptr while serializing a pointer");
+        }
+        serialize(out, *v);
+    }
+    template<typename Input>
+    static void skip(Input& in) {
+        serializer<T>::skip(in);
     }
 };
 

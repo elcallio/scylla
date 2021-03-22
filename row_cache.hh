@@ -154,6 +154,7 @@ public:
         uint64_t partition_hits;
         uint64_t partition_misses;
         uint64_t row_hits;
+        uint64_t dummy_row_hits;
         uint64_t row_misses;
         uint64_t partition_insertions;
         uint64_t row_insertions;
@@ -210,6 +211,7 @@ public:
     void on_partition_eviction() noexcept;
     void on_row_eviction() noexcept;
     void on_row_hit() noexcept;
+    void on_dummy_row_hit() noexcept;
     void on_row_miss() noexcept;
     void on_miss_already_populated() noexcept;
     void on_mispopulate() noexcept;
@@ -573,28 +575,22 @@ public:
     template<typename Func>
     decltype(auto) run_in_read_section(const Func &func) {
         return _cache._read_section(_cache._tracker.region(), [&func]() {
-            return with_linearized_managed_bytes([&func]() {
-                return func();
-            });
+            return func();
         });
     }
 
     template<typename Func>
     decltype(auto) run_in_update_section(const Func &func) {
         return _cache._update_section(_cache._tracker.region(), [&func]() {
-            return with_linearized_managed_bytes([&func]() {
-                return func();
-            });
+            return func();
         });
     }
 
     template<typename Func>
     void run_in_update_section_with_allocator(Func &&func) {
         return _cache._update_section(_cache._tracker.region(), [this, &func]() {
-            return with_linearized_managed_bytes([this, &func]() {
-                return with_allocator(_cache._tracker.region().allocator(), [this, &func]() mutable {
-                    return func();
-                });
+            return with_allocator(_cache._tracker.region().allocator(), [this, &func]() mutable {
+                return func();
             });
         });
     }

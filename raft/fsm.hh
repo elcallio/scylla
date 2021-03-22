@@ -22,15 +22,14 @@
 
 #include <seastar/core/condition-variable.hh>
 #include "raft.hh"
-#include "progress.hh"
+#include "tracker.hh"
 #include "log.hh"
 
 namespace raft {
 
 // State of the FSM that needs logging & sending.
 struct fsm_output {
-    term_t term;
-    server_id vote;
+    std::optional<std::pair<term_t, server_id>> term_and_vote;
     std::vector<log_entry_ptr> log_entries;
     std::vector<std::pair<server_id, rpc_message>> messages;
     // Entries to apply.
@@ -41,10 +40,15 @@ struct fsm_output {
 struct fsm_config {
     // max size of appended entries in bytes
     size_t append_request_threshold;
-    // max number of entries of in-memory part of the log after
-    // which requests are stopped to be addmitted unill the log
-    // is shrunk back by snapshoting
-    size_t max_log_length;
+    // Max number of entries of in-memory part of the log after
+    // which requests are stopped to be admitted until the log
+    // is shrunk back by a snapshot. Should be greater than
+    // whatever the default number of trailing log entries
+    // is configured by the snapshot, otherwise the state
+    // machine will deadlock.
+    size_t max_log_size;
+    // If set to true will enable prevoting stage during election
+    bool enable_prevoting;
 };
 
 // 3.4 Leader election
@@ -64,9 +68,20 @@ static constexpr logical_clock::duration ELECTION_TIMEOUT = logical_clock::durat
 // (if a client contacts a follower, the follower redirects it to
 // the leader). The third state, candidate, is used to elect a new
 // leader.
-class follower {};
-class candidate {};
-class leader {};
+struct follower : std::monostate {};
+struct candidate {
+     // Votes received during an election round.
+    votes votes;
+    // True if the candidate in prevote state
+    bool is_prevote;
+    candidate(configuration configuration, bool prevote) :
+               votes(std::move(configuration)), is_prevote(prevote) {}
+};
+struct leader {
+    // A state for each follower
+    tracker tracker;
+    leader(server_id id) : tracker(id) {}
+};
 
 // Raft protocol finite state machine
 //
@@ -108,7 +123,7 @@ class fsm {
     server_id _current_leader;
     // What state the server is in. The default is follower.
     std::variant<follower, candidate, leader> _state;
-    // _current_term, _voted_for && _log are persisted in storage
+    // _current_term, _voted_for && _log are persisted in persistence
     // The latest term the server has seen.
     term_t _current_term;
     // Candidate id that received a vote in the current term (or
@@ -155,12 +170,8 @@ class fsm {
     // reset on each term change. For testing, it's necessary to have the value
     // at election_timeout without becoming a candidate.
     logical_clock::duration _randomized_election_timeout = ELECTION_TIMEOUT + logical_clock::duration{1};
-    // Votes received during an election round. Available only in
-    // candidate state.
-    std::optional<votes> _votes;
 
-    // A state for each follower, maintained only on the leader.
-    std::optional<tracker> _tracker;
+private:
     // Holds all replies to AppendEntries RPC which are not
     // yet sent out. If AppendEntries request is accepted, we must
     // withhold a reply until the respective entry is persisted in
@@ -174,10 +185,6 @@ class fsm {
     // TLA+ line 328
     std::vector<std::pair<server_id, rpc_message>> _messages;
 
-    // Currently used configuration, may be different from
-    // the committed during a configuration change.
-    configuration _current_config;
-
     // Signaled when there is a IO event to process.
     seastar::condition_variable _sm_events;
 
@@ -185,7 +192,7 @@ class fsm {
         seastar::semaphore sem;
         server_id& leader;
         log_limiter_semaphore_guard(fsm* fsm) :
-             sem(fsm->_config.max_log_length), leader(fsm->_current_leader) {}
+             sem(fsm->_config.max_log_size), leader(fsm->_current_leader) {}
         ~log_limiter_semaphore_guard() {
             sem.broken(not_a_leader(leader));
         }
@@ -195,8 +202,9 @@ class fsm {
 
     // Called when one of the replicas advances its match index
     // so it may be the case that some entries are committed now.
-    // Signals _sm_events.
-    void check_committed();
+    // Signals _sm_events. May resign leadership if we committed
+    // a configuration change.
+    void maybe_commit();
     // Check if the randomized election timeout has expired.
     bool is_past_election_timeout() const {
         return _clock.now() - _last_election_time >= _randomized_election_timeout;
@@ -221,7 +229,7 @@ class fsm {
 
     void become_leader();
 
-    void become_candidate();
+    void become_candidate(bool is_prevote);
 
     void become_follower(server_id leader);
 
@@ -232,7 +240,7 @@ class fsm {
     // and allow_empty is true, send a heartbeat.
     void replicate_to(follower_progress& progress, bool allow_empty);
     void replicate();
-    void append_entries(server_id from, append_request_recv&& append_request);
+    void append_entries(server_id from, append_request&& append_request);
     void append_entries_reply(server_id from, append_reply&& reply);
 
     void request_vote(server_id from, vote_request&& vote_request);
@@ -248,18 +256,25 @@ class fsm {
     // Tick implementation on a leader
     void tick_leader();
 
-    // Set cluster configuration
-    void set_configuration(const configuration& config) {
-        _current_config = config;
-        // We unconditionally access _current_config
-        // to identify which entries are committed.
-        assert(_current_config.servers.size() > 0);
-        if (is_leader()) {
-            _tracker->set_configuration(_current_config.servers, _log.next_idx());
-        } else if (is_candidate()) {
-            _votes->set_configuration(_current_config.servers);
-        }
+    void reset_election_timeout();
+
+    candidate& candidate_state() {
+        return std::get<candidate>(_state);
     }
+
+    const candidate& candidate_state() const {
+        return std::get<candidate>(_state);
+    }
+
+protected: // For testing
+    leader& leader_state() {
+        return std::get<leader>(_state);
+    }
+
+    const leader& leader_state() const {
+        return std::get<leader>(_state);
+    }
+
 public:
     explicit fsm(server_id id, term_t current_term, server_id voted_for, log log,
             failure_detector& failure_detector, fsm_config conf);
@@ -273,10 +288,22 @@ public:
     bool is_candidate() const {
         return std::holds_alternative<candidate>(_state);
     }
+    bool is_prevote_candidate() const {
+        return is_candidate() && std::get<candidate>(_state).is_prevote;
+    }
+    index_t log_last_idx() const {
+        return _log.last_idx();
+    }
+    term_t log_last_term() const {
+        return _log.last_term();
+    }
 
-    // call this function to wait for number of log entries to go below
-    // max_log_length
-    future<> wait();
+    // Call this function to wait for the number of log entries to
+    // go below  max_log_size.
+    future<> wait_max_log_size();
+
+    // Return current configuration. Throws if not a leader.
+    const configuration& get_configuration() const;
 
     // Add an entry to in-memory log. The entry has to be
     // committed to the persistent Raft log afterwards.
@@ -286,7 +313,7 @@ public:
     // needs to be handled.
     // This includes a list of the entries that need
     // to be logged. The logged entries are eventually
-    // discarded from the state machine after snapshotting.
+    // discarded from the state machine after applying a snapshot.
     future<fsm_output> poll_output();
 
     // Get state machine output, if there is any. Doesn't
@@ -325,10 +352,14 @@ public:
 
     void snapshot_status(server_id id, std::optional<index_t> idx);
 
-    // This call will update the log to point to the new snaphot
+    // This call will update the log to point to the new snapshot
     // and will truncate the log prefix up to (snp.idx - trailing)
-    // entry. Retruns false if the snapshot is older than existing one.
+    // entry. Returns false if the snapshot is older than existing one.
     bool apply_snapshot(snapshot snp, size_t traling);
+
+    size_t in_memory_log_size() const {
+        return _log.in_memory_size();
+    };
 
     friend std::ostream& operator<<(std::ostream& os, const fsm& f);
 };
@@ -350,11 +381,13 @@ void fsm::step(server_id from, Message&& msg) {
     // follower state. If a server receives a request with
     // a stale term number, it rejects the request.
     if (msg.current_term > _current_term) {
+        server_id leader{};
+
         logger.trace("{} [term: {}] received a message with higher term from {} [term: {}]",
             _my_id, _current_term, from, msg.current_term);
 
-        if constexpr (std::is_same_v<Message, append_request_recv>) {
-            become_follower(from);
+        if constexpr (std::is_same_v<Message, append_request>) {
+            leader = from;
         } else {
             if constexpr (std::is_same_v<Message, vote_request>) {
                 if (_current_leader != server_id{} && election_elapsed() < ELECTION_TIMEOUT) {
@@ -363,22 +396,40 @@ void fsm::step(server_id from, Message&& msg) {
                     // within the minimum election timeout of
                     // hearing from a current leader, it does not
                     // update its term or grant its vote.
-                    logger.trace("{} [term: {}] not granting a vote within a minimum election timeout, elapsed {}",
-                        _my_id, _current_term, election_elapsed());
+                    logger.trace("{} [term: {}] not granting a vote within a minimum election timeout, elapsed {} (current leader = {})",
+                        _my_id, _current_term, election_elapsed(), _current_leader);
                     return;
                 }
             }
-            become_follower(server_id{});
         }
-        update_current_term(msg.current_term);
+        bool ignore_term = false;
+        if constexpr (std::is_same_v<Message, vote_request>) {
+            // Do not update term on prevote request
+            ignore_term = msg.is_prevote;
+        } else if constexpr (std::is_same_v<Message, vote_reply>) {
+            // We send pre-vote requests with a term in our future. If the
+            // pre-vote is granted, we will increment our term when we get a
+            // quorum. If it is not, the term comes from the node that
+            // rejected our vote so we should become a follower at the new
+            // term.
+            ignore_term = msg.is_prevote && msg.vote_granted;
+        }
 
+        if (!ignore_term) {
+            become_follower(leader);
+            update_current_term(msg.current_term);
+        }
     } else if (msg.current_term < _current_term) {
-        if constexpr (std::is_same_v<Message, append_request_recv>) {
+        if constexpr (std::is_same_v<Message, append_request>) {
             // Instructs the leader to step down.
             append_reply reply{_current_term, _commit_idx, append_reply::rejected{msg.prev_log_idx, _log.last_idx()}};
             send_to(from, std::move(reply));
         } else if constexpr (std::is_same_v<Message, install_snapshot>) {
             send_to(from, snapshot_reply{ .success = false });
+        } else if constexpr (std::is_same_v<Message, vote_request>) {
+            if (msg.is_prevote) {
+                send_to(from, vote_reply{_current_term, false, true});
+            }
         } else {
             // Ignore other cases
             logger.trace("{} [term: {}] ignored a message with lower term from {} [term: {}]",
@@ -387,7 +438,7 @@ void fsm::step(server_id from, Message&& msg) {
         return;
 
     } else /* _current_term == msg.current_term */ {
-        if constexpr (std::is_same_v<Message, append_request_recv> ||
+        if constexpr (std::is_same_v<Message, append_request> ||
                       std::is_same_v<Message, install_snapshot>) {
             if (is_candidate()) {
                 // 3.4 Leader Election
@@ -412,7 +463,7 @@ void fsm::step(server_id from, Message&& msg) {
     auto visitor = [this, from, msg = std::move(msg)](auto state) mutable {
         using State = decltype(state);
 
-        if constexpr (std::is_same_v<Message, append_request_recv>) {
+        if constexpr (std::is_same_v<Message, append_request>) {
             // Got AppendEntries RPC from self
             append_entries(from, std::move(msg));
         } else if constexpr (std::is_same_v<Message, append_reply>) {

@@ -34,7 +34,6 @@
 #include <seastar/util/lazy.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/core/checked_ptr.hh>
-#include "utils/UUID_gen.hh"
 #include "tracing/tracing.hh"
 #include "gms/inet_address.hh"
 #include "auth/authenticated_user.hh"
@@ -224,25 +223,9 @@ private:
         return log_slow_query() && e > _slow_query_threshold;
     }
 
-    void init_session_records(trace_type type, std::chrono::seconds slow_query_ttl, std::optional<utils::UUID> session_id = std::nullopt, span_id parent_id = span_id::illegal_id) {
-        _records = make_lw_shared<one_session_records>();
-        _records->session_id = session_id ? *session_id : utils::UUID_gen::get_time_UUID();
-
-        if (full_tracing()) {
-            if (!log_slow_query()) {
-                _records->ttl = ttl_by_type(type);
-            } else {
-                _records->ttl = std::max(ttl_by_type(type), slow_query_ttl);
-            }
-        } else {
-            _records->ttl = slow_query_ttl;
-        }
-
-        _records->session_rec.command = type;
-        _records->session_rec.slow_query_record_ttl = slow_query_ttl;
-        _records->my_span_id = span_id::make_span_id();
-        _records->parent_id = parent_id;
-    }
+    void init_session_records(trace_type type, std::chrono::seconds slow_query_ttl,
+        std::optional<utils::UUID> session_id = std::nullopt,
+        span_id parent_id = span_id::illegal_id);
 
     bool should_write_records() const {
         return full_tracing() || _records->do_log_slow_query;
@@ -364,6 +347,16 @@ private:
     void add_query(sstring_view val);
 
     /**
+     * Store a custom session parameter.
+     * 
+     * Thus value will be stored in the params<string, string> map of a tracing session
+     * 
+     * @param key the parameter key
+     * @param val the parameter value
+     */
+    void add_session_param(sstring_view key, sstring_view val);
+
+    /**
      * Store a user provided timestamp.
      *
      * This value will eventually be stored in a params<string, string> map of a tracing session
@@ -481,6 +474,7 @@ private:
     friend void set_consistency_level(const trace_state_ptr& p, db::consistency_level val);
     friend void set_optional_serial_consistency_level(const trace_state_ptr& p, const std::optional<db::consistency_level>&val);
     friend void add_query(const trace_state_ptr& p, sstring_view val);
+    friend void add_session_param(const trace_state_ptr& p, sstring_view key, sstring_view val);
     friend void set_user_timestamp(const trace_state_ptr& p, api::timestamp_type val);
     friend void add_prepared_statement(const trace_state_ptr& p, prepared_checked_weak_ptr& prepared);
     friend void set_username(const trace_state_ptr& p, const std::optional<auth::authenticated_user>& user);
@@ -619,6 +613,12 @@ inline void set_optional_serial_consistency_level(const trace_state_ptr& p, cons
 inline void add_query(const trace_state_ptr& p, sstring_view val) {
     if (p) {
         p->add_query(std::move(val));
+    }
+}
+
+inline void add_session_param(const trace_state_ptr& p, sstring_view key, sstring_view val) {
+    if (p) {
+        p->add_session_param(std::move(key), std::move(val));
     }
 }
 

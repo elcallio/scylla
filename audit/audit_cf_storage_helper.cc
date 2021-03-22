@@ -9,11 +9,27 @@
  */
 
 #include "audit/audit_cf_storage_helper.hh"
+#include "utils/UUID_gen.hh"
 
 namespace audit {
 
 const sstring audit_cf_storage_helper::KEYSPACE_NAME("audit");
 const sstring audit_cf_storage_helper::TABLE_NAME("audit_log");
+
+static ::service::query_state& internal_distributed_query_state() noexcept {
+    using namespace std::chrono_literals;
+
+#ifdef DEBUG
+    // Give the much slower debug tests more headroom for completing auth queries.
+    static const auto t = 30s;
+#else
+    static const auto t = 5s;
+#endif
+    static const timeout_config tc{t, t, t, t, t, t, t};
+    static thread_local ::service::client_state cs(::service::client_state::internal_tag{}, tc);
+    static thread_local ::service::query_state qs(cs, empty_service_permit());
+    return qs;
+}
 
 audit_cf_storage_helper::audit_cf_storage_helper(cql3::query_processor& qp)
     : _qp(qp)
@@ -100,7 +116,7 @@ cql3::query_options audit_cf_storage_helper::make_data(const audit_info* audit_i
         cql3::raw_value::make_value(utf8_type->decompose(username)),
         cql3::raw_value::make_value(boolean_type->decompose(error)),
     };
-    return cql3::query_options(cql3::default_cql_config, db::consistency_level::ONE, infinite_timeout_config, std::nullopt, std::move(values), false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
+    return cql3::query_options(cql3::default_cql_config, db::consistency_level::ONE, std::nullopt, std::move(values), false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
 }
 
 cql3::query_options audit_cf_storage_helper::make_login_data(socket_address node_ip,
@@ -126,7 +142,7 @@ cql3::query_options audit_cf_storage_helper::make_login_data(socket_address node
             cql3::raw_value::make_value(utf8_type->decompose(username)),
             cql3::raw_value::make_value(boolean_type->decompose(error)),
     };
-    return cql3::query_options(cql3::default_cql_config, db::consistency_level::ONE, infinite_timeout_config, std::nullopt, std::move(values), false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
+    return cql3::query_options(cql3::default_cql_config, db::consistency_level::ONE, std::nullopt, std::move(values), false, cql3::query_options::specific_options::DEFAULT, cql_serialization_format::latest());
 }
 
 using registry = class_registrator<storage_helper, audit_cf_storage_helper, cql3::query_processor&>;

@@ -34,6 +34,8 @@
 
 namespace cql3 {
 
+class query_processor;
+
 namespace statements {
 
 class revoke_statement : public permission_altering_statement {
@@ -42,7 +44,7 @@ public:
 
     std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 
-    future<::shared_ptr<cql_transport::messages::result_message>> execute(service::storage_proxy&
+    future<::shared_ptr<cql_transport::messages::result_message>> execute(query_processor&
                     , service::query_state&
                     , const query_options&) const override;
 };

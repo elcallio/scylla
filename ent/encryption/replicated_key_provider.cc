@@ -34,8 +34,12 @@
 #include "utils/UUID_gen.hh"
 #include "utils/hash.hh"
 #include "service/storage_service.hh"
+#include "service/migration_manager.hh"
 #include "sstables/compaction_manager.hh"
 #include "distributed_loader.hh"
+#include "schema_builder.hh"
+#include "db/system_keyspace.hh"
+
 
 namespace encryption {
 
@@ -95,7 +99,8 @@ public:
             return true;
         }
         auto& qp = _ctxt.get_query_processor();
-        return !qp.local_is_initialized() || _ctxt.get_database().local().get_compaction_manager().enabled();
+        // FIXME: wait for system tables to be started.
+        return !qp.local_is_initialized();
     }
 
     void print(std::ostream& os) const override {
@@ -132,6 +137,12 @@ static const timeout_config rkp_db_timeout_config {
     5s, 5s, 5s, 5s, 5s, 5s, 5s,
 };
 
+static service::query_state& rkp_db_query_state() {
+    static thread_local service::client_state cs(service::client_state::internal_tag{}, rkp_db_timeout_config);
+    static thread_local service::query_state qs(cs, empty_service_permit());
+    return qs;
+}
+
 template<typename... Args>
 future<::shared_ptr<cql3::untyped_result_set>> replicated_key_provider::query(sstring q, Args&& ...params) {
     return _ctxt.get_storage_service().local().is_starting().then([this, t = std::make_tuple<sstring, Args...>(std::move(q), std::forward<Args>(params)...)](bool starting) {
@@ -139,7 +150,7 @@ future<::shared_ptr<cql3::untyped_result_set>> replicated_key_provider::query(ss
             return _ctxt.get_query_processor().local().execute_internal(q, { (params)...});
         };
         auto query_normal = [this](const sstring& q, auto&& ...params) {
-            return _ctxt.get_query_processor().local().execute_internal(q, db::consistency_level::ONE, rkp_db_timeout_config, { (params)...}, false);
+            return _ctxt.get_query_processor().local().execute_internal(q, db::consistency_level::ONE, rkp_db_query_state(), { (params)...}, false);
         };
         return starting ? std::apply(query_internal, t) : std::apply(query_normal, t);
     });
@@ -308,6 +319,21 @@ future<> replicated_key_provider::validate() const {
     return f;
 }
 
+schema_ptr encrypted_keys_table() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(KSNAME, TABLENAME);
+        return schema_builder(KSNAME, TABLENAME, std::make_optional(id))
+                .with_column("key_file", utf8_type, column_kind::partition_key)
+                .with_column("cipher", utf8_type, column_kind::partition_key)
+                .with_column("strength", int32_type, column_kind::clustering_key)
+                .with_column("key_id", timeuuid_type, column_kind::clustering_key)
+                .with_column("key", utf8_type)
+                .with_version(::db::system_keyspace::generate_schema_version(id))
+                .build();
+    }();
+    return schema;
+}
+
 future<> replicated_key_provider::maybe_initialize_tables() {
     auto& db = _ctxt.get_database().local();
 
@@ -318,16 +344,28 @@ future<> replicated_key_provider::maybe_initialize_tables() {
     }
 
     auto f = make_ready_future();
-
+    auto& mm = _ctxt.get_migration_manager().local();
+    static auto ignore_existing = [] (seastar::noncopyable_function<future<>()> func) {
+        return futurize_invoke(std::move(func)).handle_exception_type([] (exceptions::already_exists_exception& ignored) { });
+    };
+    log.debug("Creating keyspace and table");
     if (!db.has_keyspace(KSNAME)) {
-        log.debug("Creating keyspace and table");
-        auto s = sprint("CREATE KEYSPACE IF NOT EXISTS %s WITH REPLICATION = { 'class' : 'EverywhereStrategy' } AND DURABLE_WRITES = true", KSNAME);
-        f = query(std::move(s)).then([&](auto&&) {
-            auto s = sprint("CREATE TABLE IF NOT EXISTS %s.%s (key_file TEXT, cipher TEXT, strength INT, key_id TIMEUUID, key TEXT, PRIMARY KEY (key_file, cipher, strength, key_id))", KSNAME, TABLENAME);
-            return query(s).discard_result();
+
+        f = ignore_existing([this, &mm] { // Create the keyspace if not exists
+            auto ksm = keyspace_metadata::new_keyspace(
+                    KSNAME,
+                    "org.apache.cassandra.locator.EverywhereStrategy",
+                    {},
+                    true);
+            return mm.announce_new_keyspace(ksm, api::min_timestamp);
         });
+
     }
-    f = f.then([&] {
+    f = f.then([this, &mm] { // Then create the table
+        return ignore_existing([this, &mm] {
+            return mm.announce_new_column_family(encrypted_keys_table(), api::min_timestamp);
+        });
+    }).then([&] { // Then do some final stuff and mark this object as initialized
         auto& ks = db.find_keyspace(KSNAME);
         auto& rs = ks.get_replication_strategy();
         // should perhaps check name also..

@@ -29,6 +29,7 @@
 #include "sstables/compaction_manager.hh"
 #include "transport/messages/result_message.hh"
 #include "sstables/shared_index_lists.hh"
+#include <fstream>
 
 using namespace std::chrono_literals;
 using namespace seastar;
@@ -41,7 +42,7 @@ static bool errors_found = false;
 cql_test_env* cql_env;
 
 static void print_error(const sstring& msg) {
-    std::cerr << "^^^ ERROR: " << msg << "\n";
+    std::cout << "^^^ ERROR: " << msg << "\n";
     errors_found = true;
 }
 
@@ -722,7 +723,7 @@ uint64_t consume_all_with_next_partition(flat_mutation_reader& rd) {
     uint64_t fragments = 0;
     do {
         fragments += consume_all(rd);
-        rd.next_partition();
+        rd.next_partition().get();
         rd.fill_buffer(db::no_timeout).get();
     } while(!rd.is_end_of_stream() || !rd.is_buffer_empty());
     return fragments;
@@ -1829,6 +1830,7 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "Data directory: " << db_cfg.data_file_directories() << "\n";
+        std::cout << "Output directory: " << output_dir << "\n";
 
         auto init = [] {
             auto conf_seed = app.configuration()["random-seed"];

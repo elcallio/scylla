@@ -26,6 +26,7 @@
 #include "test/lib/test_services.hh"
 #include "test/lib/data_model.hh"
 #include "test/lib/log.hh"
+#include "test/lib/random_utils.hh"
 #include "utils/ranges.hh"
 
 using namespace std::literals::chrono_literals;
@@ -197,9 +198,8 @@ SEASTAR_TEST_CASE(test_builder_view_added_during_ongoing_build) {
 }
 
 std::mt19937 random_generator() {
-    std::random_device rd;
     // In case of errors, replace the seed with a fixed value to get a deterministic run.
-    auto seed = rd();
+    auto seed = tests::random::get_int<uint32_t>();
     std::cout << "Random seed: " << seed << "\n";
     return std::mt19937(seed);
 }
@@ -422,7 +422,7 @@ SEASTAR_TEST_CASE(test_view_update_generator) {
 
         auto write_to_sstable = [&] (mutation m) {
             auto sst = t->make_streaming_staging_sstable();
-            sstables::sstable_writer_config sst_cfg = e.db().local().get_user_sstables_manager().configure_writer();
+            sstables::sstable_writer_config sst_cfg = e.db().local().get_user_sstables_manager().configure_writer("test");
             auto& pc = service::get_local_streaming_priority();
 
             sst->write_components(flat_mutation_reader_from_mutations(tests::make_permit(), {m}), 1ul, s, sst_cfg, {}, pc).get();
@@ -536,7 +536,7 @@ SEASTAR_THREAD_TEST_CASE(test_view_update_generator_deadlock) {
         }
 
         auto sst = t->make_streaming_staging_sstable();
-        sstables::sstable_writer_config sst_cfg = e.local_db().get_user_sstables_manager().configure_writer();
+        sstables::sstable_writer_config sst_cfg = e.local_db().get_user_sstables_manager().configure_writer("test");
         auto& pc = service::get_local_streaming_priority();
 
         sst->write_components(flat_mutation_reader_from_mutations(tests::make_permit(), {m}), 1ul, s, sst_cfg, {}, pc).get();
@@ -612,7 +612,7 @@ SEASTAR_THREAD_TEST_CASE(test_view_update_generator_register_semaphore_unit_leak
             }
 
             auto sst = t->make_streaming_staging_sstable();
-            sstables::sstable_writer_config sst_cfg = e.local_db().get_user_sstables_manager().configure_writer();
+            sstables::sstable_writer_config sst_cfg = e.local_db().get_user_sstables_manager().configure_writer("test");
             auto& pc = service::get_local_streaming_priority();
 
             sst->write_components(flat_mutation_reader_from_mutations(tests::make_permit(), {m}), 1ul, s, sst_cfg, {}, pc).get();

@@ -1253,8 +1253,15 @@ void paxos_response_handler::prune(utils::UUID ballot) {
             tracing::trace(tr_state, "prune: send prune of {} to {}", ballot, peer);
             return _proxy->_messaging.send_paxos_prune(peer, _timeout, _schema->version(), _key.key(), ballot, tracing::make_trace_info(tr_state));
         }
-    }).finally([h = shared_from_this()] {
+    }).then_wrapped([h = shared_from_this()] (future<> f) {
         h->_proxy->get_stats().cas_now_pruning--;
+        try {
+            f.get();
+        } catch (rpc::closed_error&) {
+            // ignore errors due to closed connection
+        } catch (...) {
+            paxos::paxos_state::logger.error("CAS[{}] prune: failed {}", h->_id, std::current_exception());
+        }
     });
 }
 
@@ -2123,16 +2130,23 @@ gms::inet_address storage_proxy::find_leader_for_counter_update(const mutation& 
         throw exceptions::unavailable_exception(cl, block_for(ks, cl), 0);
     }
 
-    auto local_endpoints = boost::copy_range<std::vector<gms::inet_address>>(live_endpoints | boost::adaptors::filtered([&] (auto&& ep) {
+    const auto my_address = utils::fb_utilities::get_broadcast_address();
+    // Early return if coordinator can become the leader (so one extra internode message can be
+    // avoided). With token-aware drivers this is the expected case, so we are doing it ASAP.
+    if (boost::algorithm::any_of_equal(live_endpoints, my_address)) {
+        return my_address;
+    }
+
+    const auto local_endpoints = boost::copy_range<std::vector<gms::inet_address>>(live_endpoints | boost::adaptors::filtered([&] (auto&& ep) {
         return db::is_local(ep);
     }));
+
     if (local_endpoints.empty()) {
         // FIXME: O(n log n) to get maximum
         auto& snitch = locator::i_endpoint_snitch::get_local_snitch_ptr();
-        snitch->sort_by_proximity(utils::fb_utilities::get_broadcast_address(), live_endpoints);
+        snitch->sort_by_proximity(my_address, live_endpoints);
         return live_endpoints[0];
     } else {
-        // FIXME: favour ourselves to avoid additional hop?
         static thread_local std::default_random_engine re{std::random_device{}()};
         std::uniform_int_distribution<> dist(0, local_endpoints.size() - 1);
         return local_endpoints[dist(re)];
@@ -2187,6 +2201,10 @@ future<> storage_proxy::mutate_counters(Range&& mutations, db::consistency_level
             auto fms = boost::copy_range<std::vector<frozen_mutation>>(mutations | boost::adaptors::transformed([] (auto& m) {
                 return std::move(m.fm);
             }));
+
+            // Coordinator is preferred as the leader - if it's not selected we can assume
+            // that the query was non-token-aware and bump relevant metric.
+            get_stats().writes_coordinator_outside_replica_set += fms.size();
 
             auto msg_addr = netw::messaging_service::msg_addr{ endpoint_and_mutations.first, 0 };
             tracing::trace(tr_state, "Enqueuing counter update to {}", msg_addr);
@@ -3760,14 +3778,6 @@ public:
     }
 };
 
-class range_slice_read_executor : public never_speculating_read_executor {
-public:
-    using never_speculating_read_executor::never_speculating_read_executor;
-    virtual future<foreign_ptr<lw_shared_ptr<query::result>>> execute(storage_proxy::clock_type::time_point timeout) override {
-        return never_speculating_read_executor::execute(timeout);
-    }
-};
-
 db::read_repair_decision storage_proxy::new_read_repair_decision(const schema& s) {
     double chance = _read_repair_chance(_urandom);
     if (s.read_repair_chance() > chance) {
@@ -3883,11 +3893,11 @@ storage_proxy::query_result_local(schema_ptr s, lw_shared_ptr<query::read_comman
     } else {
         // FIXME: adjust multishard_mutation_query to accept an smp_service_group and propagate it there
         tracing::trace(trace_state, "Start querying token range {}", pr);
-        return query_nonsingular_mutations_locally(s, cmd, {pr}, trace_state, timeout).then([s, cmd, opts, trace_state = std::move(trace_state)] (rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>&& r_ht) {
+        return query_nonsingular_data_locally(s, cmd, {pr}, opts, trace_state, timeout).then(
+                [trace_state = std::move(trace_state)] (rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>&& r_ht) {
             auto&& [r, ht] = r_ht;
             tracing::trace(trace_state, "Querying is done");
-            return make_ready_future<rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>>(
-                    rpc::tuple(::make_foreign(::make_lw_shared<query::result>(to_data_query_result(*r, s, cmd->slice,  cmd->get_row_limit(), cmd->partition_limit, opts))), ht));
+            return make_ready_future<rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>>(rpc::tuple(std::move(r), ht));
         });
     }
 }
@@ -4003,6 +4013,10 @@ storage_proxy::query_partition_key_range_concurrent(storage_proxy::clock_type::t
     std::unordered_map<abstract_read_executor*, std::vector<dht::token_range>> ranges_per_exec;
     const auto tmptr = get_token_metadata_ptr();
 
+    if (_features.cluster_supports_range_scan_data_variant()) {
+        cmd->slice.options.set<query::partition_slice::option::range_scan_data_variant>();
+    }
+
     const auto preferred_replicas_for_range = [this, &preferred_replicas, tmptr] (const dht::partition_range& r) {
         auto it = preferred_replicas.find(r.transform(std::mem_fn(&dht::ring_position::token)));
         return it == preferred_replicas.end() ? std::vector<gms::inet_address>{} : replica_ids_to_endpoints(*tmptr, it->second);
@@ -4098,7 +4112,7 @@ storage_proxy::query_partition_key_range_concurrent(storage_proxy::clock_type::t
             throw;
         }
 
-        exec.push_back(::make_shared<range_slice_read_executor>(schema, cf.shared_from_this(), p, cmd, std::move(range), cl, std::move(filtered_endpoints), trace_state, permit));
+        exec.push_back(::make_shared<never_speculating_read_executor>(schema, cf.shared_from_this(), p, cmd, std::move(range), cl, std::move(filtered_endpoints), trace_state, permit));
         ranges_per_exec.emplace(exec.back().get(), std::move(merged_ranges));
     }
 
@@ -4920,10 +4934,12 @@ void storage_proxy::init_messaging_service() {
             tracing::trace(trace_state_ptr, "read_data: message received from /{}", src_addr.addr);
         }
         auto da = oda.value_or(query::digest_algorithm::MD5);
+        auto sp = get_local_shared_storage_proxy();
         if (!cmd.max_result_size) {
-            cmd.max_result_size.emplace(cinfo.retrieve_auxiliary<uint64_t>("max_result_size"));
+            auto& cfg = sp->local_db().get_config();
+            cmd.max_result_size.emplace(cfg.max_memory_for_unlimited_query_soft_limit(), cfg.max_memory_for_unlimited_query_hard_limit());
         }
-        return do_with(std::move(pr), get_local_shared_storage_proxy(), std::move(trace_state_ptr), [&cinfo, cmd = make_lw_shared<query::read_command>(std::move(cmd)), src_addr = std::move(src_addr), da, t] (::compat::wrapping_partition_range& pr, shared_ptr<storage_proxy>& p, tracing::trace_state_ptr& trace_state_ptr) mutable {
+        return do_with(std::move(pr), std::move(sp), std::move(trace_state_ptr), [&cinfo, cmd = make_lw_shared<query::read_command>(std::move(cmd)), src_addr = std::move(src_addr), da, t] (::compat::wrapping_partition_range& pr, shared_ptr<storage_proxy>& p, tracing::trace_state_ptr& trace_state_ptr) mutable {
             p->get_stats().replica_data_reads++;
             auto src_ip = src_addr.addr;
             return get_schema_for_read(cmd->schema_version, std::move(src_addr), p->_messaging).then([cmd, da, &pr, &p, &trace_state_ptr, t] (schema_ptr s) {
@@ -5174,6 +5190,22 @@ storage_proxy::query_nonsingular_mutations_locally(schema_ptr s,
             return make_ready_future<rpc::tuple<foreign_ptr<lw_shared_ptr<reconcilable_result>>, cache_temperature>>(std::move(t));
         });
     });
+}
+
+future<rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>>
+storage_proxy::query_nonsingular_data_locally(schema_ptr s, lw_shared_ptr<query::read_command> cmd, const dht::partition_range_vector&& prs,
+        query::result_options opts, tracing::trace_state_ptr trace_state, storage_proxy::clock_type::time_point timeout) {
+    auto ranges = std::move(prs);
+    auto local_cmd = cmd;
+    rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature> ret;
+    if (local_cmd->slice.options.contains(query::partition_slice::option::range_scan_data_variant)) {
+        ret = co_await query_data_on_all_shards(_db, std::move(s), *local_cmd, ranges, opts, std::move(trace_state), timeout);
+    } else {
+        auto res = co_await query_mutations_on_all_shards(_db, s, *local_cmd, ranges, std::move(trace_state), timeout);
+        ret = rpc::tuple(make_foreign(make_lw_shared<query::result>(to_data_query_result(std::move(*std::get<0>(res)), std::move(s), local_cmd->slice,
+                local_cmd->get_row_limit(), local_cmd->partition_limit, opts))), std::get<1>(res));
+    }
+    co_return ret;
 }
 
 future<> storage_proxy::start_hints_manager(shared_ptr<gms::gossiper> gossiper_ptr, shared_ptr<service::storage_service> ss_ptr) {

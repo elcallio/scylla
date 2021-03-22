@@ -13,7 +13,6 @@
 #include <optional>
 #include <boost/functional/hash.hpp>
 #include <iosfwd>
-#include "data/cell.hh"
 #include <sstream>
 #include <iterator>
 
@@ -24,7 +23,6 @@
 #include "db_clock.hh"
 #include "bytes.hh"
 #include "log.hh"
-#include "atomic_cell.hh"
 #include "cql_serialization_format.hh"
 #include "tombstone.hh"
 #include "to_string.hh"
@@ -40,6 +38,8 @@
 #include "hashing.hh"
 #include "utils/fragmented_temporary_buffer.hh"
 #include "utils/exceptions.hh"
+#include "utils/managed_bytes.hh"
+#include "utils/bit_cast.hh"
 
 class tuple_type_impl;
 class big_decimal;
@@ -455,7 +455,6 @@ class user_type_impl;
 class abstract_type : public enable_shared_from_this<abstract_type> {
     sstring _name;
     std::optional<uint32_t> _value_length_if_fixed;
-    data::type_imr_descriptor _imr_state;
 public:
     enum class kind : int8_t {
         ascii,
@@ -493,18 +492,20 @@ private:
 public:
     kind get_kind() const { return _kind; }
 
-    abstract_type(kind k, sstring name, std::optional<uint32_t> value_length_if_fixed, data::type_info ti)
-        : _name(name), _value_length_if_fixed(std::move(value_length_if_fixed)), _imr_state(ti), _kind(k) {}
+    abstract_type(kind k, sstring name, std::optional<uint32_t> value_length_if_fixed)
+        : _name(name), _value_length_if_fixed(std::move(value_length_if_fixed)), _kind(k) {}
     virtual ~abstract_type() {}
-    const data::type_imr_descriptor& imr_state() const { return _imr_state; }
     bool less(bytes_view v1, bytes_view v2) const { return compare(v1, v2) < 0; }
     // returns a callable that can be called with two byte_views, and calls this->less() on them.
     serialized_compare as_less_comparator() const ;
     serialized_tri_compare as_tri_comparator() const ;
     static data_type parse_type(const sstring& name);
     size_t hash(bytes_view v) const;
+    size_t hash(managed_bytes_view v) const;
     bool equal(bytes_view v1, bytes_view v2) const;
+    bool equal(managed_bytes_view v1, managed_bytes_view v2) const;
     int32_t compare(bytes_view v1, bytes_view v2) const;
+    int32_t compare(managed_bytes_view v1, managed_bytes_view v2) const;
 
 private:
     // Explicitly instantiated in .cc
@@ -599,6 +600,11 @@ public:
     cql3::cql3_type as_cql3_type() const;
     const sstring& cql3_type_name() const;
     virtual shared_ptr<const abstract_type> freeze() const { return shared_from_this(); }
+
+    const abstract_type& without_reversed() const {
+        return is_reversed() ? *underlying_type() : *this;
+    }
+
     friend class list_type_impl;
 private:
     mutable sstring _cql3_type_name;
@@ -647,6 +653,14 @@ T&& value_cast(data_value&& value) {
         throw std::runtime_error("value is null");
     }
     return std::move(*reinterpret_cast<maybe_empty<T>*>(value._value));
+}
+
+/// Special case: sometimes we cast uuid to timeuuid so we can correctly compare timestamps.  See #7729.
+template <>
+inline timeuuid_native_type&& value_cast<timeuuid_native_type>(data_value&& value) {
+    static thread_local timeuuid_native_type value_holder; // Static so it survives return from this function.
+    value_holder.uuid = value_cast<utils::UUID>(value);
+    return std::move(value_holder);
 }
 
 // CRTP: implements translation between a native_type (C++ type) to abstract_type
@@ -718,7 +732,7 @@ bool less_compare(data_type t, bytes_view e1, bytes_view e2) {
 }
 
 static inline
-int tri_compare(data_type t, bytes_view e1, bytes_view e2) {
+int tri_compare(data_type t, managed_bytes_view e1, managed_bytes_view e2) {
     return t->compare(e1, e2);
 }
 
@@ -733,7 +747,7 @@ tri_compare_opt(data_type t, bytes_view_opt v1, bytes_view_opt v2) {
 }
 
 static inline
-bool equal(data_type t, bytes_view e1, bytes_view e2) {
+bool equal(data_type t, managed_bytes_view e1, managed_bytes_view e2) {
     return t->equal(e1, e2);
 }
 
@@ -807,7 +821,7 @@ class reversed_type_impl : public abstract_type {
     data_type _underlying_type;
     reversed_type_impl(data_type t)
         : abstract_type(kind::reversed, "org.apache.cassandra.db.marshal.ReversedType(" + t->name() + ")",
-                        t->value_length_if_fixed(), t->imr_state().type_info())
+                        t->value_length_if_fixed())
         , _underlying_type(t)
     {}
 public:
@@ -1067,6 +1081,13 @@ to_bytes(const sstring& x) {
     return bytes(reinterpret_cast<const int8_t*>(x.c_str()), x.size());
 }
 
+// FIXME: make more explicit
+inline
+managed_bytes
+to_managed_bytes(const sstring& x) {
+    return managed_bytes(reinterpret_cast<const int8_t*>(x.c_str()), x.size());
+}
+
 inline
 bytes_view
 to_bytes_view(const sstring& x) {
@@ -1127,26 +1148,6 @@ typename Type::value_type deserialize_value(Type& t, bytes_view v) {
     return t.deserialize_value(v);
 }
 
-// Does not check bounds. Must be called only after size is already checked.
-template<FragmentedView View>
-void read_fragmented(View& v, size_t n, bytes::value_type* out) {
-    while (n) {
-        if (n <= v.current_fragment().size()) {
-            std::copy_n(v.current_fragment().data(), n, out);
-            v.remove_prefix(n);
-            n = 0;
-        } else {
-            out = std::copy_n(v.current_fragment().data(), v.current_fragment().size(), out);
-            n -= v.current_fragment().size();
-            v.remove_current();
-        }
-    }
-}
-template<> void inline read_fragmented(single_fragmented_view& v, size_t n, bytes::value_type* out) {
-    std::copy_n(v.current_fragment().data(), n, out);
-    v.remove_prefix(n);
-}
-
 template<typename T>
 T read_simple(bytes_view& v) {
     if (v.size() < sizeof(T)) {
@@ -1154,22 +1155,7 @@ T read_simple(bytes_view& v) {
     }
     auto p = v.begin();
     v.remove_prefix(sizeof(T));
-    return net::ntoh(*reinterpret_cast<const net::packed<T>*>(p));
-}
-
-template<typename T, FragmentedView View>
-T read_simple(View& v) {
-    if (v.current_fragment().size() >= sizeof(T)) [[likely]] {
-        auto p = v.current_fragment().data();
-        v.remove_prefix(sizeof(T));
-        return net::ntoh(*reinterpret_cast<const net::packed<T>*>(p));
-    } else if (v.size_bytes() >= sizeof(T)) {
-        T buf;
-        read_fragmented(v, sizeof(T), reinterpret_cast<bytes::value_type*>(&buf));
-        return net::ntoh(buf);
-    } else {
-        throw_with_backtrace<marshal_exception>(format("read_simple - not enough bytes (expected {:d}, got {:d})", sizeof(T), v.size_bytes()));
-    }
+    return net::ntoh(read_unaligned<T>(p));
 }
 
 template<typename T>
@@ -1178,21 +1164,7 @@ T read_simple_exactly(bytes_view v) {
         throw_with_backtrace<marshal_exception>(format("read_simple_exactly - size mismatch (expected {:d}, got {:d})", sizeof(T), v.size()));
     }
     auto p = v.begin();
-    return net::ntoh(*reinterpret_cast<const net::packed<T>*>(p));
-}
-
-template<typename T, FragmentedView View>
-T read_simple_exactly(View v) {
-    if (v.current_fragment().size() == sizeof(T)) [[likely]] {
-        auto p = v.current_fragment().data();
-        return net::ntoh(*reinterpret_cast<const net::packed<T>*>(p));
-    } else if (v.size_bytes() == sizeof(T)) {
-        T buf;
-        read_fragmented(v, sizeof(T), reinterpret_cast<bytes::value_type*>(&buf));
-        return net::ntoh(buf);
-    } else {
-        throw_with_backtrace<marshal_exception>(format("read_simple_exactly - size mismatch (expected {:d}, got {:d})", sizeof(T), v.size_bytes()));
-    }
+    return net::ntoh(read_unaligned<T>(p));
 }
 
 inline

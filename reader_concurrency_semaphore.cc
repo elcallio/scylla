@@ -17,6 +17,7 @@
 #include "utils/exceptions.hh"
 #include "schema.hh"
 #include "utils/human_readable.hh"
+#include "flat_mutation_reader.hh"
 
 logger rcslog("reader_concurrency_semaphore");
 
@@ -327,6 +328,9 @@ void reader_concurrency_semaphore::expiry_handler::operator()(entry& e) noexcept
     maybe_dump_reader_permit_diagnostics(_semaphore, *_semaphore._permit_list, "timed out");
 }
 
+reader_concurrency_semaphore::inactive_read::~inactive_read() {
+}
+
 void reader_concurrency_semaphore::signal(const resources& r) noexcept {
     _resources += r;
     while (!_wait_list.empty() && has_available_units(_wait_list.front().res)) {
@@ -361,26 +365,47 @@ reader_concurrency_semaphore::~reader_concurrency_semaphore() {
     broken(std::make_exception_ptr(broken_semaphore{}));
 }
 
-reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(std::unique_ptr<inactive_read> ir) {
+reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(flat_mutation_reader reader) noexcept {
     // Implies _inactive_reads.empty(), we don't queue new readers before
     // evicting all inactive reads.
     if (_wait_list.empty()) {
-        const auto [it, _] = _inactive_reads.emplace(_next_id++, std::move(ir));
-        (void)_;
+      try {
+        auto irp = std::make_unique<inactive_read>(std::move(reader));
+        auto& ir = *irp;
+        _inactive_reads.push_back(ir);
         ++_stats.inactive_reads;
-        return inactive_read_handle(*this, it->first);
+        return inactive_read_handle(*this, std::move(irp));
+      } catch (...) {
+        // It is okay to swallow the exception since
+        // we're allowed to drop the reader upon registration
+        // due to lack of resources. Returning an empty
+        // i_r_h here rather than throwing simplifies the caller's
+        // error handling.
+        rcslog.warn("Registering inactive read failed: {}. Ignored as if it was evicted.", std::current_exception());
+      }
+    } else {
+        ++_stats.permit_based_evictions;
     }
-
-    // The evicted reader will release its permit, hopefully allowing us to
-    // admit some readers from the _wait_list.
-    ir->evict();
-    ++_stats.permit_based_evictions;
     return inactive_read_handle();
 }
 
-std::unique_ptr<reader_concurrency_semaphore::inactive_read> reader_concurrency_semaphore::unregister_inactive_read(inactive_read_handle irh) {
-    if (irh && irh._sem != this) {
-        throw std::runtime_error(fmt::format(
+void reader_concurrency_semaphore::set_notify_handler(inactive_read_handle& irh, eviction_notify_handler&& notify_handler, std::optional<std::chrono::seconds> ttl_opt) {
+    auto& ir = *irh._irp;
+    ir.notify_handler = std::move(notify_handler);
+    if (ttl_opt) {
+        ir.ttl_timer.set_callback([this, &ir] {
+            evict(ir, evict_reason::time);
+        });
+        ir.ttl_timer.arm(lowres_clock::now() + *ttl_opt);
+    }
+}
+
+flat_mutation_reader_opt reader_concurrency_semaphore::unregister_inactive_read(inactive_read_handle irh) {
+    if (!irh) {
+        return {};
+    }
+    if (irh._sem != this) {
+        on_internal_error(rcslog, fmt::format(
                     "reader_concurrency_semaphore::unregister_inactive_read(): "
                     "attempted to unregister an inactive read with a handle belonging to another semaphore: "
                     "this is {} (0x{:x}) but the handle belongs to {} (0x{:x})",
@@ -390,27 +415,39 @@ std::unique_ptr<reader_concurrency_semaphore::inactive_read> reader_concurrency_
                     reinterpret_cast<uintptr_t>(irh._sem)));
     }
 
-    if (auto it = _inactive_reads.find(irh._id); it != _inactive_reads.end()) {
-        auto ir = std::move(it->second);
-        _inactive_reads.erase(it);
-        --_stats.inactive_reads;
-        return ir;
-    }
-    return {};
+    --_stats.inactive_reads;
+    auto irp = std::move(irh._irp);
+    irp->unlink();
+    return std::move(irp->reader);
 }
 
-bool reader_concurrency_semaphore::try_evict_one_inactive_read() {
+bool reader_concurrency_semaphore::try_evict_one_inactive_read(evict_reason reason) {
     if (_inactive_reads.empty()) {
         return false;
     }
-    auto it = _inactive_reads.begin();
-    it->second->evict();
-    _inactive_reads.erase(it);
-
-    ++_stats.permit_based_evictions;
-    --_stats.inactive_reads;
-
+    evict(_inactive_reads.front(), reason);
     return true;
+}
+
+void reader_concurrency_semaphore::evict(inactive_read& ir, evict_reason reason) {
+    auto reader = std::move(ir.reader);
+    ir.unlink();
+    if (auto notify_handler = std::move(ir.notify_handler)) {
+        notify_handler(reason);
+        // The notify_handler may destroy the inactive_read.
+        // Do not use it after this point!
+    }
+    switch (reason) {
+        case evict_reason::permit:
+            ++_stats.permit_based_evictions;
+            break;
+        case evict_reason::time:
+            ++_stats.time_based_evictions;
+            break;
+        case evict_reason::manual:
+            break;
+    }
+    --_stats.inactive_reads;
 }
 
 bool reader_concurrency_semaphore::has_available_units(const resources& r) const {
@@ -436,14 +473,10 @@ future<reader_permit::resource_units> reader_concurrency_semaphore::do_wait_admi
                         format("{}: restricted mutation reader queue overload", _name))));
     }
     auto r = resources(1, static_cast<ssize_t>(memory));
-    auto it = _inactive_reads.begin();
-    while (!may_proceed(r) && it != _inactive_reads.end()) {
-        auto ir = std::move(it->second);
-        it = _inactive_reads.erase(it);
-        ir->evict();
-
-        ++_stats.permit_based_evictions;
-        --_stats.inactive_reads;
+    while (!may_proceed(r)) {
+        if (!try_evict_one_inactive_read(evict_reason::permit)) {
+            break;
+        }
     }
     if (may_proceed(r)) {
         permit.on_admission();

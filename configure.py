@@ -108,18 +108,21 @@ def ensure_tmp_dir_exists():
         os.makedirs(tempfile.tempdir)
 
 
-def try_compile_and_link(compiler, source='', flags=[]):
+def try_compile_and_link(compiler, source='', flags=[], verbose=False):
     ensure_tmp_dir_exists()
     with tempfile.NamedTemporaryFile() as sfile:
         ofile = tempfile.mktemp()
         try:
             sfile.file.write(bytes(source, 'utf-8'))
             sfile.file.flush()
-            # We can't write to /dev/null, since in some cases (-ftest-coverage) gcc will create an auxiliary
-            # output file based on the name of the output file, and "/dev/null.gcsa" is not a good name
-            return subprocess.call([compiler, '-x', 'c++', '-o', ofile, sfile.name] + args.user_cflags.split() + flags,
-                                   stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL) == 0
+            ret = subprocess.run([compiler, '-x', 'c++', '-o', ofile, sfile.name] + args.user_cflags.split() + flags,
+                                 capture_output=True)
+            if verbose:
+                print(f"Compilation failed: {compiler} -x c++ -o {ofile} {sfile.name} {args.user_cflags} {flags}")
+                print(source)
+                print(ret.stdout.decode('utf-8'))
+                print(ret.stderr.decode('utf-8'))
+            return ret.returncode == 0
         finally:
             if os.path.exists(ofile):
                 os.unlink(ofile)
@@ -146,7 +149,21 @@ def linker_flags(compiler):
             link_flags.append(threads_flag)
         return ' '.join(link_flags)
     else:
-        print('Note: neither lld nor gold found; using default system linker')
+        linker = ''
+        try:
+            subprocess.call(["gold", "-v"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            linker = 'gold'
+        except:
+            pass
+        try:
+            subprocess.call(["lld", "-v"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            linker = 'lld'
+        except:
+            pass
+        if linker:
+            print(f'Linker {linker} found, but the compilation attempt failed, defaulting to default system linker')
+        else:
+            print('Note: neither lld nor gold found; using default system linker')
         return ''
 
 
@@ -240,21 +257,25 @@ modes = {
         'cxxflags': '-DDEBUG -DSANITIZE -DDEBUG_LSA_SANITIZER -DSCYLLA_ENABLE_ERROR_INJECTION',
         'cxx_ld_flags': '',
         'stack-usage-threshold': 1024*40,
+        'optimization-level': 'g',
     },
     'release': {
-        'cxxflags': '-O3 -ffunction-sections -fdata-sections ',
+        'cxxflags': '-ffunction-sections -fdata-sections ',
         'cxx_ld_flags': '-Wl,--gc-sections',
         'stack-usage-threshold': 1024*13,
+        'optimization-level': '3',
     },
     'dev': {
-        'cxxflags': '-O1 -DDEVEL -DSEASTAR_ENABLE_ALLOC_FAILURE_INJECTION -DSCYLLA_ENABLE_ERROR_INJECTION',
+        'cxxflags': '-DDEVEL -DSEASTAR_ENABLE_ALLOC_FAILURE_INJECTION -DSCYLLA_ENABLE_ERROR_INJECTION',
         'cxx_ld_flags': '',
         'stack-usage-threshold': 1024*21,
+        'optimization-level': '2',
     },
     'sanitize': {
-        'cxxflags': '-Os -DDEBUG -DSANITIZE -DDEBUG_LSA_SANITIZER -DSCYLLA_ENABLE_ERROR_INJECTION',
+        'cxxflags': '-DDEBUG -DSANITIZE -DDEBUG_LSA_SANITIZER -DSCYLLA_ENABLE_ERROR_INJECTION',
         'cxx_ld_flags': '',
         'stack-usage-threshold': 1024*50,
+        'optimization-level': 's',
     }
 }
 
@@ -266,6 +287,7 @@ ldap_tests = set([
 
 scylla_tests = set([
     'test/boost/UUID_test',
+    'test/boost/cdc_generation_test',
     'test/boost/aggregate_fcts_test',
     'test/boost/allocation_strategy_test',
     'test/boost/alternator_base64_test',
@@ -320,8 +342,8 @@ scylla_tests = set([
     'test/boost/gossip_test',
     'test/boost/gossiping_property_file_snitch_test',
     'test/boost/hash_test',
+    'test/boost/hashers_test',
     'test/boost/idl_test',
-    'test/boost/imr_test',
     'test/boost/input_stream_test',
     'test/boost/json_cql_query_test',
     'test/boost/json_test',
@@ -335,10 +357,10 @@ scylla_tests = set([
     'test/boost/estimated_histogram_test',
     'test/boost/logalloc_test',
     'test/boost/managed_vector_test',
+    'test/boost/managed_bytes_test',
     'test/boost/intrusive_array_test',
     'test/boost/map_difference_test',
     'test/boost/memtable_test',
-    'test/boost/meta_test',
     'test/boost/multishard_mutation_query_test',
     'test/boost/murmur_hash_test',
     'test/boost/mutation_fragment_test',
@@ -377,6 +399,7 @@ scylla_tests = set([
     'test/boost/incremental_compaction_test',
     'test/boost/sstable_test',
     'test/boost/sstable_move_test',
+    'test/boost/statement_restrictions_test',
     'test/boost/storage_proxy_test',
     'test/boost/top_k_test',
     'test/boost/transport_test',
@@ -393,9 +416,12 @@ scylla_tests = set([
     'test/boost/vint_serialization_test',
     'test/boost/virtual_reader_test',
     'test/boost/bptree_test',
+    'test/boost/btree_test',
+    'test/boost/radix_tree_test',
     'test/boost/double_decker_test',
     'test/boost/stall_free_test',
-    'test/boost/imr_test',
+    'test/boost/raft_sys_table_storage_test',
+    'test/boost/sstable_set_test',
     'test/boost/encrypted_file_test',
     'test/boost/mirror_file_test',
     'test/manual/ec2_snitch_test',
@@ -416,6 +442,7 @@ scylla_tests = set([
     'test/perf/perf_mutation',
     'test/perf/perf_collection',
     'test/perf/perf_row_cache_update',
+    'test/perf/perf_row_cache_reads',
     'test/perf/perf_simple_query',
     'test/perf/perf_sstable',
     'test/unit/lsa_async_eviction_test',
@@ -423,7 +450,11 @@ scylla_tests = set([
     'test/unit/row_cache_alloc_stress_test',
     'test/unit/row_cache_stress_test',
     'test/unit/bptree_stress_test',
+    'test/unit/btree_stress_test',
     'test/unit/bptree_compaction_test',
+    'test/unit/btree_compaction_test',
+    'test/unit/radix_tree_stress_test',
+    'test/unit/radix_tree_compaction_test',
 ]) | ldap_tests
 
 perf_tests = set([
@@ -437,7 +468,8 @@ perf_tests = set([
 
 raft_tests = set([
     'test/raft/replication_test',
-    'test/boost/raft_fsm_test',
+    'test/raft/fsm_test',
+    'test/raft/etcd_test',
 ])
 
 apps = set([
@@ -484,6 +516,8 @@ arg_parser.add_argument('--dpdk-target', action='store', dest='dpdk_target', def
                         help='Path to DPDK SDK target location (e.g. <DPDK SDK dir>/x86_64-native-linuxapp-gcc)')
 arg_parser.add_argument('--debuginfo', action='store', dest='debuginfo', type=int, default=1,
                         help='Enable(1)/disable(0)compiler debug information generation')
+arg_parser.add_argument('--optimization-level', action='append', dest='mode_o_levels', metavar='MODE=LEVEL', default=[],
+                        help=f'Override default compiler optimization level for mode (defaults: {" ".join([x+"="+modes[x]["optimization-level"] for x in modes])})')
 arg_parser.add_argument('--static-stdc++', dest='staticcxx', action='store_true',
                         help='Link libgcc and libstdc++ statically')
 arg_parser.add_argument('--static-thrift', dest='staticthrift', action='store_true',
@@ -506,8 +540,6 @@ arg_parser.add_argument('--with-antlr3', dest='antlr3_exec', action='store', def
                         help='path to antlr3 executable')
 arg_parser.add_argument('--with-ragel', dest='ragel_exec', action='store', default='ragel',
         help='path to ragel executable')
-arg_parser.add_argument('--build-raft', dest='build_raft', action='store_true', default=False,
-                        help='build raft code')
 add_tristate(arg_parser, name='stack-guards', dest='stack_guards', help='Use stack guards')
 arg_parser.add_argument('--verbose', dest='verbose', action='store_true',
                         help='Make configure.py output more verbose (useful for debugging the build process itself)')
@@ -516,15 +548,24 @@ arg_parser.add_argument('--test-repeat', dest='test_repeat', action='store', typ
 arg_parser.add_argument('--test-timeout', dest='test_timeout', action='store', type=str, default='7200')
 args = arg_parser.parse_args()
 
-if not args.build_raft:
-    all_artifacts.difference_update(raft_tests)
-    tests.difference_update(raft_tests)
-
 defines = ['XXH_PRIVATE_API',
            'SEASTAR_TESTING_MAIN',
 ]
 
-extra_cxxflags = {}
+extra_cxxflags = {
+    'debug': {},
+    'dev': {},
+    'release': {},
+    'sanitize': {}
+}
+
+scylla_raft_core = [
+    'raft/raft.cc',
+    'raft/server.cc',
+    'raft/fsm.cc',
+    'raft/tracker.cc',
+    'raft/log.cc',
+]
 
 scylla_core = (['database.cc',
                 'absl-flat_hash_map.cc',
@@ -567,15 +608,16 @@ scylla_core = (['database.cc',
                 'counters.cc',
                 'compress.cc',
                 'zstd.cc',
-                'sstables/mp_row_consumer.cc',
                 'sstables/sstables.cc',
                 'sstables/sstables_manager.cc',
                 'sstables/sstable_set.cc',
+                'sstables/mx/reader.cc',
                 'sstables/mx/writer.cc',
+                'sstables/kl/reader.cc',
                 'sstables/kl/writer.cc',
                 'sstables/sstable_version.cc',
                 'sstables/compress.cc',
-                'sstables/partition.cc',
+                'sstables/sstable_mutation_reader.cc',
                 'sstables/compaction.cc',
                 'sstables/compaction_strategy.cc',
                 'sstables/size_tiered_compaction_strategy.cc',
@@ -851,7 +893,6 @@ scylla_core = (['database.cc',
                 'vint-serialization.cc',
                 'utils/arch/powerpc/crc32-vpmsum/crc32_wrapper.cc',
                 'querier.cc',
-                'data/cell.cc',
                 'mutation_writer/multishard_writer.cc',
                 'ent/encryption/encryption_config.cc',
                 'ent/encryption/encryption.cc',
@@ -874,8 +915,16 @@ scylla_core = (['database.cc',
                 'utils/error_injection.cc',
                 'mutation_writer/timestamp_based_splitting_writer.cc',
                 'mutation_writer/shard_based_splitting_writer.cc',
+                'mutation_writer/feed_writers.cc',
                 'lua.cc',
-                ] + [Antlr3Grammar('cql3/Cql.g')] + [Thrift('interface/cassandra.thrift', 'Cassandra')]
+                'service/raft/schema_raft_state_machine.cc',
+                'service/raft/raft_sys_table_storage.cc',
+                'serializer.cc',
+                'service/raft/raft_rpc.cc',
+                'service/raft/raft_gossip_failure_detector.cc',
+                'service/raft/raft_services.cc',
+                ] + [Antlr3Grammar('cql3/Cql.g')] + [Thrift('interface/cassandra.thrift', 'Cassandra')] \
+                  + scylla_raft_core
                )
 
 api = ['api/api.cc',
@@ -971,6 +1020,7 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/view.idl.hh',
         'idl/messaging_service.idl.hh',
         'idl/paxos.idl.hh',
+        'idl/raft.idl.hh',
         ]
 
 headers = find_headers('.', excluded_dirs=['idl', 'build', 'seastar', '.git'])
@@ -995,14 +1045,7 @@ scylla_tests_dependencies = scylla_core + idls + scylla_tests_generic_dependenci
     'test/lib/random_schema.cc',
 ]
 
-scylla_raft_dependencies = [
-    'raft/raft.cc',
-    'raft/server.cc',
-    'raft/fsm.cc',
-    'raft/progress.cc',
-    'raft/log.cc',
-    'utils/uuid.cc'
-]
+scylla_raft_dependencies = scylla_raft_core + ['utils/uuid.cc']
 
 deps = {
     'scylla': idls + ['main.cc', 'release.cc', 'utils/build_id.cc'] + scylla_core + api + alternator + redis,
@@ -1029,13 +1072,13 @@ pure_boost_tests = set([
     'test/boost/dynamic_bitset_test',
     'test/boost/enum_option_test',
     'test/boost/enum_set_test',
+    'test/boost/hashers_test',
     'test/boost/idl_test',
     'test/boost/json_test',
     'test/boost/keys_test',
     'test/boost/like_matcher_test',
     'test/boost/linearizing_input_stream_test',
     'test/boost/map_difference_test',
-    'test/boost/meta_test',
     'test/boost/nonwrapping_range_test',
     'test/boost/observable_test',
     'test/boost/range_test',
@@ -1045,6 +1088,8 @@ pure_boost_tests = set([
     'test/boost/top_k_test',
     'test/boost/vint_serialization_test',
     'test/boost/bptree_test',
+    'test/boost/utf8_test',
+    'test/boost/btree_test',
     'test/manual/streaming_histogram_test',
 ])
 
@@ -1064,7 +1109,11 @@ tests_not_using_seastar_test_framework = set([
     'test/unit/lsa_sync_eviction_test',
     'test/unit/row_cache_alloc_stress_test',
     'test/unit/bptree_stress_test',
+    'test/unit/btree_stress_test',
     'test/unit/bptree_compaction_test',
+    'test/unit/btree_compaction_test',
+    'test/unit/radix_tree_stress_test',
+    'test/unit/radix_tree_compaction_test',
     'test/manual/sstable_scan_footprint_test',
 ]) | pure_boost_tests
 
@@ -1108,8 +1157,6 @@ deps['test/boost/estimated_histogram_test'] = ['test/boost/estimated_histogram_t
 deps['test/boost/anchorless_list_test'] = ['test/boost/anchorless_list_test.cc']
 deps['test/perf/perf_fast_forward'] += ['release.cc']
 deps['test/perf/perf_simple_query'] += ['release.cc']
-deps['test/boost/meta_test'] = ['test/boost/meta_test.cc']
-deps['test/boost/imr_test'] = ['test/boost/imr_test.cc', 'utils/logalloc.cc', 'utils/dynamic_bitset.cc']
 deps['test/boost/reusable_buffer_test'] = [
     "test/boost/reusable_buffer_test.cc",
     "test/lib/log.cc",
@@ -1127,7 +1174,8 @@ deps['test/boost/duration_test'] += ['test/lib/exception_utils.cc']
 deps['test/boost/alternator_base64_test'] += ['alternator/base64.cc']
 
 deps['test/raft/replication_test'] = ['test/raft/replication_test.cc'] + scylla_raft_dependencies
-deps['test/boost/raft_fsm_test'] =  ['test/boost/raft_fsm_test.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
+deps['test/raft/fsm_test'] =  ['test/raft/fsm_test.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
+deps['test/raft/etcd_test'] =  ['test/raft/etcd_test.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
 
 deps['utils/gz/gen_crc_combine_table'] = ['utils/gz/gen_crc_combine_table.cc']
 
@@ -1183,9 +1231,16 @@ warnings = [w
 
 warnings = ' '.join(warnings + ['-Wno-error=deprecated-declarations'])
 
+def clang_inline_threshold():
+    if platform.machine() == 'aarch64':
+        # we see miscompiles with 1200 and above with format("{}", uuid)
+        return 600
+    else:
+        return 2500
+
 optimization_flags = [
     '--param inline-unit-growth=300', # gcc
-    '-mllvm -inline-threshold=2500',  # clang
+    f'-mllvm -inline-threshold={clang_inline_threshold()}',  # clang
 ]
 optimization_flags = [o
                       for o in optimization_flags
@@ -1195,6 +1250,15 @@ modes['release']['cxxflags'] += ' ' + ' '.join(optimization_flags)
 if flag_supported(flag='-Wstack-usage=4096', compiler=args.cxx):
     for mode in modes:
         modes[mode]['cxxflags'] += f' -Wstack-usage={modes[mode]["stack-usage-threshold"]} -Wno-error=stack-usage='
+
+for mode_level in args.mode_o_levels:
+    ( mode, level ) = mode_level.split('=', 2)
+    if mode not in modes:
+        raise Exception(f'Mode {mode} is missing, cannot configure optimization level for it')
+    modes[mode]['optimization-level'] = level
+
+for mode in modes:
+    modes[mode]['cxxflags'] += f' -O{modes[mode]["optimization-level"]}'
 
 linker_flags = linker_flags(compiler=args.cxx)
 
@@ -1261,7 +1325,8 @@ compiler_test_src = '''
 int main() { return 0; }
 '''
 if not try_compile_and_link(compiler=args.cxx, source=compiler_test_src):
-    print('Wrong GCC version. Scylla needs GCC >= 10.1.1 to compile.')
+    try_compile_and_link(compiler=args.cxx, source=compiler_test_src, verbose=True)
+    print('Wrong compiler version or incorrect flags. Scylla needs GCC >= 10.1.1 with coroutines (-fcoroutines) or clang >= 10.0.0 to compile.')
     sys.exit(1)
 
 if not try_compile(compiler=args.cxx, source='#include <boost/version.hpp>'):
@@ -1312,7 +1377,9 @@ scylla_release = file.read().strip()
 file = open(f'{outdir}/SCYLLA-PRODUCT-FILE', 'r')
 scylla_product = file.read().strip()
 
-extra_cxxflags["release.cc"] = "-DSCYLLA_VERSION=\"\\\"" + scylla_version + "\\\"\" -DSCYLLA_RELEASE=\"\\\"" + scylla_release + "\\\"\""
+for m in ['debug', 'release', 'sanitize', 'dev']:
+    cxxflags = "-DSCYLLA_VERSION=\"\\\"" + scylla_version + "\\\"\" -DSCYLLA_RELEASE=\"\\\"" + scylla_release + "\\\"\" -DSCYLLA_BUILD_MODE=\"\\\"" + m + "\\\"\""
+    extra_cxxflags[m]["release.cc"] = cxxflags
 
 for m in ['debug', 'release', 'sanitize']:
     modes[m]['cxxflags'] += ' ' + dbgflag
@@ -1466,6 +1533,7 @@ abseil_libs = ['absl/' + lib for lib in [
     'numeric/libabsl_int128.a',
     'hash/libabsl_city.a',
     'hash/libabsl_hash.a',
+    'hash/libabsl_wyhash.a',
     'base/libabsl_malloc_internal.a',
     'base/libabsl_spinlock_wait.a',
     'base/libabsl_base.a',
@@ -1485,9 +1553,6 @@ libs = ' '.join([maybe_static(args.staticyamlcpp, '-lyaml-cpp'), '-latomic', '-l
 
 if not args.staticboost:
     args.user_cflags += ' -DBOOST_TEST_DYN_LINK'
-
-if build_raft:
-    args.user_cflags += ' -DENABLE_SCYLLA_RAFT'
 
 # thrift version detection, see #4538
 proc_res = subprocess.run(["thrift", "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -1797,8 +1862,8 @@ with open(buildfile_tmp, 'w') as f:
         for obj in compiles:
             src = compiles[obj]
             f.write('build {}: cxx.{} {} || {} {}\n'.format(obj, mode, src, seastar_dep, gen_headers_dep))
-            if src in extra_cxxflags:
-                f.write('    cxxflags = {seastar_cflags} $cxxflags $cxxflags_{mode} {extra_cxxflags}\n'.format(mode=mode, extra_cxxflags=extra_cxxflags[src], **modeval))
+            if src in extra_cxxflags[mode]:
+                f.write('    cxxflags = {seastar_cflags} $cxxflags $cxxflags_{mode} {extra_cxxflags}\n'.format(mode=mode, extra_cxxflags=extra_cxxflags[mode][src], **modeval))
         for swagger in swaggers:
             hh = swagger.headers(gen_dir)[0]
             cc = swagger.sources(gen_dir)[0]

@@ -9,6 +9,7 @@
  */
 
 #include "test/lib/reader_permit.hh"
+#include "reader_concurrency_semaphore.hh"
 
 namespace tests {
 

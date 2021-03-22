@@ -971,6 +971,14 @@
                      "paramType":"query"
                   },
                   {
+                     "name":"ignore_nodes",
+                     "description":"Which hosts are to ignore in this repair. Multiple hosts can be listed separated by commas.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
                      "name":"trace",
                      "description":"If the value is the string 'true' with any capitalization, enable tracing of the repair.",
                      "required":false,
@@ -1761,6 +1769,22 @@
                      "name":"cf",
                      "description":"Column family name",
                      "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"load_and_stream",
+                     "description":"Load the sstables and stream to all replica nodes that owns the data",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"primary_replica_only",
+                     "description":"Load the sstables and stream to primary replica node that owns the data. Repair is needed after the load and stream process",
+                     "required":false,
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"

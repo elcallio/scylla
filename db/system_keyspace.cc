@@ -32,6 +32,7 @@
 #include <boost/range/adaptor/filtered.hpp>
 #include <boost/range/adaptor/map.hpp>
 
+#include <seastar/core/coroutine.hh>
 #include "system_keyspace.hh"
 #include "types.hh"
 #include "service/storage_proxy.hh"
@@ -198,6 +199,51 @@ schema_ptr batchlog() {
        return builder.build(schema_builder::compact_storage::no);
     }();
     return paxos;
+}
+
+schema_ptr raft() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, RAFT);
+        return schema_builder(NAME, RAFT, std::optional(id))
+            .with_column("group_id", long_type, column_kind::partition_key)
+            // raft log part
+            .with_column("index", long_type, column_kind::clustering_key)
+            .with_column("term", long_type)
+            .with_column("data", bytes_type) // decltype(raft::log_entry::data) - serialized variant
+            // persisted term and vote
+            .with_column("vote_term", long_type, column_kind::static_column)
+            .with_column("vote", uuid_type, column_kind::static_column)
+            // id of the most recent persisted snapshot
+            .with_column("snapshot_id", uuid_type, column_kind::static_column)
+
+            .set_comment("Persisted RAFT log, votes and snapshot info")
+            .with_version(generate_schema_version(id))
+            .set_wait_for_sync_to_commitlog(true)
+            .with_null_sharder()
+            .build();
+    }();
+    return schema;
+}
+
+// Note that this table does not include actula user snapshot data since it's dependent
+// on user-provided state machine and could be stored anywhere else in any other form.
+schema_ptr raft_snapshots() {
+    static thread_local auto schema = [] {
+        auto id = generate_legacy_id(NAME, RAFT_SNAPSHOTS);
+        return schema_builder(NAME, RAFT_SNAPSHOTS, std::optional(id))
+            .with_column("group_id", long_type, column_kind::partition_key)
+            .with_column("id", uuid_type, column_kind::clustering_key)
+            .with_column("idx", long_type)
+            .with_column("term", long_type)
+            .with_column("config", bytes_type) // serialized
+
+            .set_comment("Persisted RAFT snapshots info")
+            .with_version(generate_schema_version(id))
+            .set_wait_for_sync_to_commitlog(true)
+            .with_null_sharder()
+            .build();
+    }();
+    return schema;
 }
 
 schema_ptr built_indexes() {
@@ -1563,6 +1609,21 @@ future<> update_cdc_streams_timestamp(db_clock::time_point tp) {
             .discard_result().then([] { return force_blocking_flush(v3::CDC_LOCAL); });
 }
 
+static const sstring CDC_REWRITTEN_KEY = "rewritten";
+
+future<> cdc_set_rewritten(std::optional<db_clock::time_point> tp) {
+    if (tp) {
+        return qctx->execute_cql(
+                format("INSERT INTO system.{} (key, streams_timestamp) VALUES (?, ?)", v3::CDC_LOCAL),
+                CDC_REWRITTEN_KEY, *tp).discard_result();
+    } else {
+        // Insert just the row marker.
+        return qctx->execute_cql(
+                format("INSERT INTO system.{} (key) VALUES (?)", v3::CDC_LOCAL),
+                CDC_REWRITTEN_KEY).discard_result();
+    }
+}
+
 future<> force_blocking_flush(sstring cfname) {
     assert(qctx);
     return qctx->_qp.invoke_on_all([cfname = std::move(cfname)] (cql3::query_processor& qp) {
@@ -1635,6 +1696,14 @@ future<std::optional<db_clock::time_point>> get_saved_cdc_streams_timestamp() {
     });
 }
 
+future<bool> cdc_is_rewritten() {
+    // We don't care about the actual timestamp; it's additional information for debugging purposes.
+    return qctx->execute_cql(format("SELECT key FROM system.{} WHERE key = ?", v3::CDC_LOCAL), CDC_REWRITTEN_KEY)
+            .then([] (::shared_ptr<cql3::untyped_result_set> msg) {
+        return !msg->empty();
+    });
+}
+
 bool bootstrap_complete() {
     return get_bootstrap_state() == bootstrap_state::COMPLETED;
 }
@@ -1680,6 +1749,7 @@ std::vector<schema_ptr> all_tables() {
                     compactions_in_progress(), compaction_history(),
                     sstable_activity(), clients(), size_estimates(), large_partitions(), large_rows(), large_cells(),
                     scylla_local(), db::schema_tables::scylla_table_schema_history(),
+                    raft(), raft_snapshots(),
                     v3::views_builds_in_progress(), v3::built_views(),
                     v3::scylla_views_builds_in_progress(),
                     v3::truncated(),
@@ -1698,7 +1768,7 @@ std::vector<schema_ptr> all_tables() {
 
 static void maybe_add_virtual_reader(schema_ptr s, database& db) {
     if (s.get() == size_estimates().get()) {
-        db.find_column_family(s).set_virtual_reader(mutation_source(db::size_estimates::virtual_reader()));
+        db.find_column_family(s).set_virtual_reader(mutation_source(db::size_estimates::virtual_reader(db)));
     }
     if (s.get() == v3::views_builds_in_progress().get()) {
         db.find_column_family(s).set_virtual_reader(mutation_source(db::view::build_progress_virtual_reader(db)));
@@ -1713,8 +1783,9 @@ static bool maybe_write_in_user_memory(schema_ptr s, database& db) {
             || s == v3::scylla_views_builds_in_progress();
 }
 
-void make(database& db, bool durable, bool volatile_testing_only) {
+future<> make(database& db) {
     auto enable_cache = db.get_config().enable_cache();
+    bool durable = db.get_config().data_file_directories().size() > 0;
     for (auto&& table : all_tables()) {
         auto ks_name = table->ks_name();
         if (!db.has_keyspace(ks_name)) {
@@ -1723,18 +1794,7 @@ void make(database& db, bool durable, bool volatile_testing_only) {
                     std::map<sstring, sstring>{},
                     durable
                     );
-            auto kscfg = db.make_keyspace_config(*ksm);
-            kscfg.enable_disk_reads = !volatile_testing_only;
-            kscfg.enable_disk_writes = !volatile_testing_only;
-            kscfg.enable_commitlog = !volatile_testing_only;
-            kscfg.enable_cache = enable_cache;
-            kscfg.compaction_concurrency_semaphore = &db._compaction_concurrency_sem;
-            // don't make system keyspace writes wait for user writes (if under pressure)
-            kscfg.dirty_memory_manager = &db._system_dirty_memory_manager;
-            keyspace _ks{ksm, std::move(kscfg)};
-            auto rs(locator::abstract_replication_strategy::create_replication_strategy(NAME, "LocalStrategy", db.get_shared_token_metadata(), ksm->strategy_options()));
-            _ks.set_replication_strategy(std::move(rs));
-            db.add_keyspace(ks_name, std::move(_ks));
+            co_await db.create_keyspace(ksm, true, database::system_keyspace::yes);
         }
         auto& ks = db.find_keyspace(ks_name);
         auto cfg = ks.make_column_family_config(*table, db);
@@ -1853,7 +1913,7 @@ future<> get_compaction_history(compaction_history_consumer&& f) {
     return do_with(compaction_history_consumer(std::move(f)),
             [](compaction_history_consumer& consumer) mutable {
         sstring req = format("SELECT * from system.{}", COMPACTION_HISTORY);
-        return qctx->qp().query(req, [&consumer] (const cql3::untyped_result_set::row& row) mutable {
+        return qctx->qp().query_internal(req, [&consumer] (const cql3::untyped_result_set::row& row) mutable {
             compaction_history_entry entry;
             entry.id = row.get_as<utils::UUID>("id");
             entry.ks = row.get_as<sstring>("keyspace_name");

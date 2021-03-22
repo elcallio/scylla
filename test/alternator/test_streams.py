@@ -140,7 +140,10 @@ def test_list_streams_alter(dynamodb, dynamodbstreams):
             wait_for_active_stream(dynamodbstreams, table)
 
 def test_list_streams_paged(dynamodb, dynamodbstreams):
-    for type in stream_types:
+    # There is no reason to run this test for all stream types - we have
+    # other tests for creating tables with all stream types, and for using
+    # them. This one is only about list_streams.
+    for type in stream_types[0:1]:
         with create_stream_test_table(dynamodb, StreamViewType=type) as table1:
             with create_stream_test_table(dynamodb, StreamViewType=type) as table2:
                 wait_for_active_stream(dynamodbstreams, table1)
@@ -514,6 +517,15 @@ def latest_iterators(dynamodbstreams, arn):
             ShardId=shard_id, ShardIteratorType='LATEST')['ShardIterator'])
     assert len(set(iterators)) == len(iterators)
     return iterators
+
+# Similar to latest_iterators(), just also returns the shard id which produced
+# each iterator.
+def shards_and_latest_iterators(dynamodbstreams, arn):
+    shards_and_iterators = []
+    for shard_id in list_shards(dynamodbstreams, arn):
+        shards_and_iterators.append((shard_id, dynamodbstreams.get_shard_iterator(StreamArn=arn,
+            ShardId=shard_id, ShardIteratorType='LATEST')['ShardIterator']))
+    return shards_and_iterators
 
 # Utility function for fetching more content from the stream (given its
 # array of iterators) into an "output" array. Call repeatedly to get more
@@ -955,11 +967,7 @@ def test_streams_another_result(test_table_ss_keys_only, dynamodbstreams):
 # event again given its saved "sequence number".
 def test_streams_at_sequence_number(test_table_ss_keys_only, dynamodbstreams):
     table, arn = test_table_ss_keys_only
-    # List all the shards and their LATEST iterators:
-    shards_and_iterators = []
-    for shard_id in list_shards(dynamodbstreams, arn):
-        shards_and_iterators.append((shard_id, dynamodbstreams.get_shard_iterator(StreamArn=arn,
-            ShardId=shard_id, ShardIteratorType='LATEST')['ShardIterator']))
+    shards_and_iterators = shards_and_latest_iterators(dynamodbstreams, arn)
     # Do an UpdateItem operation that is expected to leave one event in the
     # stream.
     p = random_string()
@@ -1005,11 +1013,7 @@ def test_streams_at_sequence_number(test_table_ss_keys_only, dynamodbstreams):
 # event again given its saved "sequence number".
 def test_streams_after_sequence_number(test_table_ss_keys_only, dynamodbstreams):
     table, arn = test_table_ss_keys_only
-    # List all the shards and their LATEST iterators:
-    shards_and_iterators = []
-    for shard_id in list_shards(dynamodbstreams, arn):
-        shards_and_iterators.append((shard_id, dynamodbstreams.get_shard_iterator(StreamArn=arn,
-            ShardId=shard_id, ShardIteratorType='LATEST')['ShardIterator']))
+    shards_and_iterators = shards_and_latest_iterators(dynamodbstreams, arn)
     # Do two UpdateItem operations to the same key, that are expected to leave
     # two events in the stream.
     p = random_string()
@@ -1056,11 +1060,7 @@ def test_streams_after_sequence_number(test_table_ss_keys_only, dynamodbstreams)
 # change this, we should change this test to use a different fixture.
 def test_streams_trim_horizon(test_table_ss_keys_only, dynamodbstreams):
     table, arn = test_table_ss_keys_only
-    # List all the shards and their LATEST iterators:
-    shards_and_iterators = []
-    for shard_id in list_shards(dynamodbstreams, arn):
-        shards_and_iterators.append((shard_id, dynamodbstreams.get_shard_iterator(StreamArn=arn,
-            ShardId=shard_id, ShardIteratorType='LATEST')['ShardIterator']))
+    shards_and_iterators = shards_and_latest_iterators(dynamodbstreams, arn)
     # Do two UpdateItem operations to the same key, that are expected to leave
     # two events in the stream.
     p = random_string()

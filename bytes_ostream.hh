@@ -13,7 +13,6 @@
 #include <boost/range/iterator_range.hpp>
 
 #include "bytes.hh"
-#include <seastar/core/unaligned.hh>
 #include "hashing.hh"
 #include <seastar/core/simple-stream.hh>
 /**
@@ -28,7 +27,7 @@ public:
     using size_type = bytes::size_type;
     using value_type = bytes::value_type;
     using fragment_type = bytes_view;
-    static constexpr size_type max_chunk_size() { return 128 * 1024; }
+    static constexpr size_type max_chunk_size() { return max_alloc_size() - sizeof(chunk); }
 private:
     static_assert(sizeof(value_type) == 1, "value_type is assumed to be one byte long");
     struct chunk {
@@ -48,6 +47,7 @@ private:
         void operator delete(void* ptr) { free(ptr); }
     };
     static constexpr size_type default_chunk_size{512};
+    static constexpr size_type max_alloc_size() { return 128 * 1024; }
 private:
     std::unique_ptr<chunk> _begin;
     chunk* _current;
@@ -121,16 +121,15 @@ private:
         return _current->size - _current->offset;
     }
     // Figure out next chunk size.
-    //   - must be enough for data_size
+    //   - must be enough for data_size + sizeof(chunk)
     //   - must be at least _initial_chunk_size
     //   - try to double each time to prevent too many allocations
-    //   - do not exceed max_chunk_size
+    //   - should not exceed max_alloc_size, unless data_size requires so
     size_type next_alloc_size(size_t data_size) const {
         auto next_size = _current
                 ? _current->size * 2
                 : _initial_chunk_size;
-        next_size = std::min(next_size, max_chunk_size());
-        // FIXME: check for overflow?
+        next_size = std::min(next_size, max_alloc_size());
         return std::max<size_type>(next_size, data_size + sizeof(chunk));
     }
     // Makes room for a contiguous region of given size.

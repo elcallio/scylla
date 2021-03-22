@@ -182,13 +182,12 @@ void sstable_writer_k_l::write_cell(file_writer& out, atomic_cell_view cell, con
         column_mask mask = column_mask::counter;
         write(_version, out, mask, int64_t(0), timestamp);
 
-      counter_cell_view::with_linearized(cell, [&] (counter_cell_view ccv) {
+        auto ccv = counter_cell_view(cell);
         write_counter_value(ccv, out, _version, [v = _version] (file_writer& out, uint32_t value) {
             return write(v, out, value);
         });
 
         _c_stats.update_local_deletion_time(std::numeric_limits<int>::max());
-      });
     } else if (cell.is_live_and_has_ttl()) {
         // expiring cell
 
@@ -635,9 +634,6 @@ void sstable_writer_k_l::consume_end_of_stream()
 {
     _monitor->on_data_write_completed();
 
-    if (_partition_key) {
-        on_internal_error(sstlog, "Mutation stream ends with unclosed partition during write");
-    }
     // what if there is only one partition? what if it is empty?
     seal_summary(_sst._components->summary, std::move(_first_key), std::move(_last_key), _index_sampling_state).get();
 
@@ -662,7 +658,7 @@ void sstable_writer_k_l::consume_end_of_stream()
         features.disable(sstable_feature::NonCompoundRangeTombstones);
     }
     run_identifier identifier{_run_identifier};
-    _sst.write_scylla_metadata(_pc, _shard, std::move(features), std::move(identifier), {});
+    _sst.write_scylla_metadata(_pc, _shard, std::move(features), std::move(identifier), {}, "");
 
     if (!_leave_unsealed) {
         _sst.seal_sstable(_backup).get();

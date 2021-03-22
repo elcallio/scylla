@@ -51,6 +51,8 @@
 
 namespace cql3 {
 
+class query_processor;
+
 namespace statements {
 
 /** A <code>CREATE INDEX</code> statement parsed from a CQL query. */
@@ -62,13 +64,13 @@ class create_index_statement : public schema_altering_statement {
     cql_stats* _cql_stats = nullptr;
 
 public:
-    create_index_statement(::shared_ptr<cf_name> name, ::shared_ptr<index_name> index_name,
+    create_index_statement(cf_name name, ::shared_ptr<index_name> index_name,
             std::vector<::shared_ptr<index_target::raw>> raw_targets,
             ::shared_ptr<index_prop_defs> properties, bool if_not_exists);
 
     future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
     void validate(service::storage_proxy&, const service::client_state& state) const override;
-    future<::shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy&) const override;
+    future<::shared_ptr<cql_transport::event::schema_change>> announce_migration(query_processor&) const override;
 
     virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 private:

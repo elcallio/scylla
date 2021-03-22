@@ -46,6 +46,7 @@
 #include "cql3/selection/selectable_with_field_selection.hh"
 #include "cql3/selection/selection.hh"
 #include "cql3/selection/writetime_or_ttl.hh"
+#include "cql3/query_processor.hh"
 #include "cql3/util.hh"
 #include "schema_builder.hh"
 #include "service/storage_proxy.hh"
@@ -60,8 +61,8 @@ namespace cql3 {
 namespace statements {
 
 create_view_statement::create_view_statement(
-        ::shared_ptr<cf_name> view_name,
-        ::shared_ptr<cf_name> base_name,
+        cf_name view_name,
+        cf_name base_name,
         std::vector<::shared_ptr<selection::raw_selector>> select_clause,
         std::vector<::shared_ptr<relation>> where_clause,
         std::vector<::shared_ptr<cql3::column_identifier::raw>> partition_keys,
@@ -78,7 +79,7 @@ create_view_statement::create_view_statement(
 }
 
 future<> create_view_statement::check_access(service::storage_proxy& proxy, const service::client_state& state) const {
-    return state.has_column_family_access(proxy.local_db(), keyspace(), _base_name->get_column_family(), auth::permission::ALTER);
+    return state.has_column_family_access(proxy.local_db(), keyspace(), _base_name.get_column_family(), auth::permission::ALTER);
 }
 
 void create_view_statement::validate(service::storage_proxy& proxy, const service::client_state& state) const {
@@ -129,7 +130,7 @@ static bool validate_primary_key(
     return new_non_pk_column;
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::announce_migration(service::storage_proxy& proxy) const {
+future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::announce_migration(query_processor& qp) const {
     // We need to make sure that:
     //  - primary key includes all columns in base table's primary key
     //  - make sure that the select statement does not have anything other than columns
@@ -139,7 +140,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     //  - make sure there is not currently a table or view
     //  - make sure base_table gc_grace_seconds > 0
 
-    auto&& db = proxy.get_db().local();
+    auto&& db = qp.db();
     auto schema_extensions = _properties.properties()->make_schema_extensions(db.extensions());
     _properties.validate(db, schema_extensions);
 
@@ -156,15 +157,15 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     // If a keyspace was not specified for the base table name, it is assumed
     // it is in the same keyspace as the view table being created (which
     // itself might be the current USEd keyspace, or explicitly specified).
-    if (_base_name->get_keyspace().empty()) {
-        _base_name->set_keyspace(keyspace(), true);
+    if (!_base_name.has_keyspace()) {
+        _base_name.set_keyspace(keyspace(), true);
     }
-    if (_base_name->get_keyspace() != keyspace()) {
+    if (_base_name.get_keyspace() != keyspace()) {
         throw exceptions::invalid_request_exception(format("Cannot create a materialized view on a table in a separate keyspace ('{}' != '{}')",
-                _base_name->get_keyspace(), keyspace()));
+                _base_name.get_keyspace(), keyspace()));
     }
 
-    schema_ptr schema = validation::validate_column_family(db, _base_name->get_keyspace(), _base_name->get_column_family());
+    schema_ptr schema = validation::validate_column_family(db, _base_name.get_keyspace(), _base_name.get_column_family());
 
     if (schema->is_counter()) {
         throw exceptions::invalid_request_exception(format("Materialized views are not supported on counter tables"));
@@ -180,7 +181,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
                 "'%s' with gc_grace_seconds of 0, since this value is "
                 "used to TTL undelivered updates. Setting gc_grace_seconds "
                 "too low might cause undelivered updates to expire "
-                "before being replayed.", column_family(), _base_name->get_column_family()));
+                "before being replayed.", column_family(), _base_name.get_column_family()));
     }
 
     // Gather all included columns, as specified by the select clause
@@ -277,7 +278,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     if (!missing_pk_columns.empty()) {
         auto column_names = ::join(", ", missing_pk_columns | boost::adaptors::transformed(std::mem_fn(&column_definition::name_as_text)));
         throw exceptions::invalid_request_exception(format("Cannot create Materialized View {} without primary key columns from base {} ({})",
-                        column_family(), _base_name->get_column_family(), column_names));
+                        column_family(), _base_name.get_column_family(), column_names));
     }
 
     if (_partition_keys.empty()) {
@@ -339,8 +340,8 @@ future<shared_ptr<cql_transport::event::schema_change>> create_view_statement::a
     auto where_clause_text = util::relations_to_where_clause(_where_clause);
     builder.with_view_info(schema->id(), schema->cf_name(), included.empty(), std::move(where_clause_text));
 
-    return make_ready_future<>().then([definition = view_ptr(builder.build())]() mutable {
-        return service::get_local_migration_manager().announce_new_view(definition);
+    return make_ready_future<>().then([definition = view_ptr(builder.build()), &mm = qp.get_migration_manager()]() mutable {
+        return mm.announce_new_view(definition);
     }).then_wrapped([this] (auto&& f) {
         try {
             f.get();

@@ -33,9 +33,10 @@
 #include "hashing_partition_visitor.hh"
 #include "range_tombstone_list.hh"
 #include "clustering_key_filter.hh"
-#include "intrusive_set_external_comparator.hh"
+#include "utils/intrusive_btree.hh"
 #include "utils/preempt.hh"
 #include "utils/managed_ref.hh"
+#include "utils/compact-radix-tree.hh"
 
 class mutation_fragment;
 
@@ -83,86 +84,13 @@ class compaction_garbage_collector;
 // for space-efficiency reasons. Whenever a method accepts a column_kind,
 // the caller must always supply the same column_kind.
 //
-// Can be used as a range of row::cell_entry.
 //
 class row {
-
-    class cell_entry {
-        boost::intrusive::set_member_hook<> _link;
-        column_id _id;
-        cell_and_hash _cell_and_hash;
-        friend class row;
-    public:
-        cell_entry(column_id id, cell_and_hash c_a_h)
-            : _id(id)
-            , _cell_and_hash(std::move(c_a_h))
-        { }
-        cell_entry(column_id id, atomic_cell_or_collection cell)
-            : cell_entry(id, cell_and_hash{std::move(cell), cell_hash_opt()})
-        { }
-        cell_entry(column_id id)
-            : _id(id)
-        { }
-        cell_entry(cell_entry&&) noexcept;
-        cell_entry(const abstract_type&, const cell_entry&);
-
-        column_id id() const { return _id; }
-        const atomic_cell_or_collection& cell() const { return _cell_and_hash.cell; }
-        atomic_cell_or_collection& cell() { return _cell_and_hash.cell; }
-        const cell_hash_opt& hash() const { return _cell_and_hash.hash; }
-        const cell_and_hash& get_cell_and_hash() const { return _cell_and_hash; }
-        cell_and_hash& get_cell_and_hash() { return _cell_and_hash; }
-
-        struct compare {
-            bool operator()(const cell_entry& e1, const cell_entry& e2) const {
-                return e1._id < e2._id;
-            }
-            bool operator()(column_id id1, const cell_entry& e2) const {
-                return id1 < e2._id;
-            }
-            bool operator()(const cell_entry& e1, column_id id2) const {
-                return e1._id < id2;
-            }
-        };
-    };
-
+    friend class size_calculator;
     using size_type = std::make_unsigned_t<column_id>;
-
-    enum class storage_type {
-        vector,
-        set,
-    };
-    storage_type _type = storage_type::vector;
     size_type _size = 0;
-
-    using map_type = boost::intrusive::set<cell_entry,
-        boost::intrusive::member_hook<cell_entry, boost::intrusive::set_member_hook<>, &cell_entry::_link>,
-        boost::intrusive::compare<cell_entry::compare>, boost::intrusive::constant_time_size<false>>;
-public:
-    static constexpr size_t max_vector_size = 32;
-    static constexpr size_t internal_count = 5;
-private:
-    using vector_type = managed_vector<cell_and_hash, internal_count, size_type>;
-
-    struct vector_storage {
-        std::bitset<max_vector_size> present;
-        vector_type v;
-
-        vector_storage() = default;
-        vector_storage(const vector_storage&) = default;
-        vector_storage(vector_storage&& other) noexcept
-                : present(other.present)
-                , v(std::move(other.v)) {
-            other.present = {};
-        }
-    };
-
-    union storage {
-        storage() { }
-        ~storage() { }
-        map_type set;
-        vector_storage vector;
-    } _storage;
+    using sparse_array_type = compact_radix_tree::tree<cell_and_hash, column_id>;
+    sparse_array_type _cells;
 public:
     row();
     ~row();
@@ -171,8 +99,6 @@ public:
     row& operator=(row&& other) noexcept;
     size_t size() const { return _size; }
     bool empty() const { return _size == 0; }
-
-    void reserve(column_id);
 
     const atomic_cell_or_collection& cell_at(column_id id) const;
 
@@ -183,53 +109,17 @@ public:
 
     template<typename Func>
     void remove_if(Func&& func) {
-        if (_type == storage_type::vector) {
-            for (unsigned i = 0; i < _storage.vector.v.size(); i++) {
-                if (!_storage.vector.present.test(i)) {
-                    continue;
-                }
-                auto& c = _storage.vector.v[i].cell;
-                if (func(i, c)) {
-                    c = atomic_cell_or_collection();
-                    _storage.vector.present.reset(i);
-                    _size--;
-                }
+        _cells.weed([func, this] (column_id id, cell_and_hash& cah) {
+            if (!func(id, cah.cell)) {
+                return false;
             }
-        } else {
-            for (auto it = _storage.set.begin(); it != _storage.set.end();) {
-                if (func(it->id(), it->cell())) {
-                    auto& entry = *it;
-                    it = _storage.set.erase(it);
-                    current_allocator().destroy(&entry);
-                    _size--;
-                } else {
-                    ++it;
-                }
-            }
-        }
+
+            _size--;
+            return true;
+        });
     }
 
 private:
-    auto get_range_vector() const {
-        auto id_range = boost::irange<column_id>(0, _storage.vector.v.size());
-        return boost::combine(id_range, _storage.vector.v)
-        | boost::adaptors::filtered([this] (const boost::tuple<const column_id&, const cell_and_hash&>& t) {
-            return _storage.vector.present.test(t.get<0>());
-        }) | boost::adaptors::transformed([] (const boost::tuple<const column_id&, const cell_and_hash&>& t) {
-            return std::pair<column_id, const atomic_cell_or_collection&>(t.get<0>(), t.get<1>().cell);
-        });
-    }
-    auto get_range_set() const {
-        auto range = boost::make_iterator_range(_storage.set.begin(), _storage.set.end());
-        return range | boost::adaptors::transformed([] (const cell_entry& c) {
-            return std::pair<column_id, const atomic_cell_or_collection&>(c.id(), c.cell());
-        });
-    }
-    template<typename Func>
-    auto with_both_ranges(const row& other, Func&& func) const;
-
-    void vector_to_set();
-
     template<typename Func>
     void consume_with(Func&&);
 
@@ -249,45 +139,25 @@ public:
     // noexcept if Func doesn't throw.
     template<typename Func>
     void for_each_cell(Func&& func) {
-        if (_type == storage_type::vector) {
-            for (auto i : bitsets::for_each_set(_storage.vector.present)) {
-                maybe_invoke_with_hash(func, i, _storage.vector.v[i]);
-            }
-        } else {
-            for (auto& cell : _storage.set) {
-                maybe_invoke_with_hash(func, cell.id(), cell.get_cell_and_hash());
-            }
-        }
+        _cells.walk([func] (column_id id, cell_and_hash& cah) {
+            maybe_invoke_with_hash(func, id, cah);
+            return true;
+        });
     }
 
     template<typename Func>
     void for_each_cell(Func&& func) const {
-        if (_type == storage_type::vector) {
-            for (auto i : bitsets::for_each_set(_storage.vector.present)) {
-                maybe_invoke_with_hash(func, i, _storage.vector.v[i]);
-            }
-        } else {
-            for (auto& cell : _storage.set) {
-                maybe_invoke_with_hash(func, cell.id(), cell.get_cell_and_hash());
-            }
-        }
+        _cells.walk([func] (column_id id, const cell_and_hash& cah) {
+            maybe_invoke_with_hash(func, id, cah);
+            return true;
+        });
     }
 
     template<typename Func>
     void for_each_cell_until(Func&& func) const {
-        if (_type == storage_type::vector) {
-            for (auto i : bitsets::for_each_set(_storage.vector.present)) {
-                if (maybe_invoke_with_hash(func, i, _storage.vector.v[i]) == stop_iteration::yes) {
-                    break;
-                }
-            }
-        } else {
-            for (auto& cell : _storage.set) {
-                if (maybe_invoke_with_hash(func, cell.id(), cell.get_cell_and_hash()) == stop_iteration::yes) {
-                    break;
-                }
-            }
-        }
+        _cells.walk([func] (column_id id, const cell_and_hash& cah) {
+            return maybe_invoke_with_hash(func, id, cah) != stop_iteration::yes;
+        });
     }
 
     // Merges cell's value into the row.
@@ -423,7 +293,7 @@ public:
 
     void reserve(column_id nr) {
         if (nr) {
-            maybe_create().reserve(nr);
+            maybe_create();
         }
     }
 
@@ -1012,7 +882,7 @@ class cache_tracker;
 class rows_entry {
     using lru_link_type = bi::list_member_hook<bi::link_mode<bi::auto_unlink>>;
     friend class size_calculator;
-    intrusive_set_external_comparator_member_hook _link;
+    intrusive_b::member_hook _link;
     clustering_key _key;
     deletable_row _row;
     lru_link_type _lru_link;
@@ -1028,7 +898,6 @@ class rows_entry {
         flags() : _before_ck(0), _after_ck(0), _continuous(true), _dummy(false), _last_dummy(false) { }
     } _flags{};
 public:
-    using container_type = intrusive_set_external_comparator<rows_entry, &rows_entry::_link>;
     using lru_type = bi::list<rows_entry,
         bi::member_hook<rows_entry, rows_entry::lru_link_type, &rows_entry::_lru_link>,
         bi::constant_time_size<false>>; // we need this to have bi::auto_unlink on hooks.
@@ -1126,30 +995,9 @@ public:
     struct compare {
         tri_compare _c;
         explicit compare(const schema& s) : _c(s) {}
-        bool operator()(const rows_entry& e1, const rows_entry& e2) const {
-            return _c(e1, e2) < 0;
-        }
-        bool operator()(const clustering_key& key, const rows_entry& e) const {
-            return _c(key, e) < 0;
-        }
-        bool operator()(const rows_entry& e, const clustering_key& key) const {
-            return _c(e, key) < 0;
-        }
-        bool operator()(const clustering_key_view& key, const rows_entry& e) const {
-            return _c(key, e) < 0;
-        }
-        bool operator()(const rows_entry& e, const clustering_key_view& key) const {
-            return _c(e, key) < 0;
-        }
-        bool operator()(const rows_entry& e, position_in_partition_view p) const {
-            return _c(e.position(), p) < 0;
-        }
-        bool operator()(position_in_partition_view p, const rows_entry& e) const {
-            return _c(p, e.position()) < 0;
-        }
-        bool operator()(position_in_partition_view p1, position_in_partition_view p2) const {
-            return _c(p1, p2) < 0;
-        }
+
+        template <typename K1, typename K2>
+        bool operator()(const K1& k1, const K2& k2) const { return _c(k1, k2) < 0; }
     };
     bool equal(const schema& s, const rows_entry& other) const;
     bool equal(const schema& s, const rows_entry& other, const schema& other_schema) const;
@@ -1168,6 +1016,8 @@ public:
         friend std::ostream& operator<<(std::ostream& os, const printer& p);
     };
     friend std::ostream& operator<<(std::ostream& os, const printer& p);
+
+    using container_type = intrusive_b::tree<rows_entry, &rows_entry::_link, rows_entry::tri_compare, 12, 20, intrusive_b::key_search::linear>;
 };
 
 struct mutation_application_stats {
@@ -1439,6 +1289,10 @@ public:
     deletable_row& clustered_row(const schema& s, clustering_key&& key);
     deletable_row& clustered_row(const schema& s, clustering_key_view key);
     deletable_row& clustered_row(const schema& s, position_in_partition_view pos, is_dummy, is_continuous);
+    // Throws if the row already exists or if the row was not inserted to the
+    // last position (one or more greater row already exists).
+    // Weak exception guarantees.
+    deletable_row& append_clustered_row(const schema& s, position_in_partition_view pos, is_dummy, is_continuous);
 public:
     tombstone partition_tombstone() const { return _tombstone; }
     lazy_row& static_row() { return _static_row; }
@@ -1464,11 +1318,6 @@ public:
         return boost::make_iterator_range(_rows.begin(), _rows.end())
             | boost::adaptors::filtered([] (const rows_entry& e) { return bool(!e.dummy()); });
     }
-    // Writes this partition using supplied query result writer.
-    // The partition should be first compacted with compact_for_query(), otherwise
-    // results may include data which is deleted/expired.
-    // At most row_limit CQL rows will be written and digested.
-    void query_compacted(query::result::partition_writer& pw, const schema& s, uint64_t row_limit) const;
     void accept(const schema&, mutation_partition_visitor&) const;
 
     // Returns the number of live CQL rows in this partition.

@@ -29,6 +29,7 @@
 #include "test/lib/memtable_snapshot_source.hh"
 #include "test/lib/log.hh"
 #include "test/lib/reader_permit.hh"
+#include "test/lib/random_utils.hh"
 
 using namespace std::chrono_literals;
 
@@ -183,10 +184,10 @@ public:
         }
         return delegating_reader<flat_mutation_reader>::fill_buffer(timeout);
     }
-    virtual void next_partition() override {
+    virtual future<> next_partition() override {
         _count_fill_buffer = false;
         ++_counter;
-        delegating_reader<flat_mutation_reader>::next_partition();
+        return delegating_reader<flat_mutation_reader>::next_partition();
     }
 };
 
@@ -849,8 +850,8 @@ SEASTAR_TEST_CASE(test_eviction) {
             cache.populate(m);
         }
 
-        std::random_device random;
-        std::shuffle(keys.begin(), keys.end(), std::default_random_engine(random()));
+        auto& random = seastar::testing::local_random_engine;
+        std::shuffle(keys.begin(), keys.end(), random);
 
         for (auto&& key : keys) {
             auto pr = dht::partition_range::make_singular(key);
@@ -888,8 +889,8 @@ SEASTAR_TEST_CASE(test_eviction_from_invalidated) {
             cache.populate(m);
         }
 
-        std::random_device random;
-        std::shuffle(keys.begin(), keys.end(), std::default_random_engine(random()));
+        auto& random = seastar::testing::local_random_engine;
+        std::shuffle(keys.begin(), keys.end(), random);
 
         for (auto&& key : keys) {
             cache.make_reader(s, tests::make_permit(), dht::partition_range::make_singular(key));
@@ -899,8 +900,20 @@ SEASTAR_TEST_CASE(test_eviction_from_invalidated) {
 
         std::vector<sstring> tmp;
         auto alloc_size = logalloc::segment_size * 10;
-        while (tracker.region().occupancy().total_space() > alloc_size) {
-            tmp.push_back(uninitialized_string(alloc_size));
+        /*
+         * Now allocate huge chunks on the region until it gives up
+         * with bad_alloc. At that point the region must not have more
+         * memory than the chunk size, neither it must contain rows
+         * or partitions (except for dummy entries)
+         */
+        try {
+            while (true) {
+                tmp.push_back(uninitialized_string(alloc_size));
+            }
+        } catch (const std::bad_alloc&) {
+            BOOST_REQUIRE(tracker.region().occupancy().total_space() < alloc_size);
+            BOOST_REQUIRE(tracker.get_stats().partitions == 0);
+            BOOST_REQUIRE(tracker.get_stats().rows == 0);
         }
     });
 }
@@ -1560,7 +1573,7 @@ SEASTAR_TEST_CASE(test_mvcc) {
 
             auto m12 = m1 + m2;
 
-            std::optional<flat_mutation_reader> mt1_reader_opt;
+            flat_mutation_reader_opt mt1_reader_opt;
             if (with_active_memtable_reader) {
                 mt1_reader_opt = mt1->make_flat_reader(s, tests::make_permit());
                 mt1_reader_opt->set_max_buffer_size(1);
@@ -2290,7 +2303,7 @@ SEASTAR_TEST_CASE(test_exception_safety_of_update_from_memtable) {
 
             populate_range(cache, population_range);
             auto rd1_v1 = assert_that(make_reader(population_range));
-            std::optional<flat_mutation_reader> snap;
+            flat_mutation_reader_opt snap;
 
             auto d = defer([&] {
                 memory::scoped_critical_alloc_section dfg;
@@ -2662,8 +2675,7 @@ SEASTAR_TEST_CASE(test_random_row_population) {
             }
         }
 
-        std::random_device rnd;
-        std::default_random_engine rng(rnd());
+        auto& rng = seastar::testing::local_random_engine;
         std::shuffle(ranges.begin(), ranges.end(), rng);
 
         struct read {
@@ -3586,5 +3598,62 @@ SEASTAR_TEST_CASE(test_reading_progress_with_small_buffer_and_invalidation) {
         }
 
         assert_that(result).is_equal_to(m1);
+    });
+}
+
+SEASTAR_TEST_CASE(test_scans_erase_dummies) {
+    return seastar::async([] {
+        simple_schema s;
+        auto cache_mt = make_lw_shared<memtable>(s.schema());
+
+        auto pkey = s.make_pkey("pk");
+
+        // underlying should not be empty, otherwise cache will make the whole range continuous
+        mutation m1(s.schema(), pkey);
+        s.add_row(m1, s.make_ckey(0), "v1");
+        cache_mt->apply(m1);
+
+        cache_tracker tracker;
+        row_cache cache(s.schema(), snapshot_source_from_snapshot(cache_mt->as_data_source()), tracker);
+
+        auto pr = dht::partition_range::make_singular(pkey);
+
+        auto populate_range = [&] (int start, int end) {
+            auto slice = partition_slice_builder(*s.schema())
+                    .with_range(query::clustering_range::make(s.make_ckey(start), s.make_ckey(end)))
+                    .build();
+            assert_that(cache.make_reader(s.schema(), tests::make_permit(), pr, slice))
+                    .produces_partition_start(pkey)
+                    .produces_partition_end()
+                    .produces_end_of_stream();
+        };
+
+        populate_range(10, 20);
+
+        // Expect 3 dummies, 2 for the last query's bounds and 1 for the last dummy.
+        BOOST_REQUIRE_EQUAL(tracker.get_stats().rows, 3);
+
+        populate_range(5, 15);
+
+        BOOST_REQUIRE_EQUAL(tracker.get_stats().rows, 3);
+
+        populate_range(16, 21);
+
+        BOOST_REQUIRE_EQUAL(tracker.get_stats().rows, 3);
+
+        populate_range(30, 31);
+
+        BOOST_REQUIRE_EQUAL(tracker.get_stats().rows, 5);
+
+        populate_range(2, 40);
+
+        BOOST_REQUIRE_EQUAL(tracker.get_stats().rows, 3);
+
+        // full scan
+        assert_that(cache.make_reader(s.schema(), tests::make_permit()))
+            .produces(m1)
+            .produces_end_of_stream();
+
+        BOOST_REQUIRE_EQUAL(tracker.get_stats().rows, 2);
     });
 }

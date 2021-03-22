@@ -69,7 +69,7 @@ const sstring cf_prop_defs::COMPACTION_STRATEGY_CLASS_KEY = "class";
 
 const sstring cf_prop_defs::COMPACTION_ENABLED_KEY = "enabled";
 
-schema::extensions_map cf_prop_defs::make_schema_extensions(const db::extensions& exts) {
+schema::extensions_map cf_prop_defs::make_schema_extensions(const db::extensions& exts) const {
     schema::extensions_map er;
     for (auto& p : exts.schema_extensions()) {
         auto i = _properties.find(p.first);
@@ -149,6 +149,7 @@ void cf_prop_defs::validate(const database& db, const schema::extensions_map& sc
     }
 
     validate_minimum_int(KW_DEFAULT_TIME_TO_LIVE, 0, DEFAULT_DEFAULT_TIME_TO_LIVE);
+    validate_minimum_int(KW_PAXOSGRACESECONDS, 0, DEFAULT_GC_GRACE_SECONDS);
 
     auto min_index_interval = get_int(KW_MIN_INDEX_INTERVAL, DEFAULT_MIN_INDEX_INTERVAL);
     auto max_index_interval = get_int(KW_MAX_INDEX_INTERVAL, DEFAULT_MAX_INDEX_INTERVAL);
@@ -226,7 +227,7 @@ const cdc::options* cf_prop_defs::get_cdc_options(const schema::extensions_map& 
     return &cdc_ext->get_options();
 }
 
-void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions) {
+void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions) const {
     if (has_property(KW_COMMENT)) {
         builder.set_comment(get_string(KW_COMMENT, ""));
     }

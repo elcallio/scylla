@@ -395,7 +395,7 @@ row_marker view_updates::compute_row_marker(const clustering_row& base_row) cons
 
 deletable_row& view_updates::get_view_row(const partition_key& base_key, const clustering_row& update) {
     std::vector<bytes> linearized_values;
-    auto get_value = boost::adaptors::transformed([&, this] (const column_definition& cdef) -> bytes_view {
+    auto get_value = boost::adaptors::transformed([&, this] (const column_definition& cdef) -> managed_bytes_view {
         auto* base_col = _base->get_column_definition(cdef.name());
         if (!base_col) {
             bytes_opt computed_value;
@@ -412,7 +412,7 @@ deletable_row& view_updates::get_view_row(const partition_key& base_key, const c
             if (!computed_value) {
                 throw std::logic_error(format("No value computed for primary key column {}", cdef.name()));
             }
-            return linearized_values.emplace_back(*computed_value);
+            return managed_bytes_view(linearized_values.emplace_back(*computed_value));
         }
         switch (base_col->kind) {
         case column_kind::partition_key:
@@ -422,10 +422,7 @@ deletable_row& view_updates::get_view_row(const partition_key& base_key, const c
         default:
             auto& c = update.cells().cell_at(base_col->id);
             auto value_view = base_col->is_atomic() ? c.as_atomic_cell(cdef).value() : c.as_collection_mutation().data;
-            if (value_view.is_fragmented()) {
-                return linearized_values.emplace_back(value_view.linearize());
-            }
-            return value_view.first_fragment();
+            return value_view;
         }
     });
     auto& partition = partition_for(partition_key::from_range(_view->partition_key_columns() | get_value));
@@ -1189,7 +1186,7 @@ future<> mutate_MV(
         auto& keyspace_name = mut.s->ks_name();
         auto target_endpoint = get_view_natural_endpoint(keyspace_name, base_token, view_token);
         auto remote_endpoints = service::get_local_storage_service().get_token_metadata().pending_endpoints_for(view_token, keyspace_name);
-        auto maybe_account_failure = [tr_state, &stats, &cf_stats, units = pending_view_updates.split(mut.fm.representation().size())] (
+        auto maybe_account_failure = [s = mut.s, tr_state, &stats, &cf_stats, base_token, view_token, units = pending_view_updates.split(mut.fm.representation().size())] (
                 future<>&& f,
                 gms::inet_address target,
                 bool is_local,
@@ -1202,7 +1199,8 @@ future<> mutate_MV(
                 auto ep = f.get_exception();
                 tracing::trace(tr_state, "Failed to apply {}view update for {} and {} remote endpoints",
                         seastar::value_of([is_local]{return is_local ? "local " : "";}), target, remotes);
-                vlogger.error("Error applying view update to {}: {}", target, ep);
+                vlogger.error("Error applying view update to {} (view: {}.{}, base token: {}, view token: {}): {}",
+                        target, s->ks_name(), s->cf_name(), base_token, view_token, ep);
                 return make_exception_future<>(std::move(ep));
             } else {
                 tracing::trace(tr_state, "Successfully applied {}view update for {} and {} remote endpoints",

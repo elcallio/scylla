@@ -64,6 +64,19 @@ def cql(request):
     )
     return cluster.connect()
 
+# A function-scoped autouse=True fixture allows us to test after every test
+# that the CQL connection is still alive - and if not report the test which
+# crashed Scylla and stop running any more tests.
+@pytest.fixture(scope="function", autouse=True)
+def cql_test_connection(cql, request):
+    yield
+    try:
+        # We want to run a do-nothing CQL command. "use system" is the
+        # closest to do-nothing I could find...
+        cql.execute("use system")
+    except:
+        pytest.exit(f"Scylla appears to have crashed in test {request.node.parent.name}::{request.node.name}")
+
 # "test_keyspace" fixture: Creates and returns a temporary keyspace to be
 # used in tests that need a keyspace. The keyspace is created with RF=1,
 # and automatically deleted at the end. We use scope="session" so that all
@@ -85,6 +98,18 @@ def scylla_only(cql):
     names = [row.table_name for row in cql.execute("SELECT * FROM system_schema.tables WHERE keyspace_name = 'system'")]
     if not any('scylla' in name for name in names):
         pytest.skip('Scylla-only test skipped')
+
+# "cassandra_bug" is similar to "scylla_only", except instead of skipping
+# the test, it is expected to fail (xfail) on Cassandra. It should be used
+# in rare cases where we consider Scylla's behavior to be the correct one,
+# and Cassandra's to be the bug.
+@pytest.fixture(scope="session")
+def cassandra_bug(cql):
+    # We recognize Scylla by checking if there is any system table whose name
+    # contains the word "scylla":
+    names = [row.table_name for row in cql.execute("SELECT * FROM system_schema.tables WHERE keyspace_name = 'system'")]
+    if not any('scylla' in name for name in names):
+        pytest.xfail('A known Cassandra bug')
 
 # TODO: use new_test_table and "yield from" to make shared test_table
 # fixtures with some common schemas.

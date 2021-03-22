@@ -26,7 +26,7 @@ namespace cache {
 class autoupdating_underlying_reader final {
     row_cache& _cache;
     read_context& _read_context;
-    std::optional<flat_mutation_reader> _reader;
+    flat_mutation_reader_opt _reader;
     utils::phased_barrier::phase_type _reader_creation_phase = 0;
     dht::partition_range _range = { };
     std::optional<dht::decorated_key> _last_key;
@@ -59,8 +59,8 @@ public:
             _reader = _cache.create_underlying_reader(_read_context, snap, _range);
             _reader_creation_phase = phase;
         }
-        _reader->next_partition();
 
+      return _reader->next_partition().then([this, timeout] {
         if (_reader->is_end_of_stream() && _reader->is_buffer_empty()) {
             return make_ready_future<mutation_fragment_opt>();
         }
@@ -71,6 +71,7 @@ public:
             }
             return std::move(mfopt);
         });
+      });
     }
     future<> fast_forward_to(dht::partition_range&& range, db::timeout_clock::time_point timeout) {
         auto snapshot_and_phase = _cache.snapshot_of(dht::ring_position_view::for_range_start(_range));
@@ -148,11 +149,11 @@ public:
         , _pc(pc)
         , _trace_state(std::move(trace_state))
         , _fwd_mr(fwd_mr)
-        , _range_query(!range.is_singular() || !range.start()->value().has_key())
+        , _range_query(!query::is_single_partition(range))
         , _underlying(_cache, *this)
     {
         ++_cache._tracker._stats.reads;
-        if (range.is_singular() && range.start()->value().has_key()) {
+        if (!_range_query) {
             _key = range.start()->value().as_decorated_key();
         }
     }

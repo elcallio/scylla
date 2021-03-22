@@ -83,6 +83,7 @@ private:
     gms::feature _digest_for_null_values_feature;
     gms::feature _correct_idx_token_in_secondary_index_feature;
     gms::feature _alternator_streams_feature;
+    gms::feature _range_scan_data_variant;
     gms::feature _in_memory_tables;
     gms::feature _workload_prioritization;
 
@@ -138,8 +139,8 @@ public:
         return _digest_insensitive_to_expiry;
     }
 
-    bool cluster_supports_computed_columns() const {
-        return bool(_computed_columns);
+    const feature& cluster_supports_computed_columns() const {
+        return _computed_columns;
     }
 
     bool cluster_supports_nonfrozen_udts() const {
@@ -160,6 +161,12 @@ public:
 
     bool cluster_supports_alternator_streams() const {
         return bool(_alternator_streams_feature);
+    }
+
+    // Range scans have a data variant, which produces query::result directly,
+    // instead of through the intermediate reconcilable_result format.
+    bool cluster_supports_range_scan_data_variant() const {
+        return bool(_range_scan_data_variant);
     }
 
     const gms::feature& cluster_supports_in_memory_tables() const {

@@ -28,9 +28,12 @@
 #include "partition_slice_builder.hh"
 #include "test/lib/test_services.hh"
 #include "cell_locking.hh"
-#include "sstables/data_consume_context.hh"
+#include "sstables/sstable_mutation_reader.hh"
+#include "sstables/kl/reader_impl.hh"
 
 using namespace sstables;
+using row_consumer = sstables::kl::row_consumer;
+using data_consume_rows_context = sstables::kl::data_consume_rows_context;
 
 bytes as_bytes(const sstring& s) {
     return { reinterpret_cast<const int8_t*>(s.data()), s.size() };
@@ -162,7 +165,7 @@ SEASTAR_TEST_CASE(missing_summary_first_last_sane) {
 }
 
 static future<sstable_ptr> do_write_sst(test_env& env, schema_ptr schema, sstring load_dir, sstring write_dir, unsigned long generation) {
-    return env.reusable_sst(std::move(schema), load_dir, generation, la).then([write_dir, generation] (sstable_ptr sst) {
+    return env.reusable_sst(std::move(schema), load_dir, generation).then([write_dir, generation] (sstable_ptr sst) {
         sstables::test(sst).change_generation_number(generation + 1);
         sstables::test(sst).change_dir(write_dir);
         auto fut = sstables::test(sst).store();
@@ -234,7 +237,7 @@ future<>
 write_and_validate_sst(schema_ptr s, sstring dir, noncopyable_function<future<> (shared_sstable sst1, shared_sstable sst2)> func) {
     return test_env::do_with(tmpdir(), [s = std::move(s), dir = std::move(dir), func = std::move(func)] (test_env& env, tmpdir& tmp) mutable {
         return do_write_sst(env, s, dir, tmp.path().string(), 1).then([&env, &tmp, s = std::move(s), func = std::move(func)] (auto sst1) {
-            auto sst2 = env.make_sstable(s, tmp.path().string(), 2, la, big);
+            auto sst2 = env.make_sstable(s, tmp.path().string(), 2, sst1->get_version());
             return func(std::move(sst1), std::move(sst2));
         });
     });
@@ -407,7 +410,7 @@ SEASTAR_TEST_CASE(uncompressed_rows_read_one) {
     return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 1, [] (auto sstp) {
         return do_with(test_row_consumer(1418656871665302), [sstp] (auto& c) {
             auto context = data_consume_rows<data_consume_rows_context>(*uncompressed_schema(), sstp, c, {0, 95}, 95);
-            auto fut = context.read();
+            auto fut = context->consume_input();
             return fut.then([sstp, &c, context = std::move(context)] {
                 BOOST_REQUIRE(c.count_row_start == 1);
                 BOOST_REQUIRE(c.count_cell == 3);
@@ -425,7 +428,7 @@ SEASTAR_TEST_CASE(compressed_rows_read_one) {
     return test_using_reusable_sst(std::move(s), "test/resource/sstables/compressed", 1, [] (auto sstp) {
         return do_with(test_row_consumer(1418654707438005), [sstp] (auto& c) {
             auto context = data_consume_rows<data_consume_rows_context>(*uncompressed_schema(), sstp, c, {0, 95}, 95);
-            auto fut = context.read();
+            auto fut = context->consume_input();
             return fut.then([sstp, &c, context = std::move(context)] {
                 BOOST_REQUIRE(c.count_row_start == 1);
                 BOOST_REQUIRE(c.count_cell == 3);
@@ -494,7 +497,7 @@ SEASTAR_TEST_CASE(uncompressed_rows_read_all) {
     return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 1, [] (auto sstp) {
         return do_with(count_row_consumer(), [sstp] (auto& c) {
             auto context = data_consume_rows<data_consume_rows_context>(*uncompressed_schema(), sstp, c);
-            auto fut = context.read();
+            auto fut = context->consume_input();
             return fut.then([sstp, &c, context = std::move(context)] {
                 BOOST_REQUIRE(c.count_row_start == 4);
                 BOOST_REQUIRE(c.count_row_end == 4);
@@ -512,7 +515,7 @@ SEASTAR_TEST_CASE(compressed_rows_read_all) {
     return test_using_reusable_sst(std::move(s), "test/resource/sstables/compressed", 1, [] (auto sstp) {
         return do_with(count_row_consumer(), [sstp] (auto& c) {
             auto context = data_consume_rows<data_consume_rows_context>(*uncompressed_schema(), sstp, c);
-            auto fut = context.read();
+            auto fut = context->consume_input();
             return fut.then([sstp, &c, context = std::move(context)] {
                 BOOST_REQUIRE(c.count_row_start == 4);
                 BOOST_REQUIRE(c.count_row_end == 4);
@@ -539,7 +542,7 @@ SEASTAR_TEST_CASE(pausable_uncompressed_rows_read_all) {
     return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 1, [] (auto sstp) {
         return do_with(pausable_count_row_consumer(), [sstp] (auto& c) {
             auto context = data_consume_rows<data_consume_rows_context>(*uncompressed_schema(), sstp, c);
-            auto fut = context.read();
+            auto fut = context->consume_input();
             return fut.then([sstp, &c, context = std::move(context)] () mutable {
                 // After one read, we only get one row
                 BOOST_REQUIRE(c.count_row_start == 1);
@@ -547,7 +550,7 @@ SEASTAR_TEST_CASE(pausable_uncompressed_rows_read_all) {
                 BOOST_REQUIRE(c.count_cell == 1*3);
                 BOOST_REQUIRE(c.count_deleted_cell == 0);
                 BOOST_REQUIRE(c.count_range_tombstone == 0);
-                auto fut = context.read();
+                auto fut = context->consume_input();
                 return fut.then([&c, context = std::move(context)] () mutable {
                     // After two reads
                     BOOST_REQUIRE(c.count_row_start == 2);
@@ -586,7 +589,7 @@ SEASTAR_TEST_CASE(read_set) {
     return test_using_reusable_sst(set_schema(), "test/resource/sstables/set", 1, [] (auto sstp) {
         return do_with(set_consumer(), [sstp] (auto& c) {
             auto context = data_consume_rows<data_consume_rows_context>(*uncompressed_schema(), sstp, c);
-            auto fut = context.read();
+            auto fut = context->consume_input();
             return fut.then([sstp, &c, context = std::move(context)] {
                 BOOST_REQUIRE(c.count_row_start == 1);
                 BOOST_REQUIRE(c.count_row_end == 1);
@@ -643,7 +646,7 @@ SEASTAR_TEST_CASE(ttl_read) {
     return test_using_reusable_sst(uncompressed_schema(), "test/resource/sstables/ttl", 1, [] (auto sstp) {
         return do_with(ttl_row_consumer(1430151018675502), [sstp] (auto& c) {
             auto context = data_consume_rows<data_consume_rows_context>(*uncompressed_schema(), sstp, c);
-            auto fut = context.read();
+            auto fut = context->consume_input();
             return fut.then([sstp, &c, context = std::move(context)] {
                 BOOST_REQUIRE(c.count_row_start == 1);
                 BOOST_REQUIRE(c.count_cell == 2);
@@ -682,7 +685,7 @@ SEASTAR_TEST_CASE(deleted_cell_read) {
     return test_using_reusable_sst(uncompressed_schema(), "test/resource/sstables/deleted_cell", 2, [] (auto sstp) {
         return do_with(deleted_cell_row_consumer(), [sstp] (auto& c) {
             auto context = data_consume_rows<data_consume_rows_context>(*uncompressed_schema(), sstp, c);
-            auto fut = context.read();
+            auto fut = context->consume_input();
             return fut.then([sstp, &c, context = std::move(context)] {
                 BOOST_REQUIRE(c.count_row_start == 1);
                 BOOST_REQUIRE(c.count_cell == 0);
@@ -828,10 +831,10 @@ SEASTAR_TEST_CASE(not_find_key_composite_bucket0) {
 // See CASSANDRA-7593. This sstable writes 0 in the range_start. We need to handle that case as well
 SEASTAR_TEST_CASE(wrong_range) {
     return test_using_reusable_sst(uncompressed_schema(), "test/resource/sstables/wrongrange", 114, [] (auto sstp) {
-        return do_with(make_dkey(uncompressed_schema(), "todata"), [sstp] (auto& key) {
+        return do_with(dht::partition_range::make_singular(make_dkey(uncompressed_schema(), "todata")), [sstp] (auto& range) {
             auto s = columns_schema();
-            auto rd = make_lw_shared<flat_mutation_reader>(sstp->read_row_flat(s, tests::make_permit(), key));
-            return read_mutation_from_flat_mutation_reader(*rd, db::no_timeout).then([sstp, s, &key, rd] (auto mutation) {
+            auto rd = make_lw_shared<flat_mutation_reader>(sstp->make_reader(s, tests::make_permit(), range, s->full_slice()));
+            return read_mutation_from_flat_mutation_reader(*rd, db::no_timeout).then([sstp, s, rd] (auto mutation) {
                 return make_ready_future<>();
             });
         });
@@ -965,8 +968,8 @@ static query::partition_slice make_partition_slice(const schema& s, sstring ck1,
 static future<int> count_rows(sstable_ptr sstp, schema_ptr s, sstring key, sstring ck1, sstring ck2) {
     return seastar::async([sstp, s, key, ck1, ck2] () mutable {
         auto ps = make_partition_slice(*s, ck1, ck2);
-        auto dkey = make_dkey(s, key.c_str());
-        auto rd = sstp->read_row_flat(s, tests::make_permit(), dkey, ps);
+        auto pr = dht::partition_range::make_singular(make_dkey(s, key.c_str()));
+        auto rd = sstp->make_reader(s, tests::make_permit(), pr, ps);
         auto mfopt = rd(db::no_timeout).get0();
         if (!mfopt) {
             return 0;
@@ -986,8 +989,8 @@ static future<int> count_rows(sstable_ptr sstp, schema_ptr s, sstring key, sstri
 // Count the number of CQL rows in one partition
 static future<int> count_rows(sstable_ptr sstp, schema_ptr s, sstring key) {
     return seastar::async([sstp, s, key] () mutable {
-        auto dkey = make_dkey(s, key.c_str());
-        auto rd = sstp->read_row_flat(s, tests::make_permit(), dkey);
+        auto pr = dht::partition_range::make_singular(make_dkey(s, key.c_str()));
+        auto rd = sstp->make_reader(s, tests::make_permit(), pr, s->full_slice());
         auto mfopt = rd(db::no_timeout).get0();
         if (!mfopt) {
             return 0;
@@ -1009,7 +1012,7 @@ static future<int> count_rows(sstable_ptr sstp, schema_ptr s, sstring key) {
 static future<int> count_rows(sstable_ptr sstp, schema_ptr s, sstring ck1, sstring ck2) {
     return seastar::async([sstp, s, ck1, ck2] () mutable {
         auto ps = make_partition_slice(*s, ck1, ck2);
-        auto reader = sstp->read_range_rows_flat(s, tests::make_permit(), query::full_partition_range, ps);
+        auto reader = sstp->make_reader(s, tests::make_permit(), query::full_partition_range, ps);
         int nrows = 0;
         auto mfopt = reader(db::no_timeout).get0();
         while (mfopt) {

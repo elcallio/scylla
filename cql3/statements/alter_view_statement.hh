@@ -39,20 +39,22 @@
 
 namespace cql3 {
 
+class query_processor;
+
 namespace statements {
 
 /** An <code>ALTER MATERIALIZED VIEW</code> parsed from a CQL query statement. */
 class alter_view_statement : public schema_altering_statement {
 private:
-    ::shared_ptr<cf_prop_defs> _properties;
+    std::optional<cf_prop_defs> _properties;
 public:
-    alter_view_statement(::shared_ptr<cf_name> view_name, ::shared_ptr<cf_prop_defs> properties);
+    alter_view_statement(cf_name view_name, std::optional<cf_prop_defs> properties);
 
     virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
     virtual void validate(service::storage_proxy&, const service::client_state& state) const override;
 
-    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy) const override;
+    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(query_processor& qp) const override;
 
     virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 };

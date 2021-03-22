@@ -21,6 +21,7 @@
 #include "cdc/split.hh"
 #include "cdc/cdc_options.hh"
 #include "cdc/change_visitor.hh"
+#include "cdc/metadata.hh"
 #include "bytes.hh"
 #include "database.hh"
 #include "db/config.hh"
@@ -37,6 +38,7 @@
 #include "cql3/untyped_result_set.hh"
 #include "log.hh"
 #include "utils/rjson.hh"
+#include "utils/UUID_gen.hh"
 #include "types.hh"
 #include "concrete_types.hh"
 #include "types/listlike_partial_deserializing_iterator.hh"
@@ -266,8 +268,8 @@ private:
     }
 };
 
-cdc::cdc_service::cdc_service(service::storage_proxy& proxy)
-    : cdc_service(db_context::builder(proxy).build())
+cdc::cdc_service::cdc_service(service::storage_proxy& proxy, cdc::metadata& cdc_metadata)
+    : cdc_service(db_context::builder(proxy, cdc_metadata).build())
 {}
 
 cdc::cdc_service::cdc_service(db_context ctxt)
@@ -559,8 +561,8 @@ static schema_ptr create_log_schema(const schema& s, std::optional<utils::UUID> 
     return b.build();
 }
 
-db_context::builder::builder(service::storage_proxy& proxy) 
-    : _proxy(proxy) 
+db_context::builder::builder(service::storage_proxy& proxy, cdc::metadata& cdc_metadata)
+    : _proxy(proxy), _cdc_metadata(cdc_metadata)
 {}
 
 db_context::builder& db_context::builder::with_migration_notifier(service::migration_notifier& migration_notifier) {
@@ -568,16 +570,11 @@ db_context::builder& db_context::builder::with_migration_notifier(service::migra
     return *this;
 }
 
-db_context::builder& db_context::builder::with_cdc_metadata(cdc::metadata& cdc_metadata) {
-    _cdc_metadata = cdc_metadata;
-    return *this;
-}
-
 db_context db_context::builder::build() {
     return db_context{
         _proxy,
         _migration_notifier ? _migration_notifier->get() : service::get_local_storage_service().get_migration_notifier(),
-        _cdc_metadata ? _cdc_metadata->get() : service::get_local_storage_service().get_cdc_metadata(),
+        _cdc_metadata,
     };
 }
 
@@ -805,13 +802,13 @@ static bytes_opt get_preimage_col_value(const column_definition& cdef, const cql
                 auto v = pirow->get_view(cdef.name_as_text());
                 auto f = cql_serialization_format::internal();
                 auto n = read_collection_size(v, f);
-                std::vector<bytes_view> tmp;
+                std::vector<bytes> tmp;
                 tmp.reserve(n);
                 while (n--) {
-                    tmp.emplace_back(read_collection_value(v, f)); // key
+                    tmp.emplace_back(read_collection_value(v, f).linearize()); // key
                     read_collection_value(v, f); // value. ignore.
                 }
-                return set_type_impl::serialize_partially_deserialized_form(tmp, f);
+                return set_type_impl::serialize_partially_deserialized_form({tmp.begin(), tmp.end()}, f);
             },
             [&] (const abstract_type& o) -> bytes {
                 return pirow->get_blob(cdef.name_as_text());
@@ -967,13 +964,13 @@ private:
 };
 
 static bytes get_bytes(const atomic_cell_view& acv) {
-    return acv.value().linearize();
+    return to_bytes(acv.value());
 }
 
-static bytes_view get_bytes_view(const atomic_cell_view& acv, std::vector<bytes>& buf) {
+static bytes_view get_bytes_view(const atomic_cell_view& acv, std::forward_list<bytes>& buf) {
     return acv.value().is_fragmented()
-        ? bytes_view{buf.emplace_back(acv.value().linearize())}
-        : acv.value().first_fragment();
+        ? bytes_view{buf.emplace_front(to_bytes(acv.value()))}
+        : acv.value().current_fragment();
 }
 
 static ttl_opt get_ttl(const atomic_cell_view& acv) {
@@ -1126,10 +1123,10 @@ struct process_row_visitor {
                 _touched_parts.set<stats::part_type::UDT>();
 
                 struct udt_visitor : public collection_visitor {
-                    std::vector<bytes_opt> _added_cells;
-                    std::vector<bytes>& _buf;
+                    std::vector<bytes_view_opt> _added_cells;
+                    std::forward_list<bytes>& _buf;
 
-                    udt_visitor(ttl_opt& ttl_column, size_t num_keys, std::vector<bytes>& buf)
+                    udt_visitor(ttl_opt& ttl_column, size_t num_keys, std::forward_list<bytes>& buf)
                         : collection_visitor(ttl_column), _added_cells(num_keys), _buf(buf) {}
 
                     void live_collection_cell(bytes_view key, const atomic_cell_view& cell) {
@@ -1138,7 +1135,7 @@ struct process_row_visitor {
                     }
                 };
 
-                std::vector<bytes> buf;
+                std::forward_list<bytes> buf;
                 udt_visitor v(_ttl_column, type.size(), buf);
 
                 visit_collection(v);
@@ -1157,9 +1154,9 @@ struct process_row_visitor {
 
                 struct map_or_list_visitor : public collection_visitor {
                     std::vector<std::pair<bytes_view, bytes_view>> _added_cells;
-                    std::vector<bytes>& _buf;
+                    std::forward_list<bytes>& _buf;
 
-                    map_or_list_visitor(ttl_opt& ttl_column, std::vector<bytes>& buf)
+                    map_or_list_visitor(ttl_opt& ttl_column, std::forward_list<bytes>& buf)
                         : collection_visitor(ttl_column), _buf(buf) {}
 
                     void live_collection_cell(bytes_view key, const atomic_cell_view& cell) {
@@ -1168,7 +1165,7 @@ struct process_row_visitor {
                     }
                 };
 
-                std::vector<bytes> buf;
+                std::forward_list<bytes> buf;
                 map_or_list_visitor v(_ttl_column, buf);
 
                 visit_collection(v);
@@ -1638,13 +1635,7 @@ public:
       try {
         return _ctx._proxy.query(_schema, std::move(command), std::move(partition_ranges), select_cl, service::storage_proxy::coordinator_query_options(default_timeout(), empty_service_permit(), client_state)).then(
                 [s = _schema, partition_slice = std::move(partition_slice), selection = std::move(selection)] (service::storage_proxy::coordinator_query_result qr) -> lw_shared_ptr<cql3::untyped_result_set> {
-                    cql3::selection::result_set_builder builder(*selection, gc_clock::now(), cql_serialization_format::latest());
-                    query::result_view::consume(*qr.query_result, partition_slice, cql3::selection::result_set_builder::visitor(builder, *s, *selection));
-                    auto result_set = builder.build();
-                    if (!result_set || result_set->empty()) {
-                        return {};
-                    }
-                    return make_lw_shared<cql3::untyped_result_set>(*result_set);
+            return make_lw_shared<cql3::untyped_result_set>(*s, std::move(qr.query_result), *selection, partition_slice);
         });
       } catch (exceptions::unavailable_exception& e) {
         // `query` can throw `unavailable_exception`, which is seen by clients as ~ "NoHostAvailable". 
@@ -1688,7 +1679,7 @@ public:
                     // as there will be no clustering row data to load into the state.
                     return;
                 }
-                ck_parts.emplace_back(*v);
+                ck_parts.emplace_back(v->linearize());
             }
             auto ck = clustering_key::from_exploded(std::move(ck_parts));
 

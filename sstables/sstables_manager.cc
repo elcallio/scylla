@@ -41,16 +41,19 @@ shared_sstable sstables_manager::make_sstable(schema_ptr schema,
     return make_lw_shared<sstable>(std::move(schema), std::move(dir), generation, v, f, get_large_data_handler(), *this, now, std::move(error_handler_gen), buffer_size);
 }
 
-sstable_writer_config sstables_manager::configure_writer() const {
+sstable_writer_config sstables_manager::configure_writer(sstring origin) const {
     sstable_writer_config cfg;
 
     cfg.promoted_index_block_size = _db_config.column_index_size_in_kb() * 1024;
-    cfg.validate_keys = _db_config.enable_sstable_key_validation();
+    cfg.validation_level = _db_config.enable_sstable_key_validation()
+            ? mutation_fragment_stream_validation_level::clustering_key
+            : mutation_fragment_stream_validation_level::token;
     cfg.summary_byte_cost = summary_byte_cost(_db_config.sstable_summary_ratio());
 
     cfg.correctly_serialize_non_compound_range_tombstones = true;
     cfg.correctly_serialize_static_compact_in_mc =
             bool(_features.cluster_supports_correct_static_compact_in_mc());
+    cfg.origin = std::move(origin);
 
     return cfg;
 }

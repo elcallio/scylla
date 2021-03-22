@@ -39,6 +39,7 @@
 #include "database.hh"
 #include "index/target_parser.hh"
 #include "gms/feature_service.hh"
+#include "cql3/query_processor.hh"
 
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/algorithm/string/join.hpp>
@@ -47,7 +48,7 @@ namespace cql3 {
 
 namespace statements {
 
-create_index_statement::create_index_statement(::shared_ptr<cf_name> name,
+create_index_statement::create_index_statement(cf_name name,
                                                ::shared_ptr<index_name> index_name,
                                                std::vector<::shared_ptr<index_target::raw>> raw_targets,
                                                ::shared_ptr<index_prop_defs> properties,
@@ -260,8 +261,8 @@ void create_index_statement::validate_targets_for_multi_column_index(std::vector
 }
 
 future<::shared_ptr<cql_transport::event::schema_change>>
-create_index_statement::announce_migration(service::storage_proxy& proxy) const {
-    auto& db = proxy.get_db().local();
+create_index_statement::announce_migration(query_processor& qp) const {
+    database& db = qp.db();
     auto schema = db.find_schema(keyspace(), column_family());
     std::vector<::shared_ptr<index_target>> targets;
     for (auto& raw_target : _raw_targets) {
@@ -298,7 +299,7 @@ create_index_statement::announce_migration(service::storage_proxy& proxy) const 
     ++_cql_stats->secondary_index_creates;
     schema_builder builder{schema};
     builder.with_index(index);
-    return service::get_local_migration_manager().announce_column_family_update(
+    return qp.get_migration_manager().announce_column_family_update(
             builder.build(), false, {}).then([this]() {
         using namespace cql_transport;
         return ::make_shared<event::schema_change>(

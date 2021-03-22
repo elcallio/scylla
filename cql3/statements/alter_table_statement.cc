@@ -40,15 +40,16 @@
 #include "view_info.hh"
 #include "database.hh"
 #include "db/view/view.hh"
+#include "cql3/query_processor.hh"
 
 namespace cql3 {
 
 namespace statements {
 
-alter_table_statement::alter_table_statement(shared_ptr<cf_name> name,
+alter_table_statement::alter_table_statement(cf_name name,
                                              type t,
                                              std::vector<column_change> column_changes,
-                                             shared_ptr<cf_prop_defs> properties,
+                                             std::optional<cf_prop_defs> properties,
                                              renames_type renames)
     : schema_altering_statement(std::move(name))
     , _type(t)
@@ -277,9 +278,9 @@ void alter_table_statement::drop_column(const schema& schema, const table& cf, s
     }
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> alter_table_statement::announce_migration(service::storage_proxy& proxy) const
+future<shared_ptr<cql_transport::event::schema_change>> alter_table_statement::announce_migration(query_processor& qp) const
 {
-    auto& db = proxy.get_db().local();
+    database& db = qp.db();
     auto s = validation::validate_column_family(db, keyspace(), column_family());
     if (s->is_view()) {
         throw exceptions::invalid_request_exception("Cannot use ALTER TABLE on Materialized View");
@@ -385,7 +386,7 @@ future<shared_ptr<cql_transport::event::schema_change>> alter_table_statement::a
         break;
     }
 
-    return service::get_local_migration_manager().announce_column_family_update(cfm.build(), false, std::move(view_updates))
+    return qp.get_migration_manager().announce_column_family_update(cfm.build(), false, std::move(view_updates))
         .then([this] {
             using namespace cql_transport;
             return ::make_shared<event::schema_change>(

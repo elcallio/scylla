@@ -50,6 +50,7 @@
 #include "schema.hh"
 #include "sstables/sstables.hh"
 #include "service/storage_service.hh"
+#include "service/migration_manager.hh"
 #include "db/commitlog/commitlog_extensions.hh"
 #include "encrypted_file_impl.hh"
 #include "encryption_config.hh"
@@ -173,6 +174,19 @@ future<> write_text_file_fully(const sstring& filename, const sstring& s) {
 
 static const sstring namespace_prefix = "com.datastax.bdp.cassandra.crypto.";
 static const sstring encryption_attribute = "scylla_encryption_options";
+
+static inline const sstring key_id_attribute = "scylla_key_id";
+static inline const sstring encrypted_components_attribute = "encrypted_components";
+
+static inline const sstables::disk_string<uint32_t> encryption_attribute_ds{
+    bytes{encryption_attribute.begin(), encryption_attribute.end()}
+};
+static inline const sstables::disk_string<uint32_t> key_id_attribute_ds{
+    bytes{key_id_attribute.begin(), key_id_attribute.end()}
+};
+static inline const sstables::disk_string<uint32_t> encrypted_components_attribute_ds{
+    bytes{encrypted_components_attribute.begin(), encrypted_components_attribute.end()}
+};
 
 key_info get_key_info(const options& map) {
     opt_wrapper opts(map);
@@ -323,6 +337,10 @@ public:
     distributed<database>& get_database() const override {
         return get_storage_service().local().db();
     }
+
+    distributed<service::migration_manager>& get_migration_manager() const override {
+        return service::get_migration_manager();
+    }
 };
 
 class encryption_schema_extension : public schema_extension {
@@ -419,19 +437,6 @@ public:
     encryption_file_io_extension(::shared_ptr<encryption_context> ctxt)
         : _ctxt(std::move(ctxt))
     {}
-
-    static inline const sstring key_id_attribute = "scylla_key_id";
-    static inline const sstring encrypted_components_attribute = "encrypted_components";
-
-    static inline const sstables::disk_string<uint32_t> encryption_attribute_ds{
-        bytes{encryption_attribute.begin(), encryption_attribute.end()}
-    };
-    static inline const sstables::disk_string<uint32_t> key_id_attribute_ds{
-        bytes{key_id_attribute.begin(), key_id_attribute.end()}
-    };
-    static inline const sstables::disk_string<uint32_t> encrypted_components_attribute_ds{
-        bytes{encrypted_components_attribute.begin(), encrypted_components_attribute.end()}
-    };
 
     attr_value_map get_attributes(const sstables::sstable& sst) const override {
         auto& sc = sst.get_shared_components();

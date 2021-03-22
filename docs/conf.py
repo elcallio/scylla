@@ -5,6 +5,7 @@ from datetime import date
 from sphinx.util import logging
 import recommonmark
 from recommonmark.transform import AutoStructify
+from sphinx_scylladb_theme.utils import multiversion_regex_builder
 
 logger = logging.getLogger(__name__)
 sys.path.insert(0, os.path.abspath('..'))
@@ -110,7 +111,7 @@ html_style = ''
 #
 html_theme_options = {
     'header_links': [
-    ('Scylla Developer Notes', 'https://scylladb.github.io/scylla'),
+    ('Scylla Developer Notes', 'https://scylla.docs.scylladb.com'),
     ('Scylla University', 'https://university.scylladb.com/'),
     ('ScyllaDB Home', 'https://www.scylladb.com/')],
     'github_issues_repository': 'scylladb/scylla',
@@ -133,7 +134,7 @@ html_sidebars = {'**': ['side-nav.html']}
 htmlhelp_basename = 'ScyllaDocumentationdoc'
 
 # URL which points to the root of the HTML documentation. 
-html_baseurl = 'https://scylladb.github.io/scylla'
+html_baseurl = 'https://scylla.docs.scylladb.com'
 
 # Dictionary of values to pass into the template engine’s context for all pages
 html_context = {'html_baseurl': html_baseurl}
@@ -153,9 +154,11 @@ redirects_file = "_utils/redirections.yaml"
 
 # -- Options for multiversion extension ----------------------------------
 # Whitelist pattern for tags (set to None to ignore all tags)
-smv_tag_whitelist = r'^.*$'
+TAGS = []
+smv_tag_whitelist = multiversion_regex_builder(TAGS)
 # Whitelist pattern for branches (set to None to ignore all branches)
-smv_branch_whitelist = r"^master$"
+BRANCHES = ['master']
+smv_branch_whitelist = multiversion_regex_builder(BRANCHES)
 # Whitelist pattern for remotes (set to None to use local branches only)
 smv_remote_whitelist = r"^origin$"
 # Pattern for released versions

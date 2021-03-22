@@ -56,6 +56,8 @@
 
 namespace cql3 {
 
+class query_processor;
+
 namespace statements {
 
 
@@ -257,7 +259,7 @@ public:
     bool has_only_static_column_conditions() const { return !_has_regular_column_conditions && _has_static_column_conditions; }
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(service::storage_proxy& proxy, service::query_state& qs, const query_options& options) const override;
+    execute(query_processor& qp, service::query_state& qs, const query_options& options) const override;
 
 private:
     future<>
@@ -288,7 +290,7 @@ protected:
      */
     virtual void validate_where_clause_for_conditions() const;
 
-    db::timeout_clock::duration get_timeout(const query_options& options) const;
+    db::timeout_clock::duration get_timeout(const service::client_state& state, const query_options& options) const;
 
     friend class raw::modification_statement;
 };

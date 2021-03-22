@@ -74,9 +74,12 @@
 #include "redis/service.hh"
 #include "cdc/log.hh"
 #include "cdc/cdc_extension.hh"
+#include "cdc/generation_service.hh"
 #include "alternator/tags_extension.hh"
 #include "alternator/rmw_operation.hh"
 #include "db/paxos_grace_seconds_extension.hh"
+
+#include "service/raft/raft_services.hh"
 
 namespace fs = std::filesystem;
 
@@ -425,6 +428,7 @@ int main(int ac, char** av) {
 
     init("version", bpo::bool_switch(), "print version number and exit");
     init("build-id", bpo::bool_switch(), "print build-id and exit");
+    init("build-mode", bpo::bool_switch(), "print build mode and exit");
 
     bpo::options_description deprecated("Deprecated options - ignored");
     deprecated.add_options()
@@ -450,9 +454,12 @@ int main(int ac, char** av) {
         fmt::print("{}\n", scylla_version());
         return 0;
     }
-
     if (vm["build-id"].as<bool>()) {
         fmt::print("{}\n", get_build_id());
+        return 0;
+    }
+    if (vm["build-mode"].as<bool>()) {
+        fmt::print("{}\n", scylla_build_mode());
         return 0;
     }
 
@@ -474,6 +481,7 @@ int main(int ac, char** av) {
     sharded<netw::messaging_service> messaging;
     sharded<cql3::query_processor> qp;
     sharded<semaphore> sst_dir_semaphore;
+    sharded<raft_services> raft_srvs;
 
     return app.run(ac, av, [&] () -> future<int> {
 
@@ -502,8 +510,14 @@ int main(int ac, char** av) {
 
         return seastar::async([cfg, ext, &db, &qp, &proxy, &mm, &mm_notifier, &ctx, &opts, &dirs,
                 &prometheus_server, &cf_cache_hitrate_calculator, &load_meter, &feature_service,
-                &token_metadata, &snapshot_ctl, &messaging, &sst_dir_semaphore] {
+                &token_metadata, &snapshot_ctl, &messaging, &sst_dir_semaphore, &raft_srvs] {
           try {
+            // disable reactor stall detection during startup
+            auto blocked_reactor_notify_ms = engine().get_blocked_reactor_notify_ms();
+            smp::invoke_on_all([] {
+                engine().update_blocked_reactor_notify_ms(std::chrono::milliseconds(1000000));
+            }).get();
+
             ::stop_signal stop_signal; // we can move this earlier to support SIGINT during initialization
             read_config(opts, *cfg).get();
             configurable::init_all(opts, *cfg, *ext).get();
@@ -525,6 +539,16 @@ int main(int ac, char** av) {
             logging::apply_settings(cfg->logging_settings(opts));
 
             startlog.info(startup_msg, scylla_version(), get_build_id());
+
+            // Set the default scheduling_group, i.e., the main scheduling
+            // group to a lower shares. Subsystems needs higher shares
+            // should set it explicitly. This prevents code that is supposed to
+            // run inside its own scheduling group leaking to main group and
+            // causing latency issues.
+            smp::invoke_on_all([] {
+                auto default_sg = default_scheduling_group();
+                default_sg.set_shares(200);
+            }).get();
 
             verify_rlimit(cfg->developer_mode());
             verify_adequate_memory_per_shard(cfg->developer_mode());
@@ -558,6 +582,7 @@ int main(int ac, char** av) {
                     return seastar::scheduling_group();
                 }
             };
+            auto background_reclaim_scheduling_group = make_sched_group("background_reclaim", 50);
             auto maintenance_scheduling_group = make_sched_group("streaming", 200);
             uint16_t api_port = cfg->api_port();
             ctx.api_dir = cfg->api_ui_dir();
@@ -745,6 +770,13 @@ int main(int ac, char** av) {
                 mscfg.encrypt = netw::messaging_service::encrypt_what::rack;
             }
 
+            if (clauth && (mscfg.encrypt == netw::messaging_service::encrypt_what::dc || mscfg.encrypt == netw::messaging_service::encrypt_what::dc)) {
+                startlog.warn("Setting require_client_auth is incompatible with 'rack' and 'dc' internode_encryption values."
+                    " To ensure that mutual TLS authentication is enforced, please set internode_encryption to 'all'. Continuing with"
+                    " potentially insecure configuration."
+                );
+            }
+
             sstring compress_what = cfg->internode_compression();
             if (compress_what == "all") {
                 mscfg.compress = netw::messaging_service::compress_what::all;
@@ -783,6 +815,7 @@ int main(int ac, char** av) {
             static sharded<db::view::view_update_generator> view_update_generator;
             static sharded<cql3::cql_config> cql_config;
             static sharded<::cql_config_updater> cql_config_updater;
+            static sharded<cdc::generation_service> cdc_generation_service;
             cql_config.start().get();
             //FIXME: discarded future
             (void)cql_config_updater.start(std::ref(cql_config), std::ref(*cfg));
@@ -797,7 +830,7 @@ int main(int ac, char** av) {
 
             service::storage_service_config sscfg;
             sscfg.available_memory = memory::stats().total_memory();
-            service::init_storage_service(stop_signal.as_sharded_abort_source(), db, gossiper, sys_dist_ks, view_update_generator, feature_service, sscfg, mm_notifier, token_metadata, messaging, sl_controller).get();
+            service::init_storage_service(stop_signal.as_sharded_abort_source(), db, gossiper, sys_dist_ks, view_update_generator, feature_service, sscfg, mm_notifier, token_metadata, messaging, cdc_generation_service, sl_controller).get();
             supervisor::notify("starting per-shard database core");
 
             sst_dir_semaphore.start(cfg->initial_sstable_loading_concurrency()).get();
@@ -860,6 +893,11 @@ int main(int ac, char** av) {
             }
 
             init_gossiper(gossiper, *cfg, listen_address, seed_provider, cluster_name);
+
+            smp::invoke_on_all([blocked_reactor_notify_ms] {
+                engine().update_blocked_reactor_notify_ms(blocked_reactor_notify_ms);
+            }).get();
+
             supervisor::notify("starting storage proxy");
             service::storage_proxy::config spcfg {
                 .hints_directory_initializer = hints_dir_initializer,
@@ -894,7 +932,7 @@ int main(int ac, char** av) {
             supervisor::notify("starting query processor");
             cql3::query_processor::memory_config qp_mcfg = {get_available_memory() / 256, get_available_memory() / 2560};
             debug::the_query_processor = &qp;
-            qp.start(std::ref(proxy), std::ref(db), std::ref(mm_notifier), qp_mcfg, std::ref(cql_config), std::ref(sl_controller)).get();
+            qp.start(std::ref(proxy), std::ref(db), std::ref(mm_notifier), std::ref(mm), qp_mcfg, std::ref(cql_config), std::ref(sl_controller)).get();
             extern sharded<cql3::query_processor>* hack_query_processor_for_encryption;
             hack_query_processor_for_encryption = &qp;
             // #293 - do not stop anything
@@ -926,12 +964,6 @@ int main(int ac, char** av) {
 
             distributed_loader::ensure_system_table_directories(db).get();
 
-            static sharded<cdc::cdc_service> cdc;
-            cdc.start(std::ref(proxy)).get();
-            auto stop_cdc_service = defer_verbose_shutdown("cdc", [] {
-                cdc.stop().get();
-            });
-
             supervisor::notify("loading non-system sstables");
             distributed_loader::init_non_system_keyspaces(db, proxy, mm).get();
 
@@ -941,7 +973,7 @@ int main(int ac, char** av) {
             db.invoke_on_all([] (database& db) {
                 for (auto& x : db.get_column_families()) {
                     table& t = *(x.second);
-                    for (sstables::shared_sstable sst : *t.get_sstables()) {
+                    for (auto sstables = t.get_sstables(); sstables::shared_sstable sst : *sstables) {
                         if (sst->requires_view_building()) {
                             // FIXME: discarded future.
                             (void)view_update_generator.local().register_staging_sstable(std::move(sst), t.shared_from_this());
@@ -1014,7 +1046,12 @@ int main(int ac, char** av) {
             auto stop_proxy_handlers = defer_verbose_shutdown("storage proxy RPC verbs", [&proxy] {
                 proxy.invoke_on_all(&service::storage_proxy::uninit_messaging_service).get();
             });
-
+            supervisor::notify("initializing Raft services");
+            raft_srvs.start(std::ref(messaging), std::ref(gossiper), std::ref(qp)).get();
+            raft_srvs.invoke_on_all(&raft_services::init).get();
+            auto stop_raft_sc_handlers = defer_verbose_shutdown("Raft services", [&raft_srvs] {
+                raft_srvs.invoke_on_all(&raft_services::uninit).get();
+            });
             supervisor::notify("starting streaming service");
             streaming::stream_session::init_streaming_service(db, sys_dist_ks, view_update_generator, messaging).get();
             auto stop_streaming_service = defer_verbose_shutdown("streaming service", [] {
@@ -1044,6 +1081,34 @@ int main(int ac, char** av) {
             auto stop_repair_messages = defer_verbose_shutdown("repair message handlers", [] {
                 repair_uninit_messaging_service_handler().get();
             });
+
+            supervisor::notify("starting CDC Generation Management service");
+            /* This service uses the system distributed keyspace.
+             * It will only do that *after* the node has joined the token ring, and the token ring joining
+             * procedure (`storage_service::init_server`) is responsible for initializing sys_dist_ks.
+             * Hence the service will start using sys_dist_ks only after it was initialized.
+             *
+             * However, there is a problem with the service shutdown order: sys_dist_ks is stopped
+             * *before* CDC generation service is stopped (`storage_service::drain_on_shutdown` below),
+             * so CDC generation service takes sharded<db::sys_dist_ks> and must check local_is_initialized()
+             * every time it accesses it (because it may have been stopped already), then take local_shared()
+             * which will prevent sys_dist_ks from being destroyed while the service operates on it.
+             */
+            cdc_generation_service.start(std::ref(*cfg), std::ref(gossiper), std::ref(sys_dist_ks),
+                    std::ref(stop_signal.as_sharded_abort_source()), std::ref(token_metadata)).get();
+            auto stop_cdc_generation_service = defer_verbose_shutdown("CDC Generation Management service", [] {
+                cdc_generation_service.stop().get();
+            });
+
+            auto get_cdc_metadata = [] (cdc::generation_service& svc) { return std::ref(svc.get_cdc_metadata()); };
+
+            supervisor::notify("starting CDC log service");
+            static sharded<cdc::cdc_service> cdc;
+            cdc.start(std::ref(proxy), sharded_parameter(get_cdc_metadata, std::ref(cdc_generation_service))).get();
+            auto stop_cdc_service = defer_verbose_shutdown("cdc log service", [] {
+                cdc.stop().get();
+            });
+
             supervisor::notify("starting storage service", true);
             auto& ss = service::get_local_storage_service();
             ss.init_messaging_service_part().get();
@@ -1074,11 +1139,17 @@ int main(int ac, char** av) {
                 gms::stop_gossiping().get();
             });
 
-            sys_dist_ks.start(std::ref(qp), std::ref(mm)).get();
+            sys_dist_ks.start(std::ref(qp), std::ref(mm), std::ref(proxy)).get();
 
-            ss.init_server().get();
+            with_scheduling_group(maintenance_scheduling_group, [&] {
+                return ss.init_server();
+            }).get();
+
             sst_format_selector.sync();
-            ss.join_cluster().get();
+
+            with_scheduling_group(maintenance_scheduling_group, [&] {
+                return ss.join_cluster();
+            }).get();
 
             supervisor::notify("starting tracing");
             tracing::tracing::start_tracing(qp).get();
@@ -1257,7 +1328,7 @@ int main(int ac, char** av) {
                 smp_service_group_config c;
                 c.max_nonlocal_requests = 5000;
                 smp_service_group ssg = create_smp_service_group(c).get0();
-                alternator_executor.start(std::ref(proxy), std::ref(mm), std::ref(sys_dist_ks), std::ref(service::get_storage_service()), ssg).get();
+                alternator_executor.start(std::ref(proxy), std::ref(mm), std::ref(sys_dist_ks), std::ref(service::get_storage_service()), sharded_parameter(get_cdc_metadata, std::ref(cdc_generation_service)), ssg).get();
                 alternator_server.start(std::ref(alternator_executor), std::ref(qp)).get();
                 std::optional<uint16_t> alternator_port;
                 if (cfg->alternator_port()) {
@@ -1293,11 +1364,12 @@ int main(int ac, char** av) {
                 }
                 bool alternator_enforce_authorization = cfg->alternator_enforce_authorization();
                 with_scheduling_group(dbcfg.statement_scheduling_group,
-                        [addr, alternator_port, alternator_https_port, creds = std::move(creds), alternator_enforce_authorization] () mutable {
+                        [addr, alternator_port, alternator_https_port, creds = std::move(creds), alternator_enforce_authorization, cfg] () mutable {
                     return alternator_server.invoke_on_all(
-                            [addr, alternator_port, alternator_https_port, creds = std::move(creds), alternator_enforce_authorization] (alternator::server& server) mutable {
+                            [addr, alternator_port, alternator_https_port, creds = std::move(creds), alternator_enforce_authorization, cfg] (alternator::server& server) mutable {
                         auto& ss = service::get_local_storage_service();
-                        return server.init(addr, alternator_port, alternator_https_port, creds, alternator_enforce_authorization, &ss.service_memory_limiter());
+                        return server.init(addr, alternator_port, alternator_https_port, creds, alternator_enforce_authorization, &ss.service_memory_limiter(),
+                                ss.db().local().get_config().max_concurrent_requests_per_shard);
                     }).then([addr, alternator_port, alternator_https_port] {
                         startlog.info("Alternator server listening on {}, HTTP port {}, HTTPS port {}",
                                 addr, alternator_port ? std::to_string(*alternator_port) : "OFF", alternator_https_port ? std::to_string(*alternator_https_port) : "OFF");
@@ -1319,13 +1391,20 @@ int main(int ac, char** av) {
                 }).get();
             }
 
-            smp::invoke_on_all([&cfg] {
+            smp::invoke_on_all([&cfg, background_reclaim_scheduling_group] {
                 logalloc::tracker::config st_cfg;
                 st_cfg.defragment_on_idle = cfg->defragment_memory_on_idle();
                 st_cfg.abort_on_lsa_bad_alloc = cfg->abort_on_lsa_bad_alloc();
                 st_cfg.lsa_reclamation_step = cfg->lsa_reclamation_step();
+                st_cfg.background_reclaim_sched_group = background_reclaim_scheduling_group;
                 logalloc::shard_tracker().configure(st_cfg);
             }).get();
+
+            auto stop_lsa_background_reclaim = defer([&] {
+                smp::invoke_on_all([&] {
+                    return logalloc::shard_tracker().stop();
+                }).get();
+            });
 
             seastar::set_abort_on_ebadf(cfg->abort_on_ebadf());
             api::set_server_done(ctx).get();

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015 ScyllaDB
+ * Copyright (C) 2015-2020 ScyllaDB
  */
 
 /*
@@ -360,6 +360,29 @@ SEASTAR_TEST_CASE(test_list_of_tuples_with_bound_var) {
         BOOST_REQUIRE_THROW(e.prepare("update cf SET c1 = c1 + [(?,9999)] where pk = 999;").get0(), exceptions::invalid_request_exception);
     });
 }
+
+/// The nubmer of distinct values in a list is limited. Test the
+// limit.
+SEASTAR_TEST_CASE(test_list_append_limit) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE t (pk int PRIMARY KEY, l list<int>);").get();
+        std::string value_list = "0";
+        for (int i = 0; i < utils::UUID_gen::SUBMICRO_LIMIT; i++) {
+            value_list.append(",0");
+        }
+        // Use a local copy of query_options to avoid impact on
+        // adjacent tests: that's where Scylla stores the list
+        // append sequence, which will be exceeded it in this
+        // test.
+        auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE,
+                std::vector<cql3::raw_value>{},
+                cql3::query_options::specific_options{1, nullptr, {}, api::new_timestamp()});
+        auto cql = fmt::format("UPDATE t SET l = l + [{}] WHERE pk = 0;", value_list);
+        BOOST_REQUIRE_THROW(e.execute_cql(cql, std::move(qo)).get0(), exceptions::invalid_request_exception);
+        e.execute_cql("DROP TABLE t;").get();
+    });
+}
+
 
 SEASTAR_TEST_CASE(test_insert_statement) {
     return do_with_cql_env([] (cql_test_env& e) {
@@ -3003,7 +3026,7 @@ SEASTAR_TEST_CASE(test_empty_partition_range_scan) {
         e.execute_cql("create table empty_partition_range_scan.tb (a int, b int, c int, val int, PRIMARY KEY ((a,b),c) );").get();
 
 
-        auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, infinite_timeout_config, std::vector<cql3::raw_value>{},
+        auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
                 cql3::query_options::specific_options{1, nullptr, {}, api::new_timestamp()});
         auto res = e.execute_cql("select * from empty_partition_range_scan.tb where token (a,b) > 1 and token(a,b) <= 1;", std::move(qo)).get0();
         assert_that(res).is_rows().is_empty();
@@ -3591,6 +3614,7 @@ SEASTAR_TEST_CASE(test_user_based_sla_queries) {
         msg = e.execute_cql("LIST ALL ATTACHED SERVICE_LEVELS;").get0();
         assert_that(msg).is_rows().with_rows({
         });
+        BOOST_REQUIRE_THROW(e.execute_cql("ALTER SERVICE_LEVEL i_do_not_exist WITH shares = 1;").get(), exceptions::invalid_request_exception);
     });
 }
 
@@ -3712,19 +3736,9 @@ SEASTAR_TEST_CASE(test_rf_expand) {
             {"datacenter1", "3"}
         });
 
-        e.execute_cql("CREATE KEYSPACE rf_expand_3 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}").get();
-        assert_replication_contains("rf_expand_3", {
-            {"class", simple},
-            {"replication_factor", "3"}
-        });
-
-        // Should not auto-expand when switching to NetworkTopologyStrategy with additional options.
-        e.execute_cql("ALTER KEYSPACE rf_expand_3 WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter2': 2}").get();
-        assert_replication_not_contains("rf_expand_3", {"datacenter1"});
-
         // Respect factors specified manually.
-        e.execute_cql("CREATE KEYSPACE rf_expand_4 WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3, 'datacenter1': 2}").get();
-        assert_replication_contains("rf_expand_4", {
+        e.execute_cql("CREATE KEYSPACE rf_expand_3 WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3, 'datacenter1': 2}").get();
+        assert_replication_contains("rf_expand_3", {
             {"class", network_topology},
             {"datacenter1", "2"}
         });
@@ -4496,7 +4510,6 @@ static std::unique_ptr<cql3::query_options> q_serial_opts(
     const auto& so = cql3::query_options::specific_options::DEFAULT;
     auto qo = std::make_unique<cql3::query_options>(
             cl,
-            infinite_timeout_config,
             values,
             // Ensure (optional) serial consistency is always specified.
             cql3::query_options::specific_options{
@@ -4675,6 +4688,11 @@ SEASTAR_THREAD_TEST_CASE(test_query_limit) {
     cfg.dbcfg->statement_scheduling_group = seastar::create_scheduling_group("statement", 1000).get0();
     cfg.dbcfg->streaming_scheduling_group = seastar::create_scheduling_group("streaming", 200).get0();
 
+    auto clean_up_sched_groups = defer([dbcfg = *cfg.dbcfg] {
+        seastar::destroy_scheduling_group(dbcfg.statement_scheduling_group).get0();
+        seastar::destroy_scheduling_group(dbcfg.streaming_scheduling_group).get0();
+    });
+
     do_with_cql_env_thread([] (cql_test_env& e) {
         e.execute_cql("CREATE TABLE test (pk int, ck int, v text, PRIMARY KEY (pk, ck));").get();
         auto id = e.prepare("INSERT INTO test (pk, ck, v) VALUES (?, ?, ?);").get0();
@@ -4711,7 +4729,7 @@ SEASTAR_THREAD_TEST_CASE(test_query_limit) {
                     const auto select_query = format("SELECT * FROM test WHERE pk = {} ORDER BY ck {};", pk, is_reversed ? "DESC" : "ASC");
 
                     int32_t page_size = is_paged ? 10000 : -1;
-                    auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, infinite_timeout_config, std::vector<cql3::raw_value>{},
+                    auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
                                 cql3::query_options::specific_options{page_size, nullptr, {}, api::new_timestamp()});
 
                     const auto* expected_rows = is_reversed ? &reversed_rows : &normal_rows;
@@ -4844,4 +4862,101 @@ SEASTAR_THREAD_TEST_CASE(test_invalid_using_timestamps) {
         BOOST_REQUIRE_THROW(e.execute_cql(format("DELETE b FROM tbl USING TIMESTAMP {} WHERE a = 1", now_nano)).get(), exceptions::invalid_request_exception);
         BOOST_REQUIRE_THROW(e.execute_cql(format("BEGIN BATCH USING TIMESTAMP {} INSERT INTO TBL (a, b) VALUES (2, 2); APPLY BATCH", now_nano)).get(), exceptions::invalid_request_exception);
     }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_twcs_non_optimal_query_path) {
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        auto now_nano = std::chrono::duration_cast<std::chrono::nanoseconds>(db_clock::now().time_since_epoch()).count();
+        e.execute_cql(
+                "CREATE TABLE tbl (pk int, ck int, v int, s int static, PRIMARY KEY (pk, ck))"
+                " WITH compaction = {"
+                "   'compaction_window_size': '1',"
+                "   'compaction_window_unit': 'MINUTES',"
+                "   'class': 'org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy'"
+                "}").get();
+
+        e.execute_cql("INSERT INTO tbl (pk, ck, v) VALUES (0, 0, 0)").get();
+        e.execute_cql("INSERT INTO tbl (pk, ck, v) VALUES (1, 0, 0)").get();
+        e.execute_cql("INSERT INTO tbl (pk, ck, v) VALUES (0, 1, 0)").get();
+        e.execute_cql("INSERT INTO tbl (pk, ck, v) VALUES (1, 1, 0)").get();
+
+        e.db().invoke_on_all([] (database& db) {
+            return db.flush_all_memtables();
+        }).get();
+
+        // Not really testing anything, just ensure that we execute the non-optimal
+        // sstable read path of TWCS tables too, allowing ASAN to shake out any memory
+        // related bugs.
+        // The non-optimal read path is triggered by having a static column, see
+        // `sstables::time_series_sstable_set::create_single_key_sstable_reader()`.
+        e.execute_cql("SELECT * FROM tbl WHERE pk = 0 BYPASS CACHE").get();
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_twcs_optimal_query_path) {
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        auto now_nano = std::chrono::duration_cast<std::chrono::nanoseconds>(db_clock::now().time_since_epoch()).count();
+        e.execute_cql(
+                "CREATE TABLE tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck))"
+                " WITH compaction = {"
+                "   'compaction_window_size': '1',"
+                "   'compaction_window_unit': 'MINUTES',"
+                "   'class': 'org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy'"
+                "}").get();
+
+        e.execute_cql("INSERT INTO tbl (pk, ck, v) VALUES (0, 0, 0)").get();
+
+        e.db().invoke_on_all([] (database& db) {
+            return db.flush_all_memtables();
+        }).get();
+
+        // Not really testing anything, just ensure that we execute the optimal
+        // sstable read path of TWCS tables too, allowing ASAN to shake out any memory
+        // related bugs.
+        assert_that(e.execute_cql("SELECT * FROM tbl WHERE pk = 0 BYPASS CACHE").get0())
+            .is_rows().with_size(1);
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_query_unselected_columns) {
+    cql_test_config cfg;
+
+    cfg.db_config->max_memory_for_unlimited_query_soft_limit(1024 * 1024, utils::config_file::config_source::CommandLine);
+    cfg.db_config->max_memory_for_unlimited_query_hard_limit(1024 * 1024, utils::config_file::config_source::CommandLine);
+
+    cfg.dbcfg.emplace();
+    cfg.dbcfg->available_memory = memory::stats().total_memory();
+    cfg.dbcfg->statement_scheduling_group = seastar::create_scheduling_group("statement", 1000).get0();
+
+    auto statement_sched_group = cfg.dbcfg->statement_scheduling_group;
+
+    auto clean_up_sched_groups = defer([statement_sched_group] {
+        seastar::destroy_scheduling_group(statement_sched_group).get0();
+    });
+
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        auto now_nano = std::chrono::duration_cast<std::chrono::nanoseconds>(db_clock::now().time_since_epoch()).count();
+        e.execute_cql("CREATE TABLE tbl (pk int, ck int, v text, PRIMARY KEY (pk, ck))").get();
+
+        const unsigned num_rows = 20;
+        const sstring val(100 * 1024, 'a');
+        const auto id = e.prepare(format("INSERT INTO tbl (pk, ck, v) VALUES (0, ?, '{}')", val)).get0();
+        for (int ck = 0; ck < num_rows; ++ck) {
+            e.execute_prepared(id, {cql3::raw_value::make_value(int32_type->decompose(ck))}).get();
+        }
+
+        {
+            testlog.info("Single partition scan");
+            auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
+                    cql3::query_options::specific_options{-1, nullptr, {}, api::new_timestamp()});
+            assert_that(e.execute_cql("SELECT pk, ck FROM tbl WHERE pk = 0", std::move(qo)).get0()).is_rows().with_size(num_rows);
+        }
+
+        {
+            testlog.info("Full scan");
+            auto qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
+                    cql3::query_options::specific_options{-1, nullptr, {}, api::new_timestamp()});
+            assert_that(e.execute_cql("SELECT pk, ck FROM tbl", std::move(qo)).get0()).is_rows().with_size(num_rows);
+        }
+    }, std::move(cfg), thread_attributes{.sched_group = statement_sched_group}).get();
 }

@@ -109,10 +109,9 @@ future<> manager::start(shared_ptr<service::storage_proxy> proxy_ptr, shared_ptr
 future<> manager::stop() {
     manager_logger.info("Asked to stop");
 
-    if (_strorage_service_anchor) {
-        _strorage_service_anchor->unregister_subscriber(this);
-    }
+  auto f = _strorage_service_anchor ? _strorage_service_anchor->unregister_subscriber(this) : make_ready_future<>();
 
+  return f.finally([this] {
     set_stopping();
 
     return _draining_eps_gate.close().finally([this] {
@@ -123,6 +122,7 @@ future<> manager::stop() {
             manager_logger.info("Stopped");
         }).discard_result();
     });
+  });
 }
 
 future<> manager::compute_hints_dir_device_id() {
@@ -330,6 +330,13 @@ future<db::commitlog> manager::end_point_hints_manager::add_store() noexcept {
             // them when commitlog is re-created. This is expected to happen regularly
             // during standard HH workload, so no need to print a warning about it.
             cfg.warn_about_segments_left_on_disk_after_shutdown = false;
+            // Allow going over the configured size limit of the commitlog
+            // (resource_manager::max_hints_per_ep_size_mb). The commitlog will
+            // be more conservative with its disk usage when going over the limit.
+            // On the other hand, HH counts used space using the space_watchdog
+            // in resource_manager, so its redundant for the commitlog to apply
+            // a hard limit.
+            cfg.allow_going_over_size_limit = true;
 
             return commitlog::create_commitlog(std::move(cfg)).then([this] (commitlog l) {
                 // add_store() is triggered every time hint files are forcefully flushed to I/O (every hints_flush_period).

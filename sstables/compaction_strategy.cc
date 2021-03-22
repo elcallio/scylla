@@ -441,7 +441,7 @@ int64_t date_tiered_manifest::get_estimated_tasks(column_family& cf) const {
     int64_t n = 0;
 
     sstables.reserve(cf.sstables_count());
-    for (auto& entry : *cf.get_sstables()) {
+    for (auto all_sstables = cf.get_sstables(); auto& entry : *all_sstables) {
         sstables.push_back(entry);
     }
     auto candidates = filter_old_sstables(sstables, _options.max_sstable_age, now);
@@ -699,7 +699,7 @@ compaction_strategy make_compaction_strategy(compaction_strategy_type strategy, 
 }
 
 std::unique_ptr<sstable_set_impl> incremental_compaction_strategy::make_sstable_set(schema_ptr schema) const {
-    return std::make_unique<partitioned_sstable_set>(std::move(schema), false);
+    return std::make_unique<partitioned_sstable_set>(std::move(schema), make_lw_shared<sstable_list>(), false);
 }
 
 }

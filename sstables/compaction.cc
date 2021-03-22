@@ -57,10 +57,39 @@
 #include "dht/token.hh"
 #include "mutation_writer/shard_based_splitting_writer.hh"
 #include "mutation_source_metadata.hh"
+#include "mutation_fragment_stream_validator.hh"
 
 namespace sstables {
 
 logging::logger clogger("compaction");
+
+static const std::unordered_map<compaction_type, sstring> compaction_types = {
+    { compaction_type::Compaction, "COMPACTION" },
+    { compaction_type::Cleanup, "CLEANUP" },
+    { compaction_type::Validation, "VALIDATION" },
+    { compaction_type::Scrub, "SCRUB" },
+    { compaction_type::Index_build, "INDEX_BUILD" },
+    { compaction_type::Reshard, "RESHARD" },
+    { compaction_type::Upgrade, "UPGRADE" },
+    { compaction_type::Reshape, "RESHAPE" },
+};
+
+sstring compaction_name(compaction_type type) {
+    auto ret = compaction_types.find(type);
+    if (ret != compaction_types.end()) {
+        return ret->second;
+    }
+    throw std::runtime_error("Invalid Compaction Type");
+}
+
+compaction_type to_compaction_type(sstring type_name) {
+    for (auto& it : compaction_types) {
+        if (it.second == type_name) {
+            return it.first;
+        }
+    }
+    throw std::runtime_error("Invalid Compaction Type Name");
+}
 
 static std::string_view to_string(compaction_type type) {
     switch (type) {
@@ -298,6 +327,7 @@ struct compaction_read_monitor_generator final : public read_monitor_generator {
         _generated_monitors.emplace_back(std::move(sst), _compaction_manager, _cf);
         return _generated_monitors.back();
     }
+
     compaction_read_monitor_generator(compaction_manager& cm, column_family& cf)
         : _compaction_manager(cm)
         , _cf(cf) {}
@@ -489,8 +519,12 @@ protected:
         _info->end_size += writer->sst->bytes_on_disk();
     }
 
-    sstable_writer_config make_sstable_writer_config() {
-        sstable_writer_config cfg = _cf.get_sstables_manager().configure_writer();
+    sstable_writer_config make_sstable_writer_config(compaction_type type) {
+        auto s = compaction_name(type);
+        std::transform(s.begin(), s.end(), s.begin(), [] (char c) {
+            return std::tolower(c);
+        });
+        sstable_writer_config cfg = _cf.get_sstables_manager().configure_writer(std::move(s));
         cfg.max_sstable_size = _max_sstable_size;
         cfg.monitor = &default_write_monitor();
         cfg.run_identifier = _run_identifier;
@@ -553,11 +587,12 @@ private:
             _ancestors.push_back(sst->generation());
             _info->start_size += sst->bytes_on_disk();
             _info->total_partitions += sst->get_estimated_key_count();
-            formatted_msg += format("{}:level={:d}, ", sst->get_filename(), sst->get_sstable_level());
+            formatted_msg += format("{}:level={:d}:origin={}, ", sst->get_filename(), sst->get_sstable_level(), sst->get_origin());
 
             // Do not actually compact a sstable that is fully expired and can be safely
             // dropped without ressurrecting old data.
             if (tombstone_expiration_enabled() && fully_expired.contains(sst)) {
+                on_skipped_expired_sstable(sst);
                 continue;
             }
 
@@ -663,6 +698,9 @@ private:
     virtual void on_new_partition() {}
 
     virtual void on_end_of_compaction() {};
+
+    // Inform about every expired sstable that was skipped during setup phase
+    virtual void on_skipped_expired_sstable(shared_sstable sstable) {}
 
     // create a writer based on decorated key.
     virtual compaction_writer create_compaction_writer(const dht::decorated_key& dk) = 0;
@@ -780,7 +818,7 @@ void garbage_collected_sstable_writer::data::maybe_create_new_sstable_writer() {
 
         auto&& priority = _c->_io_priority;
         auto monitor = std::make_unique<compaction_write_monitor>(sst, _c->_cf, _c->maximum_timestamp(), _c->_sstable_level);
-        sstable_writer_config cfg = _c->_cf.get_sstables_manager().configure_writer();
+        sstable_writer_config cfg = _c->_cf.get_sstables_manager().configure_writer("garbage_collection");
         cfg.run_identifier = _run_identifier;
         cfg.monitor = monitor.get();
         auto writer = sst->get_writer(*_c->schema(), _c->partitions_per_sstable(), cfg, _c->get_encoding_stats(), priority);
@@ -828,7 +866,7 @@ public:
         auto sst = _sstable_creator(this_shard_id());
         setup_new_sstable(sst);
 
-        sstable_writer_config cfg = make_sstable_writer_config();
+        sstable_writer_config cfg = make_sstable_writer_config(compaction_type::Reshape);
         return compaction_writer{sst->get_writer(*_schema, partitions_per_sstable(), cfg, get_encoding_stats(), _io_priority), sst};
     }
 
@@ -885,7 +923,7 @@ public:
         _unused_sstables.push_back(sst);
 
         auto monitor = std::make_unique<compaction_write_monitor>(sst, _cf, maximum_timestamp(), _sstable_level);
-        sstable_writer_config cfg = make_sstable_writer_config();
+        sstable_writer_config cfg = make_sstable_writer_config(_info->type);
         cfg.monitor = monitor.get();
         return compaction_writer{std::move(monitor), sst->get_writer(*_schema, partitions_per_sstable(), cfg, get_encoding_stats(), _io_priority), sst};
     }
@@ -906,6 +944,12 @@ public:
             _cf.get_compaction_manager().on_compaction_complete(*_weight_registration);
         }
         replace_remaining_exhausted_sstables();
+    }
+
+    virtual void on_skipped_expired_sstable(shared_sstable sstable) override {
+        // manually register expired sstable into monitor, as it's not being actually compacted
+        // this will allow expired sstable to be removed from tracker once compaction completes
+        _monitor_generator(std::move(sstable));
     }
 private:
     void backlog_tracker_incrementally_adjust_charges(std::vector<shared_sstable> exhausted_sstables) {
@@ -1235,8 +1279,8 @@ class scrub_compaction final : public regular_compaction {
                 }
             });
         }
-        virtual void next_partition() override {
-            throw_with_backtrace<std::bad_function_call>();
+        virtual future<> next_partition() override {
+            return make_exception_future<>(make_backtraced_exception_ptr<std::bad_function_call>());
         }
         virtual future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override {
             return make_exception_future<>(make_backtraced_exception_ptr<std::bad_function_call>());
@@ -1359,7 +1403,7 @@ public:
         auto sst = _sstable_creator(shard);
         setup_new_sstable(sst);
 
-        auto cfg = make_sstable_writer_config();
+        auto cfg = make_sstable_writer_config(compaction_type::Reshard);
         // sstables generated for a given shard will share the same run identifier.
         cfg.run_identifier = _run_identifiers.at(shard);
         return compaction_writer{sst->get_writer(*_schema, partitions_per_sstable(shard), cfg, get_encoding_stats(), _io_priority, shard), sst};

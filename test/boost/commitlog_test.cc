@@ -19,6 +19,7 @@
 #include <set>
 
 #include <seastar/testing/test_case.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/scollectd_api.hh>
@@ -37,6 +38,7 @@
 #include "test/lib/data_model.hh"
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/reader_permit.hh"
+#include "test/lib/mutation_source_test.hh"
 
 using namespace db;
 
@@ -567,11 +569,14 @@ SEASTAR_TEST_CASE(test_allocation_failure){
 
             // Use us loads of memory so we can OOM at the appropriate place
             try {
+                assert(fragmented_temporary_buffer::default_fragment_size < size);
                 for (;;) {
-                    junk->emplace_back(new char[size]);
+                    junk->emplace_back(new char[fragmented_temporary_buffer::default_fragment_size]);
                 }
             } catch (std::bad_alloc&) {
             }
+            auto last = junk->end();
+            junk->erase(--last);
             return log.add_mutation(utils::UUID_gen::get_time_UUID(), size, db::commitlog::force_sync::no, [size](db::commitlog::output& dst) {
                         dst.fill(char(1), size);
                     }).then_wrapped([junk, size](future<db::rp_handle> f) {
@@ -636,6 +641,99 @@ SEASTAR_TEST_CASE(test_commitlog_replay_invalid_key){
             mopt = {};
             mopt = read_mutation_from_flat_mutation_reader(rd, db::no_timeout).get0();
             BOOST_REQUIRE(!mopt);
+        }
+    });
+}
+
+using namespace std::chrono_literals;
+
+SEASTAR_TEST_CASE(test_commitlog_add_entries) {
+    return cl_test([](commitlog& log) {
+        return seastar::async([&] {
+            using force_sync = commitlog_entry_writer::force_sync;
+
+            constexpr auto n = 10;
+            for (auto fs : { force_sync(false), force_sync(true) }) {
+                std::vector<commitlog_entry_writer> writers;
+                std::vector<frozen_mutation> mutations;
+                std::vector<replay_position> rps;
+
+                writers.reserve(n);
+                mutations.reserve(n);
+                
+                for (auto i = 0; i < n; ++i) {
+                    random_mutation_generator gen(random_mutation_generator::generate_counters(false));
+                    mutations.emplace_back(gen(1).front());
+                    writers.emplace_back(gen.schema(), mutations.back(), fs);
+                }
+
+                auto res = log.add_entries(writers, db::timeout_clock::now() + 60s).get0();
+
+                std::set<segment_id_type> ids;
+                for (auto& h : res) {
+                    ids.emplace(h.rp().id);
+                    rps.emplace_back(h.rp());
+                }
+                BOOST_CHECK_EQUAL(ids.size(), 1);
+
+                log.sync_all_segments().get();
+                auto segments = log.get_active_segment_names();
+                BOOST_REQUIRE(!segments.empty());
+
+                std::unordered_set<replay_position> result;
+
+                for (auto& seg : segments) {
+                    db::commitlog::read_log_file(seg, db::commitlog::descriptor::FILENAME_PREFIX, service::get_local_commitlog_priority(), [&](db::commitlog::buffer_and_replay_position buf_rp) {
+                        commitlog_entry_reader r(buf_rp.buffer);
+                        auto& rp = buf_rp.position;
+                        auto i = std::find(rps.begin(), rps.end(), rp);
+                        // since we are looping, we can be reading last test cases 
+                        // segment (force_sync permutations)
+                        if (i != rps.end()) {
+                            auto n = std::distance(rps.begin(), i);
+                            auto& fm1 = mutations.at(n);
+                            auto& fm2 = r.mutation();
+                            auto s = writers.at(n).schema();
+                            auto m1 = fm1.unfreeze(s);
+                            auto m2 = fm2.unfreeze(s);
+                            BOOST_CHECK_EQUAL(m1, m2);
+                            result.emplace(rp);
+                        }
+                        return make_ready_future<>();
+                    }).get();
+                }
+
+                BOOST_CHECK_EQUAL(result.size(), rps.size());
+            }
+        });
+    });
+}
+
+SEASTAR_TEST_CASE(test_commitlog_new_segment_odsync){
+    commitlog::config cfg;
+    cfg.commitlog_segment_size_in_mb = 1;
+    cfg.use_o_dsync = true;
+
+    return cl_test(cfg, [](commitlog& log) -> future<> {
+        auto uuid = utils::UUID_gen::get_time_UUID();
+        rp_set set;
+        while (set.size() <= 1) {
+            sstring tmp = "hej bubba cow";
+            rp_handle h = co_await log.add_mutation(uuid, tmp.size(), db::commitlog::force_sync::no, [tmp](db::commitlog::output& dst) {
+                dst.write(tmp.data(), tmp.size());
+            });
+            set.put(std::move(h));
+        }
+
+        auto names = log.get_active_segment_names();
+        BOOST_REQUIRE(names.size() > 1);
+
+        // check that all the segments are pre-allocated.
+        for (auto& name : names) {
+            auto f = co_await seastar::open_file_dma(name, seastar::open_flags::ro);
+            auto s = co_await f.size();
+            co_await f.close();
+            BOOST_CHECK_EQUAL(s, 1024u*1024u);
         }
     });
 }

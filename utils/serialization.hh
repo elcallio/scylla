@@ -32,6 +32,7 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/net/byteorder.hh>
 #include "bytes.hh"
+#include "fragment_range.hh"
 #include <iosfwd>
 #include <iterator>
 

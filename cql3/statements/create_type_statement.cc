@@ -31,6 +31,7 @@
 #include "database.hh"
 #include "service/migration_manager.hh"
 #include "user_types_metadata.hh"
+#include "cql3/query_processor.hh"
 
 namespace cql3 {
 
@@ -127,9 +128,9 @@ inline user_type create_type_statement::create_type(database& db) const
         std::move(field_names), std::move(field_types), true /* multi cell */);
 }
 
-future<shared_ptr<cql_transport::event::schema_change>> create_type_statement::announce_migration(service::storage_proxy& proxy) const
+future<shared_ptr<cql_transport::event::schema_change>> create_type_statement::announce_migration(query_processor& qp) const
 {
-    auto&& db = proxy.get_db().local();
+    database& db = qp.db();
 
     // Keyspace exists or we wouldn't have validated otherwise
     auto&& ks = db.find_keyspace(keyspace());
@@ -141,7 +142,7 @@ future<shared_ptr<cql_transport::event::schema_change>> create_type_statement::a
 
     auto type = create_type(db);
     check_for_duplicate_names(type);
-    return service::get_local_migration_manager().announce_new_type(type).then([this] {
+    return qp.get_migration_manager().announce_new_type(type).then([this] {
         using namespace cql_transport;
 
         return ::make_shared<event::schema_change>(

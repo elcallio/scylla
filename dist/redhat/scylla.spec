@@ -79,13 +79,18 @@ getent passwd scylla || /usr/sbin/useradd -g scylla -s /sbin/nologin -r -d %{_sh
 %post server
 /opt/scylladb/scripts/scylla_post_install.sh
 
-%systemd_post scylla-server.service
+if [ $1 -eq 1 ] ; then
+    /usr/bin/systemctl preset scylla-server.service ||:
+fi
 
 %preun server
-%systemd_preun scylla-server.service
+if [ $1 -eq 0 ] ; then
+    /usr/bin/systemctl --no-reload disable scylla-server.service ||:
+    /usr/bin/systemctl stop scylla-server.service ||:
+fi
 
 %postun server
-%systemd_postun scylla-server.service
+/usr/bin/systemctl daemon-reload ||:
 
 %posttrans server
 if  [ -d /tmp/%{name}-%{version}-%{release} ]; then
@@ -102,7 +107,6 @@ rm -rf $RPM_BUILD_ROOT
 
 %config(noreplace) %{_sysconfdir}/sysconfig/scylla-server
 %config(noreplace) %{_sysconfdir}/sysconfig/scylla-housekeeping
-%{_sysconfdir}/security/limits.d/scylla.conf
 %attr(0755,root,root) %dir %{_sysconfdir}/scylla.d
 %config(noreplace) %{_sysconfdir}/scylla.d/*.conf
 /opt/scylladb/share/doc/scylla/*
@@ -208,7 +212,6 @@ if Scylla is the main application on your server and you wish to optimize its la
 # We cannot use the sysctl_apply rpm macro because it is not present in 7.0
 # following is a "manual" expansion
 /usr/lib/systemd/systemd-sysctl 99-scylla-sched.conf >/dev/null 2>&1 || :
-/usr/lib/systemd/systemd-sysctl 99-scylla-aio.conf >/dev/null 2>&1 || :
 /usr/lib/systemd/systemd-sysctl 99-scylla-vm.conf >/dev/null 2>&1 || :
 /usr/lib/systemd/systemd-sysctl 99-scylla-inotify.conf >/dev/null 2>&1 || :
 
@@ -227,10 +230,18 @@ URL:            https://github.com/prometheus/node_exporter
 Prometheus exporter for machine metrics, written in Go with pluggable metric collectors.
 
 %post node-exporter
-%systemd_post node-exporter.service
+if [ $1 -eq 1 ] ; then
+    /usr/bin/systemctl preset node-exporter.service ||:
+fi
 
 %preun node-exporter
-%systemd_preun node-exporter.service
+if [ $1 -eq 0 ] ; then
+    /usr/bin/systemctl --no-reload disable node-exporter.service ||:
+    /usr/bin/systemctl stop node-exporter.service ||:
+fi
+
+%postun node-exporter
+/usr/bin/systemctl daemon-reload ||:
 
 %files node-exporter
 %defattr(-,root,root)

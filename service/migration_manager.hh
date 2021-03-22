@@ -35,6 +35,7 @@
 #include "gms/endpoint_state.hh"
 #include <seastar/core/distributed.hh>
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/gate.hh>
 #include "gms/inet_address.hh"
 #include "gms/feature.hh"
 #include "message/msg_addr.hh"

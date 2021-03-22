@@ -8,6 +8,7 @@
  * See the LICENSE.PROPRIETARY file in the top-level directory for licensing information.
  */
 #include <filesystem>
+#include <fstream>
 // use boost::regex instead of std::regex due
 // to stack overflow in debug mode
 #include <boost/regex.hpp>
@@ -93,7 +94,6 @@ std::unique_ptr<cql3::query_options> repl_options() {
     const auto& so = cql3::query_options::specific_options::DEFAULT;
     auto qo = std::make_unique<cql3::query_options>(
             db::consistency_level::ONE,
-            infinite_timeout_config,
             std::vector<cql3::raw_value>{},
             // Ensure (optional) serial consistency is always specified.
             cql3::query_options::specific_options{

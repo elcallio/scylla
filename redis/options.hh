@@ -19,8 +19,6 @@
 #include "service/client_state.hh"
 #include "auth/service.hh"
 
-using namespace seastar;
-
 namespace service {
 class storage_proxy;
 }
@@ -35,10 +33,6 @@ class redis_options {
     service::client_state _client_state;
     size_t _total_redis_db_count;
 public:
-    //redis_options(redis_options&&) = default;
-    
-    //explicit redis_options(const redis_options&) = default;
-   
     explicit redis_options(const db::consistency_level rcl,
         const db::consistency_level wcl,
         const timeout_config& tc,
@@ -49,7 +43,7 @@ public:
         ,_read_consistency(rcl)
         ,_write_consistency(wcl)
         ,_timeout_config(tc)
-        ,_client_state(service::client_state::external_tag{}, auth, addr)
+        ,_client_state(service::client_state::external_tag{}, auth, tc, addr)
         ,_total_redis_db_count(total_redis_db_count)
     {
     }
@@ -64,7 +58,7 @@ public:
         ,_read_consistency(rcl)
         ,_write_consistency(wcl)
         ,_timeout_config(tc)
-        ,_client_state(service::client_state::external_tag{}, auth, addr)
+        ,_client_state(service::client_state::external_tag{}, auth, tc, addr)
         ,_total_redis_db_count(total_redis_db_count)
     {
     }

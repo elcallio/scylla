@@ -18,9 +18,9 @@
 #include "vint-serialization.hh"
 #include <seastar/core/byteorder.hh>
 #include "version.hh"
-#include "data/value_view.hh"
 #include "counters.hh"
 #include "service/storage_service.hh"
+#include "utils/bit_cast.hh"
 
 namespace sstables {
 
@@ -252,10 +252,8 @@ template <typename T, typename W>
 requires Writer<W>
 inline typename std::enable_if_t<std::is_integral<T>::value, void>
 write(sstable_version_types v, W& out, T i) {
-    auto *nr = reinterpret_cast<const net::packed<T> *>(&i);
-    i = net::hton(*nr);
-    auto p = reinterpret_cast<const char*>(&i);
-    out.write(p, sizeof(T));
+    i = net::hton(i);
+    out.write(reinterpret_cast<const char*>(&i), sizeof(T));
 }
 
 template <typename T, typename W>
@@ -273,10 +271,8 @@ inline void write(sstable_version_types v, W& out, bool i) {
 }
 
 inline void write(sstable_version_types v, file_writer& out, double d) {
-    auto *nr = reinterpret_cast<const net::packed<unsigned long> *>(&d);
-    auto tmp = net::hton(*nr);
-    auto p = reinterpret_cast<const char*>(&tmp);
-    out.write(p, sizeof(unsigned long));
+    unsigned long tmp = net::hton(bit_cast<unsigned long>(d));
+    out.write(reinterpret_cast<const char*>(&tmp), sizeof(unsigned long));
 }
 
 
@@ -290,6 +286,14 @@ template <typename W>
 requires Writer<W>
 inline void write(sstable_version_types v, W& out, bytes_view s) {
     out.write(reinterpret_cast<const char*>(s.data()), s.size());
+}
+
+template <typename W>
+requires Writer<W>
+inline void write(sstable_version_types v, W& out, managed_bytes_view s) {
+    for (bytes_view fragment : fragment_range(s)) {
+        write(v, out, fragment);
+    }
 }
 
 inline void write(sstable_version_types v, file_writer& out, bytes_ostream s) {
@@ -356,10 +360,11 @@ inline void write(sstable_version_types v, file_writer& out, const disk_string_v
 template<typename SizeType>
 inline void write(sstable_version_types ver, file_writer& out, const disk_data_value_view<SizeType>& v) {
     SizeType length;
-    check_truncate_and_assign(length, v.value.size_bytes());
+    check_truncate_and_assign(length, v.value.size());
     write(ver, out, length);
-    using boost::range::for_each;
-    for_each(v.value, [&] (bytes_view fragment) { write(ver, out, fragment); });
+    for (bytes_view frag : fragment_range(v.value)) {
+        write(ver, out, frag);
+    }
 }
 
 template <typename Members>
@@ -533,7 +538,7 @@ void write_column_name(sstable_version_types v, Writer& out, const schema& s, co
 
 template <typename W>
 requires Writer<W>
-void write_cell_value(sstable_version_types v, W& out, const abstract_type& type, bytes_view value) {
+void write_cell_value(sstable_version_types v, W& out, const abstract_type& type, managed_bytes_view value) {
     if (!value.empty()) {
         if (type.value_length_if_fixed()) {
             write(v, out, value);
@@ -546,13 +551,14 @@ void write_cell_value(sstable_version_types v, W& out, const abstract_type& type
 
 template <typename W>
 requires Writer<W>
-void write_cell_value(sstable_version_types v, W& out, const abstract_type& type, atomic_cell_value_view value) {
+void write_cell_value(sstable_version_types v, W& out, const abstract_type& type, bytes_view value) {
     if (!value.empty()) {
-        if (!type.value_length_if_fixed()) {
-            write_vint(out, value.size_bytes());
+        if (type.value_length_if_fixed()) {
+            write(v, out, value);
+        } else {
+            write_vint(out, value.size());
+            write(v, out, value);
         }
-        using boost::range::for_each;
-        for_each(value, [&] (bytes_view fragment) { write(v, out, fragment); });
     }
 }
 

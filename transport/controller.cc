@@ -70,11 +70,8 @@ future<> controller::do_start_server() {
         auto keepalive = cfg.rpc_keepalive();
         cql_transport::cql_server_config cql_server_config;
         cql_server_config.timeout_config = make_timeout_config(cfg);
-        cql_server_config.max_request_size = service::get_local_storage_service()._service_memory_total;
-        cql_server_config.get_max_concurrent_requests_updateable_value = [ss = std::ref(service::get_storage_service())] () -> utils::updateable_value<uint32_t> {
-            return ss.get().local().db().local().get_config().max_concurrent_requests_per_shard;
-        };
-        cql_server_config.get_service_memory_limiter_semaphore = [ss = std::ref(service::get_storage_service())] () -> semaphore& { return ss.get().local()._service_memory_limiter; };
+        cql_server_config.max_request_size = service::get_local_storage_service().service_memory_total();
+        cql_server_config.get_service_memory_limiter_semaphore = [ss = std::ref(service::get_storage_service())] () -> semaphore& { return ss.get().local().service_memory_limiter(); };
         cql_server_config.allow_shard_aware_drivers = cfg.enable_shard_aware_drivers();
         cql_server_config.sharding_ignore_msb = cfg.murmur3_partitioner_ignore_msb_bits();
         if (cfg.native_shard_aware_transport_port.is_set()) {
@@ -98,12 +95,18 @@ future<> controller::do_start_server() {
         };
 
         std::vector<listen_cfg> configs;
+        int native_port_idx = -1, native_shard_aware_port_idx = -1;
 
-        if (cfg.native_transport_port() != 0) {
-            configs.push_back(listen_cfg{ socket_address{ip, cfg.native_transport_port()}, false });
+        if (cfg.native_transport_port.is_set() ||
+                (!cfg.native_transport_port_ssl.is_set() && !cfg.native_transport_port.is_set())) {
+            // Non-SSL port is specified || neither SSL nor non-SSL ports are specified
+            configs.emplace_back(listen_cfg{ socket_address{ip, cfg.native_transport_port()}, false });
+            native_port_idx = 0;
         }
-        if (cfg.native_shard_aware_transport_port.is_set()) {
-            configs.push_back(listen_cfg{ socket_address{ip, cfg.native_shard_aware_transport_port()}, true });
+        if (cfg.native_shard_aware_transport_port.is_set() ||
+                (!cfg.native_shard_aware_transport_port_ssl.is_set() && !cfg.native_shard_aware_transport_port.is_set())) {
+            configs.emplace_back(listen_cfg{ socket_address{ip, cfg.native_shard_aware_transport_port()}, true });
+            native_shard_aware_port_idx = native_port_idx + 1;
         }
 
         // main should have made sure values are clean and neatish
@@ -128,19 +131,24 @@ future<> controller::do_start_server() {
 
             logger.info("Enabling encrypted CQL connections between client and server");
 
-            if (cfg.native_transport_port_ssl.is_set() && cfg.native_transport_port_ssl() != cfg.native_transport_port()) {
+            if (cfg.native_transport_port_ssl.is_set() &&
+                    (!cfg.native_transport_port.is_set() ||
+                    cfg.native_transport_port_ssl() != cfg.native_transport_port())) {
+                // SSL port is specified && non-SSL port is either left out or set to a different value
                 configs.emplace_back(listen_cfg{{ip, cfg.native_transport_port_ssl()}, false, cred});
-            } else {
-                configs[0].cred = cred;
+            } else if (native_port_idx >= 0) {
+                configs[native_port_idx].cred = cred;
             }
-            if (cfg.native_shard_aware_transport_port_ssl.is_set() && cfg.native_shard_aware_transport_port_ssl() != cfg.native_shard_aware_transport_port()) {
+            if (cfg.native_shard_aware_transport_port_ssl.is_set() &&
+                    (!cfg.native_shard_aware_transport_port.is_set() ||
+                    cfg.native_shard_aware_transport_port_ssl() != cfg.native_shard_aware_transport_port())) {
                 configs.emplace_back(listen_cfg{{ip, cfg.native_shard_aware_transport_port_ssl()}, true, std::move(cred)});
-            } else if (cfg.native_shard_aware_transport_port.is_set()) {
-                configs[1].cred = std::move(cred);
+            } else if (native_shard_aware_port_idx >= 0) {
+                configs[native_shard_aware_port_idx].cred = std::move(cred);
             }
         }
 
-        cserver->start(std::ref(_qp), std::ref(_auth_service), std::ref(_mnotifier), cql_server_config, std::ref(_sl_controller)).get();
+        cserver->start(std::ref(_qp), std::ref(_auth_service), std::ref(_mnotifier), std::ref(_db), cql_server_config, std::ref(_sl_controller)).get();
 
         try {
             parallel_for_each(configs, [cserver, keepalive](const listen_cfg & cfg) {

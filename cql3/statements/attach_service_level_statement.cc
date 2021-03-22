@@ -32,7 +32,7 @@ future<> attach_service_level_statement::check_access(service::storage_proxy& sp
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>
-attach_service_level_statement::execute(service::storage_proxy &sp,
+attach_service_level_statement::execute(query_processor& qp,
         service::query_state &state,
         const query_options &) const {
     return state.get_service_level_controller().get_distributed_service_level(_service_level).then([this] (qos::service_levels_info sli) {

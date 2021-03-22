@@ -280,6 +280,10 @@ public:
                 // We are passing only dead (purged) data so pass is_live=false.
                 gc_consumer.consume(std::move(sr_garbage), current_tombstone, false);
             });
+        } else {
+            if (can_purge_tombstone(current_tombstone)) {
+                current_tombstone = {};
+            }
         }
         _static_row_live = is_live;
         if (is_live || (!only_live() && !sr.empty())) {
@@ -322,6 +326,10 @@ public:
                 // We are passing only dead (purged) data so pass is_live=false.
                 gc_consumer.consume(std::move(cr_garbage), t, false);
             });
+        } else {
+            if (can_purge_tombstone(t)) {
+                t = {};
+            }
         }
 
         if (only_live() && is_live) {

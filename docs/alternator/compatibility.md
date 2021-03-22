@@ -54,18 +54,48 @@ other options result in significantly better write performance and should be
 considered when the workload involves pure writes (e.g., ingestion of new
 data) or if pure writes and read-modify-writes go to distinct items.
 
+## Authorization
+
+Alternator implements the same [signature protocol](https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html)
+as DynamoDB and the rest of AWS. Clients use, as usual, an access key ID and
+a secret access key to prove their identity and the authenticity of their
+request. Alternator can then validate the authenticity and authorization of
+each request using a known list of authorized key pairs.
+
+In the current implementation, the user stores the list of allowed key pairs
+in the `system_auth.roles` table: The access key ID is the `role` column, and
+the secret key is the `salted_hash`, i.e., the secret key can be found by
+`SELECT salted_hash from system_auth.roles WHERE role = ID;`.
+
+By default, authorization is not enforced at all. It can be turned on
+by providing an entry in Scylla configuration:
+    `alternator_enforce_authorization: true`
+
+Although Alternator implements DynamoDB's authentication, including the
+possibility of listing multiple allowed key pairs, there is currently no
+implementation of _access control_. All authenticated key pairs currently get
+full access to the entire database. This is in contrast with DynamoDB which
+supports fine-grain access controls via "IAM policies" - which give each
+authenticated user access to a different subset of the tables, different
+allowed operations, and even different permissions for individual items.
+All of this is not yet implemented in Alternator.
+
+### Metrics
+
+Scylla has an advanced and extensive monitoring framework for inspecting
+and graphing hundreds of different metrics of Scylla's usage and performance.
+Scylla's monitoring stack, based on Grafana and Prometheus, is described in
+https://docs.scylladb.com/operating-scylla/monitoring/.
+This monitoring stack is different from DynamoDB's offering - but Scylla's
+is significantly more powerful and gives the user better insights on
+the internals of the database and its performance.
+
 ## Unimplemented API features
 
 In general, every DynamoDB API feature available in Amazon DynamoDB should
 behave the same in Alternator. However, there are a few features which we have
 not implemented yet. Unimplemented features return an error when used, so
 they should be easy to detect. Here is a list of these unimplemented features:
-
-* Missing support for **atribute paths** like `a.b[3].c`.
-  Nested attributes _are_ supported, but Alternator does not yet allow reading
-  or writing directly a piece of a nested attributes using an attribute path -
-  only top-level attributes can be read or written directly.
-  https://github.com/scylladb/scylla/issues/5024
 
 * Currently in Alternator, a GSI (Global Secondary Index) can only be added
   to a table at table creation time. Unlike DynamoDB which also allows adding

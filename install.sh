@@ -163,6 +163,11 @@ check_usermode_support() {
     [ -n "$user" ]
 }
 
+if ! $packaging && [ ! -d /run/systemd/system/ ]; then
+    echo "systemd is not detected, unsupported distribution."
+    exit 1
+fi
+
 # change directory to the package's root directory
 cd "$(dirname "$0")"
 
@@ -251,7 +256,7 @@ else
     cat << EOS > "$rsystemd"/scylla-node-exporter.service.d/nonroot.conf
 [Service]
 EnvironmentFile=
-EnvironmentFile=$rsysconfdir/scylla-node-exporter
+EnvironmentFile=$(realpath -m "$rsysconfdir/scylla-node-exporter")
 ExecStart=
 ExecStart=$rprefix/node_exporter/node_exporter $SCYLLA_NODE_EXPORTER_ARGS
 User=
@@ -261,6 +266,7 @@ EOS
 fi
 
 # scylla-server
+install -m755 -d "$rprefix"
 install -m755 -d "$rsysconfdir"
 install -m755 -d "$retc/scylla.d"
 installconfig 644 dist/common/sysconfig/scylla-housekeeping "$rsysconfdir"
@@ -329,11 +335,12 @@ EnvironmentFile=
 EnvironmentFile=$sysconfdir/scylla-housekeeping
 EOS
     done
+        cat << EOS > "$rprefix"/scripts/scylla_sysconfdir.py
+SYSCONFDIR="$sysconfdir"
+EOS
     fi
-    install -m755 -d "$retc/security/limits.d"
     install -m755 -d "$rusr/bin"
     install -m755 -d "$rhkdata"
-    install -m644 dist/common/limits.d/scylla.conf -Dt "$retc"/security/limits.d
     ln -srf "$rprefix/bin/scylla" "$rusr/bin/scylla"
     ln -srf "$rprefix/bin/iotune" "$rusr/bin/iotune"
     ln -srf "$rprefix/bin/scyllatop" "$rusr/bin/scyllatop"
@@ -362,7 +369,7 @@ else
         cat << EOS > "$rsystemd"/scylla-server.service.d/nonroot.conf
 [Service]
 EnvironmentFile=
-EnvironmentFile=$rsysconfdir/scylla-server
+EnvironmentFile=$(realpath -m "$rsysconfdir/scylla-server")
 EnvironmentFile=$retc/scylla.d/*.conf
 ExecStartPre=
 ExecStart=
@@ -374,7 +381,7 @@ EOS
         cat << EOS > "$rsystemd"/scylla-server.service.d/nonroot.conf
 [Service]
 EnvironmentFile=
-EnvironmentFile=$rsysconfdir/scylla-server
+EnvironmentFile=$(realpath -m "$rsysconfdir/scylla-server")
 EnvironmentFile=$retc/scylla.d/*.conf
 ExecStartPre=
 ExecStartPre=$rprefix/scripts/scylla_logrotate
@@ -386,6 +393,9 @@ StandardOutput=
 StandardOutput=file:$rprefix/scylla-server.log
 StandardError=
 StandardError=inherit
+EOS
+        cat << EOS > "$rprefix"/scripts/scylla_sysconfdir.py
+SYSCONFDIR="$sysconfdir"
 EOS
     fi
 
@@ -441,7 +451,8 @@ elif ! $packaging; then
 
     for file in dist/common/sysctl.d/*.conf; do
         bn=$(basename "$file")
-        sysctl -p "$rusr"/lib/sysctl.d/"$bn"
+        # ignore error since some kernel may not have specified parameter
+        sysctl -p "$rusr"/lib/sysctl.d/"$bn" || :
     done
     $rprefix/scripts/scylla_post_install.sh
     echo "Scylla offline install completed."

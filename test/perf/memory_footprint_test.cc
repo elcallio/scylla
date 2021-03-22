@@ -29,6 +29,8 @@
 #include "test/lib/reader_permit.hh"
 
 class size_calculator {
+    using cells_type = row::sparse_array_type;
+
     class nest {
     public:
         static thread_local int level;
@@ -62,7 +64,23 @@ public:
         std::cout << prefix() << "sizeof(lru_link_type) = " << sizeof(rows_entry::lru_link_type) << "\n";
         std::cout << prefix() << "sizeof(deletable_row) = " << sizeof(deletable_row) << "\n";
         std::cout << prefix() << "sizeof(row) = " << sizeof(row) << "\n";
+        std::cout << prefix() << "radix_tree::inner_node::node_sizes = ";
+        for (int i = 4; i <= 128; i *= 2) {
+            std::cout << " " << cells_type::inner_node::node_type::node_size(cells_type::layout::direct_dynamic, i);
+        }
+        std::cout << "\n";
+        std::cout << prefix() << "radix_tree::leaf_node::node_sizes = ";
+        std::cout << " " << cells_type::leaf_node::node_type::node_size(cells_type::layout::indirect_tiny, 0);
+        std::cout << " " << cells_type::leaf_node::node_type::node_size(cells_type::layout::indirect_small, 0);
+        std::cout << " " << cells_type::leaf_node::node_type::node_size(cells_type::layout::indirect_medium, 0);
+        std::cout << " " << cells_type::leaf_node::node_type::node_size(cells_type::layout::indirect_large, 0);
+        std::cout << " " << cells_type::leaf_node::node_type::node_size(cells_type::layout::direct_static, 0);
+        std::cout << "\n";
+
         std::cout << prefix() << "sizeof(atomic_cell_or_collection) = " << sizeof(atomic_cell_or_collection) << "\n";
+        std::cout << prefix() << "btree::linear_node_size(1) = " << mutation_partition::rows_type::node::linear_node_size(1) << "\n";
+        std::cout << prefix() << "btree::inner_node_size = " << mutation_partition::rows_type::node::inner_node_size << "\n";
+        std::cout << prefix() << "btree::leaf_node_size = " << mutation_partition::rows_type::node::leaf_node_size << "\n";
     }
 
     static void print_mutation_partition_size() {
@@ -185,8 +203,7 @@ static sizes calculate_sizes(cache_tracker& tracker, const mutation_settings& se
     result.cache = tracker.region().occupancy().used_space() - cache_initial_occupancy;
     result.frozen = freeze(m).representation().size();
     result.canonical = canonical_mutation(m).representation().size();
-    result.query_result = m.query(partition_slice_builder(*s).build(),
-            query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size }, query::result_options::only_result()).buf().size();
+    result.query_result = query_mutation(mutation(m), partition_slice_builder(*s).build()).buf().size();
 
     tmpdir sstable_dir;
     sstables::test_env::do_with_async([&] (sstables::test_env& env) {

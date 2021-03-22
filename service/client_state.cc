@@ -38,7 +38,6 @@
 #include "db/system_keyspace.hh"
 #include "db/schema_tables.hh"
 #include "tracing/trace_keyspace_helper.hh"
-#include "storage_service.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "database.hh"
 #include "cdc/log.hh"
@@ -183,8 +182,7 @@ future<> service::client_state::has_access(const sstring& ks, auth::command_desc
         }
     }
 
-    if (service::get_local_storage_service().db().local().features().cluster_supports_cdc()
-        && cmd.resource.kind() == auth::resource_kind::data) {
+    if (cmd.resource.kind() == auth::resource_kind::data) {
         const auto resource_view = auth::data_resource_view(cmd.resource);
         if (resource_view.table()) {
             if (cmd.permission == auth::permission::DROP) {
@@ -199,8 +197,9 @@ future<> service::client_state::has_access(const sstring& ks, auth::command_desc
 
             if (cdc_topology_description_forbidden_permissions.contains(cmd.permission)) {
                 if (ks == db::system_distributed_keyspace::NAME
-                        && (resource_view.table() == db::system_distributed_keyspace::CDC_DESC
-                        || resource_view.table() == db::system_distributed_keyspace::CDC_TOPOLOGY_DESCRIPTION)) {
+                        && (resource_view.table() == db::system_distributed_keyspace::CDC_DESC_V2
+                        || resource_view.table() == db::system_distributed_keyspace::CDC_TOPOLOGY_DESCRIPTION
+                        || resource_view.table() == db::system_distributed_keyspace::CDC_TIMESTAMPS)) {
                     throw exceptions::unauthorized_exception(
                             format("Cannot {} {}", auth::permissions::to_string(cmd.permission), cmd.resource));
                 }

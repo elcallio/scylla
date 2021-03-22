@@ -53,6 +53,7 @@ constexpr std::string_view features::PER_TABLE_CACHING = "PER_TABLE_CACHING";
 constexpr std::string_view features::DIGEST_FOR_NULL_VALUES = "DIGEST_FOR_NULL_VALUES";
 constexpr std::string_view features::CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX = "CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX";
 constexpr std::string_view features::ALTERNATOR_STREAMS = "ALTERNATOR_STREAMS";
+constexpr std::string_view features::RANGE_SCAN_DATA_VARIANT = "RANGE_SCAN_DATA_VARIANT";
 constexpr std::string_view features::IN_MEMORY_TABLES = "IN_MEMORY_TABLES";
 constexpr std::string_view features::WORKLOAD_PRIORITIZATION = "WORKLOAD_PRIORITIZATION";
 
@@ -81,6 +82,7 @@ feature_service::feature_service(feature_config cfg) : _config(cfg)
         , _digest_for_null_values_feature(*this, features::DIGEST_FOR_NULL_VALUES)
         , _correct_idx_token_in_secondary_index_feature(*this, features::CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX)
         , _alternator_streams_feature(*this, features::ALTERNATOR_STREAMS)
+        , _range_scan_data_variant(*this, features::RANGE_SCAN_DATA_VARIANT)
         , _in_memory_tables(*this, features::IN_MEMORY_TABLES)
         , _workload_prioritization(*this, features::WORKLOAD_PRIORITIZATION)
 {}
@@ -186,6 +188,7 @@ std::set<std::string_view> feature_service::known_feature_set() {
         gms::features::DIGEST_FOR_NULL_VALUES,
         gms::features::CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX,
         gms::features::ALTERNATOR_STREAMS,
+        gms::features::RANGE_SCAN_DATA_VARIANT,
         gms::features::IN_MEMORY_TABLES,
         gms::features::WORKLOAD_PRIORITIZATION,
     };
@@ -270,6 +273,7 @@ void feature_service::enable(const std::set<std::string_view>& list) {
         std::ref(_digest_for_null_values_feature),
         std::ref(_correct_idx_token_in_secondary_index_feature),
         std::ref(_alternator_streams_feature),
+        std::ref(_range_scan_data_variant),
         std::ref(_in_memory_tables),
         std::ref(_workload_prioritization),
     })

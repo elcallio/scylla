@@ -18,6 +18,7 @@
 #include <seastar/testing/test_runner.hh>
 #include "schema_builder.hh"
 #include "release.hh"
+#include <fstream>
 
 static const sstring table_name = "cf";
 

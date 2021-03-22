@@ -759,8 +759,7 @@ SEASTAR_TEST_CASE(test_querying_of_mutation) {
 
         auto resultify = [s] (const mutation& m) -> query::result_set {
             auto slice = make_full_slice(*s);
-            return query::result_set::from_raw_result(s, slice,
-                    m.query(slice, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size }));
+            return query::result_set::from_raw_result(s, slice, query_mutation(mutation(m), slice));
         };
 
         mutation m(s, partition_key::from_single_value(*s, "key1"));
@@ -795,8 +794,7 @@ SEASTAR_TEST_CASE(test_partition_with_no_live_data_is_absent_in_data_query_resul
 
         auto slice = make_full_slice(*s);
 
-        assert_that(query::result_set::from_raw_result(s, slice,
-                    m.query(slice, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size })))
+        assert_that(query::result_set::from_raw_result(s, slice, query_mutation(mutation(m), slice)))
             .is_empty();
     });
 }
@@ -820,7 +818,7 @@ SEASTAR_TEST_CASE(test_partition_with_live_data_in_static_row_is_present_in_the_
             .build();
 
         assert_that(query::result_set::from_raw_result(s, slice,
-                    m.query(slice, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size })))
+                query_mutation(mutation(m), slice)))
             .has_only(a_row()
                 .with_column("pk", data_value(bytes("key1")))
                 .with_column("v", data_value::make_null(bytes_type)));
@@ -844,7 +842,7 @@ SEASTAR_TEST_CASE(test_query_result_with_one_regular_column_missing) {
         auto slice = partition_slice_builder(*s).build();
 
         assert_that(query::result_set::from_raw_result(s, slice,
-                    m.query(slice, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size })))
+                query_mutation(mutation(m), slice)))
             .has_only(a_row()
                 .with_column("pk", data_value(bytes("key1")))
                 .with_column("ck", data_value(bytes("ck:A")))
@@ -1011,6 +1009,9 @@ SEASTAR_TEST_CASE(test_apply_monotonically_is_monotonic) {
                     }
                     m.partition().apply_monotonically(*m.schema(), std::move(m2), no_cache_tracker, app_stats);
                     assert_that(m).is_equal_to(expected);
+
+                    m = target;
+                    m2 = mutation_partition(*m.schema(), second.partition());
                 });
                 m.partition().apply_monotonically(*m.schema(), std::move(m2), no_cache_tracker, app_stats);
                 d.cancel();
@@ -1225,10 +1226,11 @@ SEASTAR_TEST_CASE(test_query_digest) {
         auto check_digests_equal = [] (const mutation& m1, const mutation& m2) {
             auto ps1 = partition_slice_builder(*m1.schema()).build();
             auto ps2 = partition_slice_builder(*m2.schema()).build();
-            auto digest1 = *m1.query(ps1, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size },
+            auto digest1 = *query_mutation(mutation(m1), ps1, query::max_rows, gc_clock::now(),
                     query::result_options::only_digest(query::digest_algorithm::xxHash)).digest();
-            auto digest2 = *m2.query(ps2, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size },
+            auto digest2 = *query_mutation( mutation(m2), ps2, query::max_rows, gc_clock::now(),
                     query::result_options::only_digest(query::digest_algorithm::xxHash)).digest();
+
             if (digest1 != digest2) {
                 BOOST_FAIL(format("Digest should be the same for {} and {}", m1, m2));
             }
@@ -1477,8 +1479,7 @@ SEASTAR_THREAD_TEST_CASE(test_querying_expired_rows) {
                 .without_partition_key_columns()
                 .build();
         auto opts = query::result_options{query::result_request::result_and_digest, query::digest_algorithm::xxHash};
-        return query::result_set::from_raw_result(s, slice,
-                m.query(slice, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size }, opts, t));
+        return query::result_set::from_raw_result(s, slice, query_mutation(mutation(m), slice, query::max_rows, t, opts));
     };
 
     mutation m(s, pk);
@@ -1542,8 +1543,7 @@ SEASTAR_TEST_CASE(test_querying_expired_cells) {
                     .without_partition_key_columns()
                     .build();
             auto opts = query::result_options{query::result_request::result_and_digest, query::digest_algorithm::xxHash};
-            return query::result_set::from_raw_result(s, slice,
-                    m.query(slice, query::result_memory_accounter{ query::result_memory_limiter::unlimited_result_size }, opts, t));
+            return query::result_set::from_raw_result(s, slice, query_mutation(mutation(m), slice, query::max_rows, t, opts));
         };
 
         {
@@ -1794,12 +1794,16 @@ SEASTAR_TEST_CASE(test_mutation_diff_with_random_generator) {
                 BOOST_FAIL(format("Partitions don't match, got: {}\n...and: {}", mutation_partition::printer(s, mp1), mutation_partition::printer(s, mp2)));
             }
         };
-        for_each_mutation_pair([&] (auto&& m1, auto&& m2, are_equal eq) {
+        const auto now = gc_clock::now();
+        can_gc_fn never_gc = [] (tombstone) { return false; };
+        for_each_mutation_pair([&] (auto m1, auto m2, are_equal eq) {
             mutation_application_stats app_stats;
             auto s = m1.schema();
             if (s != m2.schema()) {
                 return;
             }
+            m1.partition().compact_for_compaction(*s, never_gc, now);
+            m2.partition().compact_for_compaction(*s, never_gc, now);
             auto m12 = m1;
             m12.apply(m2);
             auto m12_with_diff = m1;
@@ -1891,8 +1895,11 @@ SEASTAR_TEST_CASE(test_continuity_merging) {
 }
 
 class measuring_allocator final : public allocation_strategy {
-    size_t _allocated_bytes;
+    size_t _allocated_bytes = 0;
 public:
+    measuring_allocator() {
+        _preferred_max_contiguous_allocation = standard_allocator().preferred_max_contiguous_allocation();
+    }
     virtual void* alloc(migrate_fn mf, size_t size, size_t alignment) override {
         _allocated_bytes += size;
         return standard_allocator().alloc(mf, size, alignment);
@@ -1969,16 +1976,25 @@ SEASTAR_THREAD_TEST_CASE(test_cell_equals) {
     BOOST_REQUIRE(!c4.equals(*bytes_type, c1));
 }
 
+// Global to avoid elimination by the compiler; see below for use
+thread_local data_type force_type_thread_local_init_evaluation [[gnu::used]];
+
 SEASTAR_THREAD_TEST_CASE(test_cell_external_memory_usage) {
     measuring_allocator alloc;
 
+    // Force evaluation of int32_type and all the other types. This is so
+    // the compiler doesn't reorder it into the with_allocator section, below,
+    // and any managed_bytes instances creates during that operation interfere
+    // with the measurements.
+    force_type_thread_local_init_evaluation = int32_type;
+    // optimization barrier
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 
     auto test_live_atomic_cell = [&] (data_type dt, bytes_view bv) {
         with_allocator(alloc, [&] {
             auto before = alloc.allocated_bytes();
             auto ac = atomic_cell_or_collection(atomic_cell::make_live(*dt, 1, bv));
             auto after = alloc.allocated_bytes();
-            BOOST_CHECK_GE(ac.external_memory_usage(*dt), bv.size());
             BOOST_CHECK_EQUAL(ac.external_memory_usage(*dt), after - before);
         });
     };
@@ -2006,7 +2022,6 @@ SEASTAR_THREAD_TEST_CASE(test_cell_external_memory_usage) {
             auto before = alloc.allocated_bytes();
             auto cell2 = cell.copy(*collection_type);
             auto after = alloc.allocated_bytes();
-            BOOST_CHECK_GE(cell2.external_memory_usage(*collection_type), bv.size());
             BOOST_CHECK_EQUAL(cell2.external_memory_usage(*collection_type), cell.external_memory_usage(*collection_type));
             BOOST_CHECK_EQUAL(cell2.external_memory_usage(*collection_type), after - before);
         });

@@ -15,6 +15,7 @@
 #include "sstables/sstables.hh"
 #include <seastar/core/do_with.hh>
 #include "test/lib/cql_test_env.hh"
+#include "cdc/generation_service.hh"
 #include "cql3/functions/functions.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/query_options.hh"
@@ -24,6 +25,7 @@
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/scheduling.hh>
+#include <seastar/core/reactor.hh>
 #include "utils/UUID_gen.hh"
 #include "service/migration_manager.hh"
 #include "sstables/compaction_manager.hh"
@@ -111,13 +113,14 @@ private:
     sharded<db::view::view_builder>& _view_builder;
     sharded<db::view::view_update_generator>& _view_update_generator;
     sharded<service::migration_notifier>& _mnotifier;
+    sharded<cdc::generation_service>& _cdc_generation_service;
     sharded<qos::service_level_controller>& _sl_controller;
 private:
     struct core_local_state {
         service::client_state client_state;
 
         core_local_state(auth::service& auth_service)
-            : client_state(service::client_state::external_tag{}, auth_service)
+            : client_state(service::client_state::external_tag{}, auth_service, infinite_timeout_config)
         {
             client_state.set_login(auth::authenticated_user(testing_superuser));
         }
@@ -143,6 +146,7 @@ public:
             sharded<db::view::view_builder>& view_builder,
             sharded<db::view::view_update_generator>& view_update_generator,
             sharded<service::migration_notifier>& mnotifier,
+            sharded<cdc::generation_service>& cdc_generation_service,
             sharded<qos::service_level_controller> &sl_controller)
             : _feature_service(feature_service)
             , _db(db)
@@ -151,6 +155,7 @@ public:
             , _view_builder(view_builder)
             , _view_update_generator(view_update_generator)
             , _mnotifier(mnotifier)
+            , _cdc_generation_service(cdc_generation_service)
             , _sl_controller(sl_controller)
     { }
 
@@ -183,7 +188,7 @@ public:
         db::consistency_level cl = db::consistency_level::ONE) override {
 
         const auto& so = cql3::query_options::specific_options::DEFAULT;
-        auto options = std::make_unique<cql3::query_options>(cl, infinite_timeout_config,
+        auto options = std::make_unique<cql3::query_options>(cl,
                 std::move(values), cql3::query_options::specific_options{
                             so.page_size,
                             so.state,
@@ -220,7 +225,7 @@ public:
             throw std::runtime_error(format("get_stmt_mutations: not a modification statement: {}", text));
         }
         auto& qo = cql3::query_options::DEFAULT;
-        auto timeout = db::timeout_clock::now() + qo.get_timeout_config().write_timeout;
+        auto timeout = db::timeout_clock::now() + qs->get_client_state().get_timeout_config().write_timeout;
 
         return modif_stmt->get_mutations(local_qp().proxy(), qo, timeout, false, qo.get_timestamp(*qs), *qs)
             .finally([qs, modif_stmt = std::move(modif_stmt)] {});
@@ -351,6 +356,12 @@ public:
         using namespace std::filesystem;
 
         return seastar::async([cfg_in = std::move(cfg_in), func] {
+            // disable reactor stall detection during startup
+            auto blocked_reactor_notify_ms = engine().get_blocked_reactor_notify_ms();
+            smp::invoke_on_all([] {
+                engine().update_blocked_reactor_notify_ms(std::chrono::milliseconds(1000000));
+            }).get();
+
             logalloc::prime_segment_pool(memory::stats().total_memory(), memory::min_free_memory()).get();
             bool old_active = false;
             if (!active.compare_exchange_strong(old_active, true)) {
@@ -467,11 +478,12 @@ public:
             auto stop_cql_config = defer([&] { cql_config.stop().get(); });
 
             sharded<db::view::view_update_generator> view_update_generator;
+            sharded<cdc::generation_service> cdc_generation_service;
 
             auto& ss = service::get_storage_service();
             service::storage_service_config sscfg;
             sscfg.available_memory = memory::stats().total_memory();
-            ss.start(std::ref(abort_sources), std::ref(db), std::ref(gms::get_gossiper()), std::ref(sys_dist_ks), std::ref(view_update_generator), std::ref(feature_service), sscfg, std::ref(mm_notif), std::ref(token_metadata), std::ref(ms), std::ref(sl_controller), true).get();
+            ss.start(std::ref(abort_sources), std::ref(db), std::ref(gms::get_gossiper()), std::ref(sys_dist_ks), std::ref(view_update_generator), std::ref(feature_service), sscfg, std::ref(mm_notif), std::ref(token_metadata), std::ref(ms), std::ref(cdc_generation_service), std::ref(sl_controller), true).get();
             auto stop_storage_service = defer([&ss] { ss.stop().get(); });
 
             sharded<semaphore> sst_dir_semaphore;
@@ -503,6 +515,10 @@ public:
                 ss.enable_all_features();
             }).get();
 
+            smp::invoke_on_all([blocked_reactor_notify_ms] {
+                engine().update_blocked_reactor_notify_ms(blocked_reactor_notify_ms);
+            }).get();
+
             service::storage_proxy::config spcfg {
                 .hints_directory_initializer = db::hints::directory_initializer::make_dummy(),
             };
@@ -518,7 +534,7 @@ public:
 
             sharded<cql3::query_processor> qp;
             cql3::query_processor::memory_config qp_mcfg = {memory::stats().total_memory() / 256, memory::stats().total_memory() / 2560};
-            qp.start(std::ref(proxy), std::ref(db), std::ref(mm_notif), qp_mcfg, std::ref(cql_config), std::ref(sl_controller)).get();
+            qp.start(std::ref(proxy), std::ref(db), std::ref(mm_notif), std::ref(mm), qp_mcfg, std::ref(cql_config), std::ref(sl_controller)).get();
             auto stop_qp = defer([&qp] { qp.stop().get(); });
 
             // In main.cc we call db::system_keyspace::setup which calls
@@ -553,12 +569,6 @@ public:
                 }
             }).get();
 
-            sharded<cdc::cdc_service> cdc;
-            cdc.start(std::ref(proxy)).get();
-            auto stop_cdc_service = defer([&] {
-                cdc.stop().get();
-            });
-
             auto stop_system_keyspace = defer([] { db::qctx = {}; });
             start_large_data_handler(db).get();
 
@@ -573,7 +583,19 @@ public:
             db::system_keyspace::init_local_cache().get();
             auto stop_local_cache = defer([] { db::system_keyspace::deinit_local_cache().get(); });
 
-            sys_dist_ks.start(std::ref(qp), std::ref(mm)).get();
+            sys_dist_ks.start(std::ref(qp), std::ref(mm), std::ref(proxy)).get();
+
+            cdc_generation_service.start(std::ref(*cfg), std::ref(gms::get_gossiper()), std::ref(sys_dist_ks), std::ref(abort_sources), std::ref(token_metadata)).get();
+            auto stop_cdc_generation_service = defer([&cdc_generation_service] {
+                cdc_generation_service.stop().get();
+            });
+
+            sharded<cdc::cdc_service> cdc;
+            auto get_cdc_metadata = [] (cdc::generation_service& svc) { return std::ref(svc.get_cdc_metadata()); };
+            cdc.start(std::ref(proxy), sharded_parameter(get_cdc_metadata, std::ref(cdc_generation_service))).get();
+            auto stop_cdc_service = defer([&] {
+                cdc.stop().get();
+            });
 
             service::get_local_storage_service().init_server(service::bind_messaging_port(false)).get();
             service::get_local_storage_service().join_cluster().get();
@@ -626,7 +648,7 @@ public:
                 // The default user may already exist if this `cql_test_env` is starting with previously populated data.
             }
 
-            single_node_cql_env env(feature_service, db, qp, auth_service, view_builder, view_update_generator, mm_notif, std::ref(sl_controller));
+            single_node_cql_env env(feature_service, db, qp, auth_service, view_builder, view_update_generator, mm_notif, cdc_generation_service, std::ref(sl_controller));
             env.start().get();
             auto stop_env = defer([&env] { env.stop().get(); });
 
@@ -668,9 +690,9 @@ future<> do_with_cql_env(std::function<future<>(cql_test_env&)> func, cql_test_c
     return single_node_cql_env::do_with(func, std::move(cfg_in));
 }
 
-future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func, cql_test_config cfg_in) {
-    return single_node_cql_env::do_with([func = std::move(func)] (auto& e) {
-        return seastar::async([func = std::move(func), &e] {
+future<> do_with_cql_env_thread(std::function<void(cql_test_env&)> func, cql_test_config cfg_in, thread_attributes thread_attr) {
+    return single_node_cql_env::do_with([func = std::move(func), thread_attr] (auto& e) {
+        return seastar::async(thread_attr, [func = std::move(func), &e] {
             return func(e);
         });
     }, std::move(cfg_in));

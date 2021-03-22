@@ -40,7 +40,6 @@
 #include "cql3/column_identifier.hh"
 #include "cql3/values.hh"
 #include "cql_serialization_format.hh"
-#include "timeout_config.hh"
 
 namespace cql3 {
 
@@ -64,7 +63,6 @@ public:
 private:
     const cql_config& _cql_config;
     const db::consistency_level _consistency;
-    const timeout_config& _timeout_config;
     const std::optional<std::vector<sstring_view>> _names;
     std::vector<cql3::raw_value> _values;
     std::vector<cql3::raw_value_view> _value_views;
@@ -72,7 +70,16 @@ private:
     const specific_options _options;
     cql_serialization_format _cql_serialization_format;
     std::optional<std::vector<query_options>> _batch_options;
-
+    // We must use the same microsecond-precision timestamp for
+    // all cells created by an LWT statement or when a statement
+    // has a user-provided timestamp. In case the statement or
+    // a BATCH appends many values to a list, each value should
+    // get a unique and monotonic timeuuid. This sequence is
+    // used to make all time-based UUIDs:
+    // 1) share the same microsecond,
+    // 2) monotonic
+    // 3) unique.
+    mutable int _list_append_seq = 0;
 private:
     /**
      * @brief Batch query_options constructor.
@@ -98,7 +105,6 @@ public:
 
     explicit query_options(const cql_config& cfg,
                            db::consistency_level consistency,
-                           const timeout_config& timeouts,
                            std::optional<std::vector<sstring_view>> names,
                            std::vector<cql3::raw_value> values,
                            bool skip_metadata,
@@ -106,7 +112,6 @@ public:
                            cql_serialization_format sf);
     explicit query_options(const cql_config& cfg,
                            db::consistency_level consistency,
-                           const timeout_config& timeouts,
                            std::optional<std::vector<sstring_view>> names,
                            std::vector<cql3::raw_value> values,
                            std::vector<cql3::raw_value_view> value_views,
@@ -115,7 +120,6 @@ public:
                            cql_serialization_format sf);
     explicit query_options(const cql_config& cfg,
                            db::consistency_level consistency,
-                           const timeout_config& timeouts,
                            std::optional<std::vector<sstring_view>> names,
                            std::vector<cql3::raw_value_view> value_views,
                            bool skip_metadata,
@@ -147,12 +151,9 @@ public:
 
     // forInternalUse
     explicit query_options(std::vector<cql3::raw_value> values);
-    explicit query_options(db::consistency_level, const timeout_config& timeouts,
-            std::vector<cql3::raw_value> values, specific_options options = specific_options::DEFAULT);
+    explicit query_options(db::consistency_level, std::vector<cql3::raw_value> values, specific_options options = specific_options::DEFAULT);
     explicit query_options(std::unique_ptr<query_options>, lw_shared_ptr<service::pager::paging_state> paging_state);
     explicit query_options(std::unique_ptr<query_options>, lw_shared_ptr<service::pager::paging_state> paging_state, int32_t page_size);
-
-    const timeout_config& get_timeout_config() const { return _timeout_config; }
 
     db::consistency_level get_consistency() const {
         return _consistency;
@@ -230,6 +231,39 @@ public:
         return _cql_config;
     }
 
+    // Generate a next unique list sequence for list append, e.g.
+    // a = a + [val1, val2, ...]
+    int next_list_append_seq() const {
+        return _list_append_seq++;
+    }
+
+    // To preserve prepend monotonicity within a batch, each next
+    // value must get a timestamp that's smaller than the previous one:
+    // BEGIN BATCH
+    //      UPDATE t SET l = [1, 2] + l WHERE pk = 0;
+    //      UPDATE t SET l = [3] + l WHERE pk = 0;
+    //      UPDATE t SET l = [4] + l WHERE pk = 0;
+    // APPLY BATCH
+    // SELECT l FROM t WHERE pk = 0;
+    //  l
+    // ------------
+    // [4, 3, 1, 2]
+    //
+    // This function reserves the given number of prepend entries
+    // and returns an id for the first prepended entry (it
+    // got to be the smallest one, to preserve the order of
+    // a multi-value append).
+    //
+    // @retval sequence number of the first entry of a multi-value
+    // append. To get the next value, add 1.
+    int next_list_prepend_seq(int num_entries, int max_entries) const {
+        if (_list_append_seq + num_entries < max_entries) {
+            _list_append_seq += num_entries;
+            return max_entries - _list_append_seq;
+        }
+        return max_entries;
+    }
+
     void prepare(const std::vector<lw_shared_ptr<column_specification>>& specs);
 private:
     void fill_value_views();
@@ -247,7 +281,7 @@ query_options::query_options(query_options&& o, std::vector<OneMutationDataRange
     std::vector<query_options> tmp;
     tmp.reserve(values_ranges.size());
     std::transform(values_ranges.begin(), values_ranges.end(), std::back_inserter(tmp), [this](auto& values_range) {
-        return query_options(_cql_config, _consistency, _timeout_config, {}, std::move(values_range), _skip_metadata, _options, _cql_serialization_format);
+        return query_options(_cql_config, _consistency, {}, std::move(values_range), _skip_metadata, _options, _cql_serialization_format);
     });
     _batch_options = std::move(tmp);
 }

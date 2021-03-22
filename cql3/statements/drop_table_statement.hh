@@ -36,18 +36,20 @@
 
 namespace cql3 {
 
+class query_processor;
+
 namespace statements {
 
 class drop_table_statement : public schema_altering_statement {
     bool _if_exists;
 public:
-    drop_table_statement(::shared_ptr<cf_name> cf_name, bool if_exists);
+    drop_table_statement(cf_name cf_name, bool if_exists);
 
     virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
 
     virtual void validate(service::storage_proxy&, const service::client_state& state) const override;
 
-    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy) const override;
+    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(query_processor& qp) const override;
 
     virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 };

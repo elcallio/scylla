@@ -37,6 +37,8 @@
 
 namespace cql3 {
 
+class query_processor;
+
 namespace statements {
 
 class alter_table_statement : public schema_altering_statement {
@@ -58,18 +60,18 @@ public:
 private:
     const type _type;
     const std::vector<column_change> _column_changes;
-    const shared_ptr<cf_prop_defs> _properties;
+    const std::optional<cf_prop_defs> _properties;
     const renames_type _renames;
 public:
-    alter_table_statement(shared_ptr<cf_name> name,
+    alter_table_statement(cf_name name,
                           type t,
                           std::vector<column_change> column_changes,
-                          shared_ptr<cf_prop_defs> properties,
+                          std::optional<cf_prop_defs> properties,
                           renames_type renames);
 
     virtual future<> check_access(service::storage_proxy& proxy, const service::client_state& state) const override;
     virtual void validate(service::storage_proxy& proxy, const service::client_state& state) const override;
-    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(service::storage_proxy& proxy) const override;
+    virtual future<shared_ptr<cql_transport::event::schema_change>> announce_migration(query_processor& qp) const override;
     virtual std::unique_ptr<prepared_statement> prepare(database& db, cql_stats& stats) override;
 private:
     void add_column(const schema& schema, const table& cf, schema_builder& cfm, std::vector<view_ptr>& view_updates, const column_identifier& column_name, const cql3_type validator, const column_definition* def, bool is_static) const;

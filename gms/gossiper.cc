@@ -398,6 +398,9 @@ future<> gossiper::handle_ack2_msg(gossip_digest_ack2 msg) {
 }
 
 future<> gossiper::handle_echo_msg() {
+    if (!_advertise_myself) {
+        return make_exception_future(std::runtime_error("Not ready to respond gossip echo message"));
+    }
     return make_ready_future<>();
 }
 
@@ -1716,13 +1719,16 @@ void gossiper::examine_gossiper(utils::chunked_vector<gossip_digest>& g_digest_l
 }
 
 future<> gossiper::start_gossiping(int generation_number, bind_messaging_port do_bind) {
-    return start_gossiping(generation_number, std::map<application_state, versioned_value>(), do_bind);
+    return start_gossiping(generation_number, std::map<application_state, versioned_value>(), do_bind, gms::advertise_myself::yes);
 }
 
-future<> gossiper::start_gossiping(int generation_nbr, std::map<application_state, versioned_value> preload_local_states, bind_messaging_port do_bind) {
+future<> gossiper::start_gossiping(int generation_nbr, std::map<application_state, versioned_value> preload_local_states, bind_messaging_port do_bind, gms::advertise_myself advertise) {
     // Although gossiper runs on cpu0 only, we need to listen incoming gossip
     // message on all cpus and forard them to cpu0 to process.
-    return get_gossiper().invoke_on_all([do_bind] (gossiper& g) {
+    return get_gossiper().invoke_on_all([do_bind, advertise] (gossiper& g) {
+        if (!advertise) {
+            g._advertise_myself = false;
+        }
         return g.init_messaging_service_handler(do_bind);
     }).then([this, generation_nbr, preload_local_states] () mutable {
         build_seeds_list();
@@ -1749,6 +1755,12 @@ future<> gossiper::start_gossiping(int generation_nbr, std::map<application_stat
             _scheduled_gossip_task.arm(INTERVAL);
             return make_ready_future<>();
         });
+    });
+}
+
+future<> gossiper::advertise_myself() {
+    return container().invoke_on_all([] (auto& g) {
+        g._advertise_myself = true;
     });
 }
 
@@ -1781,6 +1793,8 @@ future<> gossiper::do_shadow_round(std::unordered_set<gms::inet_address> nodes, 
                 }).handle_exception_type([node, &fall_back_to_syn_msg] (seastar::rpc::unknown_verb_error&) {
                     logger.warn("Node {} does not support get_endpoint_states verb", node);
                     fall_back_to_syn_msg = true;
+                }).handle_exception_type([node, &nodes_down] (seastar::rpc::timeout_error&) {
+                    logger.warn("The get_endpoint_states verb to node {} was timeout", node);
                 }).handle_exception_type([node, &nodes_down] (seastar::rpc::closed_error&) {
                     nodes_down++;
                     logger.warn("Node {} is down for get_endpoint_states verb", node);

@@ -31,6 +31,7 @@
 #include <boost/range/adaptor/map.hpp>
 #include "utils/error_injection.hh"
 #include "utils/histogram_metrics_helper.hh"
+#include "mutation_source_metadata.hh"
 
 static logging::logger tlogger("table");
 static seastar::metrics::label column_family_label("cf");
@@ -79,9 +80,8 @@ table::make_sstable_reader(schema_ptr s,
                     tracing::trace_state_ptr trace_state,
                     streamed_mutation::forwarding fwd,
                     mutation_reader::forwarding fwd_mr) {
-                assert(pr.is_singular() && pr.start()->value().has_key());
                 return sstables->create_single_key_sstable_reader(const_cast<column_family*>(this), std::move(s), std::move(permit),
-                        _stats.estimated_sstable_per_read, pr.start()->value(), slice, pc, std::move(trace_state), fwd, fwd_mr);
+                        _stats.estimated_sstable_per_read, pr, slice, pc, std::move(trace_state), fwd, fwd_mr);
             });
         } else {
             return mutation_source([sstables=std::move(sstables)] (
@@ -239,6 +239,17 @@ flat_mutation_reader table::make_streaming_reader(schema_ptr schema, const dht::
     return make_combined_reader(std::move(schema), std::move(permit), std::move(readers), fwd, fwd_mr);
 }
 
+flat_mutation_reader table::make_streaming_reader(schema_ptr schema, const dht::partition_range& range,
+        lw_shared_ptr<sstables::sstable_set> sstables) const {
+    auto permit = _config.streaming_read_concurrency_semaphore->make_permit(schema.get(), "load-and-stream");
+    auto& slice = schema->full_slice();
+    const auto& pc = service::get_local_streaming_priority();
+    auto trace_state = tracing::trace_state_ptr();
+    const auto fwd = streamed_mutation::forwarding::no;
+    const auto fwd_mr = mutation_reader::forwarding::no;
+    return make_sstable_reader(schema, permit, sstables, range, slice, pc, std::move(trace_state), fwd, fwd_mr);
+}
+
 future<std::vector<locked_cell>> table::lock_counter_cells(const mutation& m, db::timeout_clock::time_point timeout) {
     assert(m.schema() == _counter_cell_locks->schema());
     return _counter_cell_locks->lock_cells(m.decorated_key(), partition_cells_range(m.partition()), timeout);
@@ -315,6 +326,14 @@ void table::load_sstable(sstables::shared_sstable& sst, bool reset_level) {
     add_sstable(sst);
 }
 
+void table::notify_bootstrap_or_replace_start() {
+    _is_bootstrap_or_replace = true;
+}
+
+void table::notify_bootstrap_or_replace_end() {
+    _is_bootstrap_or_replace = false;
+}
+
 void table::update_stats_for_new_sstable(uint64_t disk_space_used_by_sstable) noexcept {
     _stats.live_disk_space_used += disk_space_used_by_sstable;
     _stats.total_disk_space_used += disk_space_used_by_sstable;
@@ -358,11 +377,23 @@ table::add_sstable_and_update_cache(sstables::shared_sstable sst) {
 }
 
 future<>
-table::update_cache(lw_shared_ptr<memtable> m, sstables::shared_sstable sst) {
-    auto adder = row_cache::external_updater([this, m, sst] {
-        auto newtab_ms = sst->as_mutation_source();
-        add_sstable(sst);
-        m->mark_flushed(std::move(newtab_ms));
+table::update_cache(lw_shared_ptr<memtable> m, std::vector<sstables::shared_sstable> ssts) {
+    mutation_source_opt ms_opt;
+    if (ssts.size() == 1) {
+        ms_opt = ssts.front()->as_mutation_source();
+    } else {
+        std::vector<mutation_source> sources;
+        sources.reserve(ssts.size());
+        for (auto& sst : ssts) {
+            sources.push_back(sst->as_mutation_source());
+        }
+        ms_opt = make_combined_mutation_source(std::move(sources));
+    }
+    auto adder = row_cache::external_updater([this, m, ssts = std::move(ssts), new_ssts_ms = std::move(*ms_opt)] () mutable {
+        for (auto& sst : ssts) {
+            add_sstable(sst);
+        }
+        m->mark_flushed(std::move(new_ssts_ms));
         try_trigger_compaction();
     });
     if (cache_enabled()) {
@@ -375,9 +406,9 @@ table::update_cache(lw_shared_ptr<memtable> m, sstables::shared_sstable sst) {
 // Handles permit management only, used for situations where we don't want to inform
 // the compaction manager about backlogs (i.e., tests)
 class permit_monitor : public sstables::write_monitor {
-    sstable_write_permit _permit;
+    lw_shared_ptr<sstable_write_permit> _permit;
 public:
-    permit_monitor(sstable_write_permit&& permit)
+    permit_monitor(lw_shared_ptr<sstable_write_permit> permit)
             : _permit(std::move(permit)) {
     }
 
@@ -387,7 +418,7 @@ public:
         // we'll have a period without significant disk activity when the current
         // SSTable is being sealed, the caches are being updated, etc. To do that,
         // we ensure the permit doesn't outlive this continuation.
-        _permit = sstable_write_permit::unconditional();
+        *_permit = sstable_write_permit::unconditional();
     }
 };
 
@@ -400,8 +431,8 @@ class database_sstable_write_monitor : public permit_monitor, public backlog_wri
     uint64_t _progress_seen = 0;
     api::timestamp_type _maximum_timestamp;
 public:
-    database_sstable_write_monitor(sstable_write_permit&& permit, sstables::shared_sstable sst, compaction_manager& manager,
-                                   sstables::compaction_strategy& strategy, api::timestamp_type max_timestamp)
+    database_sstable_write_monitor(lw_shared_ptr<sstable_write_permit> permit, sstables::shared_sstable sst,
+        compaction_manager& manager, sstables::compaction_strategy& strategy, api::timestamp_type max_timestamp)
             : permit_monitor(std::move(permit))
             , _sst(std::move(sst))
             , _compaction_manager(manager)
@@ -504,9 +535,6 @@ table::seal_active_memtable(flush_permit&& permit) {
 future<stop_iteration>
 table::try_flush_memtable_to_sstable(lw_shared_ptr<memtable> old, sstable_write_permit&& permit) {
   return with_scheduling_group(_config.memtable_scheduling_group, [this, old = std::move(old), permit = std::move(permit)] () mutable {
-    auto newtab = make_sstable();
-
-    tlogger.debug("Flushing to {}", newtab->get_filename());
     // Note that due to our sharded architecture, it is possible that
     // in the face of a value change some shards will backup sstables
     // while others won't.
@@ -518,31 +546,57 @@ table::try_flush_memtable_to_sstable(lw_shared_ptr<memtable> old, sstable_write_
     //
     // The code as is guarantees that we'll never partially backup a
     // single sstable, so that is enough of a guarantee.
-    database_sstable_write_monitor monitor(std::move(permit), newtab, _compaction_manager, _compaction_strategy, old->get_max_timestamp());
-    return do_with(std::move(monitor), [this, old, newtab] (auto& monitor) {
-        auto&& priority = service::get_local_memtable_flush_priority();
-        sstables::sstable_writer_config cfg = get_sstables_manager().configure_writer();
-        cfg.backup = incremental_backups_enabled();
-        auto f = write_memtable_to_sstable(*old, newtab, monitor, cfg, priority);
+
+    return do_with(std::vector<sstables::shared_sstable>(), [this, old, permit = make_lw_shared(std::move(permit))] (auto& newtabs) {
+        auto metadata = mutation_source_metadata{};
+        metadata.min_timestamp = old->get_min_timestamp();
+        metadata.max_timestamp = old->get_max_timestamp();
+
+        auto consumer = _compaction_strategy.make_interposer_consumer(metadata, [this, old, permit, &newtabs] (flat_mutation_reader reader) mutable {
+            auto&& priority = service::get_local_memtable_flush_priority();
+            sstables::sstable_writer_config cfg = get_sstables_manager().configure_writer("memtable");
+            cfg.backup = incremental_backups_enabled();
+
+            auto newtab = make_sstable();
+            newtabs.push_back(newtab);
+            tlogger.debug("Flushing to {}", newtab->get_filename());
+
+            auto monitor = database_sstable_write_monitor(permit, newtab, _compaction_manager, _compaction_strategy,
+                old->get_max_timestamp());
+
+            return do_with(std::move(monitor), [newtab, cfg = std::move(cfg), old, reader = std::move(reader), &priority] (auto& monitor) mutable {
+                // FIXME: certain writers may receive only a small subset of the partitions, so bloom filters will be
+                // bigger than needed, due to overestimation. That's eventually adjusted through compaction, though.
+                return write_memtable_to_sstable(std::move(reader), *old, newtab, monitor, cfg, priority);
+            });
+        });
+
+        auto f = consumer(old->make_flush_reader(old->schema(), service::get_local_memtable_flush_priority()));
+
         // Switch back to default scheduling group for post-flush actions, to avoid them being staved by the memtable flush
         // controller. Cache update does not affect the input of the memtable cpu controller, so it can be subject to
         // priority inversion.
-        return with_scheduling_group(default_scheduling_group(), [this, old = std::move(old), newtab = std::move(newtab), f = std::move(f)] () mutable {
-            return f.then([this, newtab, old] {
-                return newtab->open_data().then([this, old, newtab] () {
-                    tlogger.debug("Flushing to {} done", newtab->get_filename());
-                    return with_scheduling_group(_config.memtable_to_cache_scheduling_group, [this, old, newtab] {
-                        return update_cache(old, newtab);
+        return with_scheduling_group(default_scheduling_group(), [this, old = std::move(old), &newtabs, f = std::move(f)] () mutable {
+            return f.then([this, &newtabs, old] {
+                return parallel_for_each(newtabs, [] (auto& newtab) {
+                    return newtab->open_data().then([&newtab] {
+                        tlogger.debug("Flushing to {} done", newtab->get_filename());
                     });
-                }).then([this, old, newtab] () noexcept {
+                }).then([this, old, &newtabs] () {
+                    return with_scheduling_group(_config.memtable_to_cache_scheduling_group, [this, old, &newtabs] {
+                        return update_cache(old, newtabs);
+                    });
+                }).then([this, old, &newtabs] () noexcept {
                     _memtables->erase(old);
-                    tlogger.debug("Memtable for {} replaced", newtab->get_filename());
+                    tlogger.debug("Memtable for {}.{} replaced, into {} sstables", old->schema()->ks_name(), old->schema()->cf_name(), newtabs.size());
                     return stop_iteration::yes;
                 });
-            }).handle_exception([this, old, newtab] (auto e) {
-                newtab->mark_for_deletion();
+            }).handle_exception([this, old, &newtabs] (auto e) {
+                for (auto& newtab : newtabs) {
+                    newtab->mark_for_deletion();
+                    tlogger.error("failed to write sstable {}: {}", newtab->get_filename(), e);
+                }
                 _config.cf_stats->failed_memtables_flushes_count++;
-                tlogger.error("failed to write sstable {}: {}", newtab->get_filename(), e);
                 // If we failed this write we will try the write again and that will create a new flush reader
                 // that will decrease dirty memory again. So we need to reset the accounting.
                 old->revert_flushed_memory();
@@ -641,11 +695,10 @@ void table::rebuild_statistics() {
     _stats.live_disk_space_used = 0;
     _stats.live_sstable_count = 0;
 
-    for (auto&& tab : boost::range::join(_sstables_compacted_but_not_deleted,
-                    // this might seem dangerous, but "move" here just avoids constness,
-                    // making the two ranges compatible when compiling with boost 1.55.
-                    // Noone is actually moving anything...
-                                         std::move(*_sstables->all()))) {
+    _sstables->for_each_sstable([this] (const sstables::shared_sstable& tab) {
+        update_stats_for_new_sstable(tab->bytes_on_disk());
+    });
+    for (auto& tab : _sstables_compacted_but_not_deleted) {
         update_stats_for_new_sstable(tab->bytes_on_disk());
     }
 }
@@ -661,7 +714,7 @@ table::build_new_sstable_list(const std::vector<sstables::shared_sstable>& new_s
     // this might seem dangerous, but "move" here just avoids constness,
     // making the two ranges compatible when compiling with boost 1.55.
     // Noone is actually moving anything...
-    for (auto&& tab : boost::range::join(new_sstables, std::move(*current_sstables->all()))) {
+    for (auto all = current_sstables->all(); auto&& tab : boost::range::join(new_sstables, std::move(*all))) {
         if (!s.contains(tab)) {
             new_sstable_list.insert(tab);
         }
@@ -833,10 +886,10 @@ void table::set_compaction_strategy(sstables::compaction_strategy_type strategy)
     _compaction_strategy.get_backlog_tracker().transfer_ongoing_charges(new_cs.get_backlog_tracker(), move_read_charges);
 
     auto new_sstables = new_cs.make_sstable_set(_schema);
-    for (auto&& s : *_sstables->all()) {
+    _sstables->for_each_sstable([&] (const sstables::shared_sstable& s) {
         add_sstable_to_backlog_tracker(new_cs.get_backlog_tracker(), s);
         new_sstables.insert(s);
-    }
+    });
 
     if (!move_read_charges) {
         _compaction_manager.stop_tracking_ongoing_compactions(this);
@@ -853,14 +906,14 @@ size_t table::sstables_count() const {
 
 std::vector<uint64_t> table::sstable_count_per_level() const {
     std::vector<uint64_t> count_per_level;
-    for (auto&& sst : *_sstables->all()) {
+    _sstables->for_each_sstable([&] (const sstables::shared_sstable& sst) {
         auto level = sst->get_sstable_level();
 
         if (level + 1 > count_per_level.size()) {
             count_per_level.resize(level + 1, 0UL);
         }
         count_per_level[level]++;
-    }
+    });
     return count_per_level;
 }
 
@@ -907,7 +960,8 @@ std::vector<sstables::shared_sstable> table::select_sstables(const dht::partitio
 }
 
 std::vector<sstables::shared_sstable> table::non_staging_sstables() const {
-    return boost::copy_range<std::vector<sstables::shared_sstable>>(*get_sstables()
+    auto sstables = get_sstables();
+    return boost::copy_range<std::vector<sstables::shared_sstable>>(*sstables
             | boost::adaptors::filtered([this] (auto& sst) {
         return !_sstables_staging.contains(sst->generation());
     }));
@@ -1122,10 +1176,10 @@ future<> table::snapshot(database& db, sstring name) {
     return flush().then([this, &db, name = std::move(name)]() {
        return with_semaphore(_sstable_deletion_sem, 1, [this, &db, name = std::move(name)]() {
         // If the SSTables are shared, link this sstable to the snapshot directory only by one of the shards that own it.
-        auto& all = *_sstables->all();
+        auto all = _sstables->all();
         std::vector<sstables::shared_sstable> tables;
-        tables.reserve(all.size());
-        for (auto& sst : all) {
+        tables.reserve(all->size());
+        for (auto& sst : *all) {
             const auto& shards = sst->get_shards_for_this_sstable();
             if (shards.size() <= 1 || shards[0] == this_shard_id()) {
                 tables.emplace_back(sst);
@@ -1251,9 +1305,14 @@ future<std::unordered_map<sstring, table::snapshot_details>> table::get_snapshot
     });
 }
 
-future<> table::flush() {
+future<> table::flush(std::optional<db::replay_position> pos) {
+    if (pos && *pos < _flush_rp) {
+        return make_ready_future<>();
+    }
     auto op = _pending_flushes_phaser.start();
-    return _memtables->request_flush().then([op = std::move(op)] {});
+    return _memtables->request_flush().then([this, op = std::move(op), fp = _highest_rp] {
+        _flush_rp = std::max(_flush_rp, fp);
+    });
 }
 
 bool table::can_flush() const {
@@ -1287,14 +1346,14 @@ future<db::replay_position> table::discard_sstables(db_clock::time_point truncat
 
             auto pruned = make_lw_shared<sstables::sstable_set>(cf._compaction_strategy.make_sstable_set(cf._schema));
 
-            for (auto& p : *cf._sstables->all()) {
+            cf._sstables->for_each_sstable([&] (const sstables::shared_sstable& p) mutable {
                 if (p->max_data_age() <= gc_trunc) {
                     rp = std::max(p->get_stats_metadata().position, rp);
                     remove.emplace_back(p);
-                    continue;
+                    return;
                 }
                 pruned->insert(p);
-            }
+            });
 
             cf._sstables = std::move(pruned);
         }
@@ -1620,19 +1679,29 @@ table::apply(const frozen_mutation& m, const schema_ptr& m_schema, db::rp_handle
 }
 
 future<>
-write_memtable_to_sstable(memtable& mt, sstables::shared_sstable sst,
+write_memtable_to_sstable(flat_mutation_reader reader,
+                          memtable& mt, sstables::shared_sstable sst,
                           sstables::write_monitor& monitor,
                           sstables::sstable_writer_config& cfg,
                           const io_priority_class& pc) {
     cfg.replay_position = mt.replay_position();
     cfg.monitor = &monitor;
-    return sst->write_components(mt.make_flush_reader(mt.schema(), pc), mt.partition_count(),
-        mt.schema(), cfg, mt.get_encoding_stats(), pc);
+    cfg.origin = "memtable";
+    schema_ptr s = reader.schema();
+    return sst->write_components(std::move(reader), mt.partition_count(), s, cfg, mt.get_encoding_stats(), pc);
+}
+
+future<>
+write_memtable_to_sstable(memtable& mt, sstables::shared_sstable sst,
+                          sstables::write_monitor& monitor,
+                          sstables::sstable_writer_config& cfg,
+                          const io_priority_class& pc) {
+    return write_memtable_to_sstable(mt.make_flush_reader(mt.schema(), pc), mt, std::move(sst), monitor, cfg, pc);
 }
 
 future<>
 write_memtable_to_sstable(memtable& mt, sstables::shared_sstable sst, sstables::sstable_writer_config cfg) {
-    return do_with(permit_monitor(sstable_write_permit::unconditional()), cfg, [&mt, sst] (auto& monitor, auto& cfg) {
+    return do_with(permit_monitor(make_lw_shared(sstable_write_permit::unconditional())), cfg, [&mt, sst] (auto& monitor, auto& cfg) {
         return write_memtable_to_sstable(mt, std::move(sst), monitor, cfg);
     });
 }

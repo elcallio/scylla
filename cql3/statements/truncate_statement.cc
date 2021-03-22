@@ -32,14 +32,14 @@
 #include "cql3/statements/prepared_statement.hh"
 #include "cql3/cql_statement.hh"
 #include "database.hh"
-
+#include "cql3/query_processor.hh"
 #include <optional>
 
 namespace cql3 {
 
 namespace statements {
 
-truncate_statement::truncate_statement(::shared_ptr<cf_name> name)
+truncate_statement::truncate_statement(cf_name name)
     : cf_statement{std::move(name)}
     , cql_statement_no_metadata(&timeout_config::truncate_timeout)
 {
@@ -79,12 +79,12 @@ void truncate_statement::validate(service::storage_proxy&, const service::client
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>
-truncate_statement::execute(service::storage_proxy& proxy, service::query_state& state, const query_options& options) const
+truncate_statement::execute(query_processor& qp, service::query_state& state, const query_options& options) const
 {
-    if (proxy.get_db().local().find_schema(keyspace(), column_family())->is_view()) {
+    if (qp.db().find_schema(keyspace(), column_family())->is_view()) {
         throw exceptions::invalid_request_exception("Cannot TRUNCATE materialized view directly; must truncate base table instead");
     }
-    return proxy.truncate_blocking(keyspace(), column_family()).handle_exception([](auto ep) {
+    return qp.proxy().truncate_blocking(keyspace(), column_family()).handle_exception([](auto ep) {
         throw exceptions::truncate_exception(ep);
     }).then([] {
         return ::shared_ptr<cql_transport::messages::result_message>{};

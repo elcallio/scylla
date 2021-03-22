@@ -27,7 +27,9 @@
 #include <fmt/ostream.h>
 #include <unordered_map>
 
+#include "cql3/constants.hh"
 #include "cql3/lists.hh"
+#include "cql3/statements/request_validations.hh"
 #include "cql3/tuples.hh"
 #include "index/secondary_index_manager.hh"
 #include "types/list.hh"
@@ -43,7 +45,8 @@ using boost::adaptors::transformed;
 
 namespace {
 
-std::optional<atomic_cell_value_view> do_get_value(const schema& schema,
+static
+bytes_opt do_get_value(const schema& schema,
         const column_definition& cdef,
         const partition_key& key,
         const clustering_key_prefix& ckey,
@@ -51,9 +54,9 @@ std::optional<atomic_cell_value_view> do_get_value(const schema& schema,
         gc_clock::time_point now) {
     switch (cdef.kind) {
         case column_kind::partition_key:
-            return atomic_cell_value_view(key.get_component(schema, cdef.component_index()));
+            return to_bytes(key.get_component(schema, cdef.component_index()));
         case column_kind::clustering_key:
-            return atomic_cell_value_view(ckey.get_component(schema, cdef.component_index()));
+            return to_bytes(ckey.get_component(schema, cdef.component_index()));
         default:
             auto cell = cells.find_cell(cdef.id);
             if (!cell) {
@@ -61,7 +64,7 @@ std::optional<atomic_cell_value_view> do_get_value(const schema& schema,
             }
             assert(cdef.is_atomic());
             auto c = cell->as_atomic_cell(cdef);
-            return c.is_dead(now) ? std::nullopt : std::optional<atomic_cell_value_view>(c.value());
+            return c.is_dead(now) ? std::nullopt : bytes_opt(to_bytes(c.value()));
     }
 }
 
@@ -138,9 +141,8 @@ bytes_opt get_value_from_partition_slice(
 
 /// Returns col's value from a mutation.
 bytes_opt get_value_from_mutation(const column_value& col, row_data_from_mutation data) {
-    const auto v = do_get_value(
+    return do_get_value(
             data.schema_, *col.col, data.partition_key_, data.clustering_key_, data.other_columns, data.now);
-    return v ? v->linearize() : bytes_opt();
 }
 
 /// Returns col's value from the fetched data.
@@ -154,7 +156,7 @@ bytes_opt get_value(const column_value& col, const column_value_eval_bag& bag) {
 
 /// Type for comparing results of get_value().
 const abstract_type* get_value_comparator(const column_definition* cdef) {
-    return cdef->type->is_reversed() ? cdef->type->underlying_type().get() : cdef->type.get();
+    return &cdef->type->without_reversed();
 }
 
 /// Type for comparing results of get_value().
@@ -413,6 +415,8 @@ bool is_one_of(const column_value& col, term& rhs, const column_value_eval_bag& 
     } else if (auto mkr = dynamic_cast<lists::marker*>(&rhs)) {
         // This is `a IN ?`.  RHS elements are values representable as bytes_opt.
         const auto values = static_pointer_cast<lists::value>(mkr->bind(bag.options));
+        statements::request_validations::check_not_null(
+                values, "Invalid null value for column %s", col.col->name_as_text());
         return boost::algorithm::any_of(values->get_elements(), [&] (const bytes_opt& b) {
                 return equal(b, col, bag);
             });
@@ -564,7 +568,8 @@ const auto deref = boost::adaptors::transformed([] (const bytes_opt& b) { return
 
 /// Returns possible values from t, which must be RHS of IN.
 value_list get_IN_values(
-        const ::shared_ptr<term>& t, const query_options& options, const serialized_compare& comparator) {
+        const ::shared_ptr<term>& t, const query_options& options, const serialized_compare& comparator,
+        sstring_view column_name) {
     // RHS is prepared differently for different CQL cases.  Cast it dynamically to discern which case this is.
     if (auto dv = dynamic_pointer_cast<lists::delayed_value>(t)) {
         // Case `a IN (1,2,3)`.
@@ -574,8 +579,12 @@ value_list get_IN_values(
         return to_sorted_vector(std::move(result_range), comparator);
     } else if (auto mkr = dynamic_pointer_cast<lists::marker>(t)) {
         // Case `a IN ?`.  Collect all list-element values.
-        const auto val = static_pointer_cast<lists::value>(mkr->bind(options));
-        return to_sorted_vector(val->get_elements() | non_null | deref, comparator);
+        const auto val = mkr->bind(options);
+        if (val == constants::UNSET_VALUE) {
+            throw exceptions::invalid_request_exception(format("Invalid unset value for column {}", column_name));
+        }
+        statements::request_validations::check_not_null(val, "Invalid null value for column %s", column_name);
+        return to_sorted_vector(static_pointer_cast<lists::value>(val)->get_elements() | non_null | deref, comparator);
     }
     throw std::logic_error(format("get_IN_values(single column) on invalid term {}", *t));
 }
@@ -601,22 +610,6 @@ value_list get_IN_values(const ::shared_ptr<term>& t, size_t k, const query_opti
 }
 
 static constexpr bool inclusive = true, exclusive = false;
-
-/// A range of all X such that X op val.
-nonwrapping_range<bytes> to_range(oper_t op, const bytes& val) {
-    switch (op) {
-    case oper_t::GT:
-        return nonwrapping_range<bytes>::make_starting_with(interval_bound(val, exclusive));
-    case oper_t::GTE:
-        return nonwrapping_range<bytes>::make_starting_with(interval_bound(val, inclusive));
-    case oper_t::LT:
-        return nonwrapping_range<bytes>::make_ending_with(interval_bound(val, exclusive));
-    case oper_t::LTE:
-        return nonwrapping_range<bytes>::make_ending_with(interval_bound(val, inclusive));
-    default:
-        throw std::logic_error(format("to_range: unknown comparison operator {}", op));
-    }
-}
 
 } // anonymous namespace
 
@@ -646,7 +639,7 @@ bool is_satisfied_by(
 std::vector<bytes_opt> first_multicolumn_bound(
         const expression& restr, const query_options& options, statements::bound bnd) {
     auto found = find_atom(restr, [bnd] (const binary_operator& oper) {
-        return matches(oper.op, bnd) && std::holds_alternative<std::vector<column_value>>(oper.lhs);
+        return matches(oper.op, bnd) && is_multi_column(oper);
     });
     if (found) {
         return static_pointer_cast<tuples::value>(found->rhs->bind(options))->get_elements();
@@ -654,6 +647,27 @@ std::vector<bytes_opt> first_multicolumn_bound(
         return std::vector<bytes_opt>{};
     }
 }
+
+template<typename T>
+nonwrapping_range<T> to_range(oper_t op, const T& val) {
+    static constexpr bool inclusive = true, exclusive = false;
+    switch (op) {
+    case oper_t::EQ:
+        return nonwrapping_range<T>::make_singular(val);
+    case oper_t::GT:
+        return nonwrapping_range<T>::make_starting_with(interval_bound(val, exclusive));
+    case oper_t::GTE:
+        return nonwrapping_range<T>::make_starting_with(interval_bound(val, inclusive));
+    case oper_t::LT:
+        return nonwrapping_range<T>::make_ending_with(interval_bound(val, exclusive));
+    case oper_t::LTE:
+        return nonwrapping_range<T>::make_ending_with(interval_bound(val, inclusive));
+    default:
+        throw std::logic_error(format("to_range: unknown comparison operator {}", op));
+    }
+}
+
+template nonwrapping_range<clustering_key_prefix> to_range(oper_t, const clustering_key_prefix&);
 
 value_set possible_lhs_values(const column_definition* cdef, const expression& expr, const query_options& options) {
     const auto type = cdef ? get_value_comparator(cdef) : long_type.get();
@@ -682,7 +696,7 @@ value_set possible_lhs_values(const column_definition* cdef, const expression& e
                                 return oper.op == oper_t::EQ ? value_set(value_list{*val})
                                         : to_range(oper.op, *val);
                             } else if (oper.op == oper_t::IN) {
-                                return get_IN_values(oper.rhs, options, type->as_less_comparator());
+                                return get_IN_values(oper.rhs, options, type->as_less_comparator(), cdef->name_as_text());
                             }
                             throw std::logic_error(format("possible_lhs_values: unhandled operator {}", oper));
                         },
@@ -798,7 +812,7 @@ bool has_supporting_index(
 }
 
 std::ostream& operator<<(std::ostream& os, const column_value& cv) {
-    os << *cv.col;
+    os << cv.col->name_as_text();
     if (cv.sub) {
         os << '[' << *cv.sub << ']';
     }
@@ -813,10 +827,10 @@ std::ostream& operator<<(std::ostream& os, const expression& expr) {
                 std::visit(overloaded_functor{
                         [&] (const token& t) { os << "TOKEN"; },
                         [&] (const column_value& col) {
-                            fmt::print(os, "({})", col);
+                            fmt::print(os, "{}", col);
                         },
                         [&] (const std::vector<column_value>& cvs) {
-                            fmt::print(os, "(({}))", fmt::join(cvs, ","));
+                            fmt::print(os, "({})", fmt::join(cvs, ","));
                         },
                     }, opr.lhs);
                 os << ' ' << opr.op << ' ' << *opr.rhs;

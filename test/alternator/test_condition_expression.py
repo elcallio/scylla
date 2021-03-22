@@ -125,7 +125,7 @@ def test_update_condition_eq_different(test_table_s):
                         ConditionExpression='a = :val2',
                         ExpressionAttributeValues={':val1': val1, ':val2': val2})
 
-# Also check an actual case of same time, but inequality.
+# Also check an actual case of same type, but inequality.
 def test_update_condition_eq_unequal(test_table_s):
     p = random_string()
     test_table_s.update_item(Key={'p': p},
@@ -134,6 +134,13 @@ def test_update_condition_eq_unequal(test_table_s):
         test_table_s.update_item(Key={'p': p},
             UpdateExpression='SET a = :val1',
             ConditionExpression='a = :oldval',
+            ExpressionAttributeValues={':val1': 3, ':oldval': 2})
+    # If the attribute being compared doesn't exist, it's considered a failed
+    # condition, not an error:
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET a = :val1',
+            ConditionExpression='q = :oldval',
             ExpressionAttributeValues={':val1': 3, ':oldval': 2})
 
 # Check that set equality is checked correctly. Unlike string equality (for
@@ -258,15 +265,44 @@ def test_update_condition_lt(test_table_s):
             UpdateExpression='SET z = :newval',
             ConditionExpression='a < :oldval',
             ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
-    # Trying to compare an unsupported type - e.g., in the following test
-    # a boolean, is unfortunately caught by boto3 and cannot be tested here...
-    #test_table_s.update_item(Key={'p': p},
-    #    AttributeUpdates={'d': {'Value': False, 'Action': 'PUT'}})
-    #with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
-    #    test_table_s.update_item(Key={'p': p},
-    #        UpdateExpression='SET z = :newval',
-    #        ConditionExpression='d < :oldval',
-    #        ExpressionAttributeValues={':newval': 2, ':oldval': True})
+    # If the attribute being compared doesn't even exist, this is also
+    # considered as a false condition - not an error.
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='q < :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval < q',
+            ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    # If a comparison parameter comes from a constant specified in the query,
+    # and it has a type not supported by the comparison (e.g., a list), it's
+    # not just a failed comparison - it is considered a ValidationException
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a < :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': [1,2]})
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval < a',
+            ExpressionAttributeValues={':newval': 2, ':oldval': [1,2]})
+    # However, if when the wrong type comes from an item attribute, not the
+    # query, the comparison is simply false - not a ValidationException.
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'x': {'Value': [1,2,3], 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='x < :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 1})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval < x',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 1})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 4
 
 # Test for ConditionExpression with operator "<="
@@ -330,6 +366,44 @@ def test_update_condition_le(test_table_s):
             UpdateExpression='SET z = :newval',
             ConditionExpression='a <= :oldval',
             ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    # If the attribute being compared doesn't even exist, this is also
+    # considered as a false condition - not an error.
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='q <= :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval <= q',
+            ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    # If a comparison parameter comes from a constant specified in the query,
+    # and it has a type not supported by the comparison (e.g., a list), it's
+    # not just a failed comparison - it is considered a ValidationException
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a <= :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': [1,2]})
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval <= a',
+            ExpressionAttributeValues={':newval': 2, ':oldval': [1,2]})
+    # However, if when the wrong type comes from an item attribute, not the
+    # query, the comparison is simply false - not a ValidationException.
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'x': {'Value': [1,2,3], 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='x <= :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 1})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval <= x',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 1})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 7
 
 # Test for ConditionExpression with operator ">"
@@ -393,6 +467,44 @@ def test_update_condition_gt(test_table_s):
             UpdateExpression='SET z = :newval',
             ConditionExpression='a > :oldval',
             ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    # If the attribute being compared doesn't even exist, this is also
+    # considered as a false condition - not an error.
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='q > :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval > q',
+            ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    # If a comparison parameter comes from a constant specified in the query,
+    # and it has a type not supported by the comparison (e.g., a list), it's
+    # not just a failed comparison - it is considered a ValidationException
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a > :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': [1,2]})
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval > a',
+            ExpressionAttributeValues={':newval': 2, ':oldval': [1,2]})
+    # However, if when the wrong type comes from an item attribute, not the
+    # query, the comparison is simply false - not a ValidationException.
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'x': {'Value': [1,2,3], 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='x > :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 1})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval > x',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 1})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 4
 
 # Test for ConditionExpression with operator ">="
@@ -456,6 +568,44 @@ def test_update_condition_ge(test_table_s):
             UpdateExpression='SET z = :newval',
             ConditionExpression='a >= :oldval',
             ExpressionAttributeValues={':newval': 2, ':oldval': '0'})
+    # If the attribute being compared doesn't even exist, this is also
+    # considered as a false condition - not an error.
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='q >= :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval >= q',
+            ExpressionAttributeValues={':newval': 2, ':oldval': '17'})
+    # If a comparison parameter comes from a constant specified in the query,
+    # and it has a type not supported by the comparison (e.g., a list), it's
+    # not just a failed comparison - it is considered a ValidationException
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a >= :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': [1,2]})
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval >= a',
+            ExpressionAttributeValues={':newval': 2, ':oldval': [1,2]})
+    # However, if when the wrong type comes from an item attribute, not the
+    # query, the comparison is simply false - not a ValidationException.
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'x': {'Value': [1,2,3], 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='x >= :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 1})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression=':oldval >= x',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 1})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 7
 
 # Test for ConditionExpression with ternary operator "BETWEEN" (checking
@@ -537,6 +687,60 @@ def test_update_condition_between(test_table_s):
             UpdateExpression='SET z = :newval',
             ConditionExpression='a BETWEEN :oldval1 AND :oldval2',
             ExpressionAttributeValues={':newval': 2, ':oldval1': '0', ':oldval2': '2'})
+    # If the attribute being compared doesn't even exist, this is also
+    # considered as a false condition - not an error.
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='q BETWEEN :oldval1 AND :oldval2',
+            ExpressionAttributeValues={':newval': 2, ':oldval1': b'dog', ':oldval2': b'zebra'})
+    # If and operand from the query, and it has a type not supported by the
+    # comparison (e.g., a list), it's not just a failed condition - it is
+    # considered a ValidationException
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a BETWEEN :oldval1 AND :oldval2',
+            ExpressionAttributeValues={':newval': 2, ':oldval1': [1,2], ':oldval2': [2,3]})
+    # However, if when the wrong type comes from an item attribute, not the
+    # query, the comparison is simply false - not a ValidationException.
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'x': {'Value': [1,2,3], 'Action': 'PUT'},
+                                                             'y': {'Value': [2,3,4], 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a BETWEEN x and y',
+            ExpressionAttributeValues={':newval': 2})
+    # If the two operands come from the query (":val" references) then if they
+    # have different types or the wrong order, this is a ValidationException.
+    # But if one or more of the operands come from the item, this only causes
+    # a false condition - not a ValidationException.
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a BETWEEN :oldval1 AND :oldval2',
+            ExpressionAttributeValues={':newval': 2, ':oldval1': 2, ':oldval2': 1})
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a BETWEEN :oldval1 AND :oldval2',
+            ExpressionAttributeValues={':newval': 2, ':oldval1': 2, ':oldval2': 'dog'})
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'two': {'Value': 2, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a BETWEEN two AND :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 1})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a BETWEEN :oldval AND two',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 3})
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET z = :newval',
+            ConditionExpression='a BETWEEN two AND :oldval',
+            ExpressionAttributeValues={':newval': 2, ':oldval': 'dog'})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['z'] == 9
 
 # Test for ConditionExpression with multi-operand operator "IN", checking
@@ -593,6 +797,13 @@ def test_update_condition_in(test_table_s):
         test_table_s.update_item(Key={'p': p},
             UpdateExpression='SET c = :val37',
             ConditionExpression='a IN ()',
+            ExpressionAttributeValues=values)
+    # If the attribute being compared doesn't even exist, this is also
+    # considered as a false condition - not an error.
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET c = :val37',
+            ConditionExpression='q IN ({})'.format(','.join(values.keys())),
             ExpressionAttributeValues=values)
 
 # Beyond the above operators, there are also test functions supported -
@@ -1040,7 +1251,6 @@ def test_update_condition_other_funcs(test_table_s):
 # ConditionExpressions also allows reading nested attributes, and we should
 # support that too. This test just checks a few random operators - we don't
 # test all the different operators here.
-@pytest.mark.xfail(reason="nested attributes not yet implemented in ConditionExpression")
 def test_update_condition_nested_attributes(test_table_s):
     p = random_string()
     test_table_s.update_item(Key={'p': p},
@@ -1054,6 +1264,21 @@ def test_update_condition_nested_attributes(test_table_s):
         UpdateExpression='SET c = :val',
             ConditionExpression='b.x < b.y[1]',
             ExpressionAttributeValues={':val': 2})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c'] == 2
+    # Also check the case of a failing condition
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET c = :val',
+                ConditionExpression='b.x < b.y[0]',
+            ExpressionAttributeValues={':val': 3})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c'] == 2
+    # A condition involving an attribute which doesn't exist results in
+    # failed condition - not an error.
+    with pytest.raises(ClientError, match='ConditionalCheckFailedException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET c = :val',
+                ConditionExpression='b.z < b.y[100]',
+            ExpressionAttributeValues={':val': 4})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c'] == 2
 
 # All the previous tests refered to attributes using their name directly.
@@ -1071,16 +1296,15 @@ def test_update_condition_attribute_reference(test_table_s):
             ExpressionAttributeValues={':val': 1})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c'] == 1
 
-@pytest.mark.xfail(reason="nested attributes not yet implemented in ConditionExpression")
 def test_update_condition_nested_attribute_reference(test_table_s):
     p = random_string()
     test_table_s.update_item(Key={'p': p},
-            AttributeUpdates={'and': {'Value': {'or': 1}, 'Action': 'PUT'}})
+            AttributeUpdates={'and': {'Value': {'or': 2}, 'Action': 'PUT'}})
     test_table_s.update_item(Key={'p': p},
         UpdateExpression='SET c = :val',
-            ConditionExpression='attribute_exists (#name1.#name2)',
+            ConditionExpression='#name1.#name2 = :two',
             ExpressionAttributeNames={'#name1': 'and', '#name2': 'or'},
-            ExpressionAttributeValues={':val': 1})
+            ExpressionAttributeValues={':val': 1, ':two': 2})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c'] == 1
 
 # All the previous tests involved a single condition. The following tests
@@ -1377,39 +1601,32 @@ def test_update_condition_unused_entries_short_circuit(test_table_s):
 # These test cases make sense only for alternator, so they're skipped
 # when run on AWS
 def test_condition_expression_with_permissive_write_isolation(scylla_only, dynamodb, test_table_s):
-    def do_test_with_permissive_isolation_levels(test_case, table, *args):
-        try:
-            for isolation in ['a', 'o', 'u']:
-                set_write_isolation(table, isolation)
-                test_case(table, *args)
-        finally:
-            clear_write_isolation(table)
-    for test_case in [test_update_condition_eq_success, test_update_condition_attribute_exists,
-                      test_delete_item_condition, test_put_item_condition, test_update_condition_attribute_reference]:
-        do_test_with_permissive_isolation_levels(test_case, test_table_s)
+    try:
+        for isolation in ['a', 'o', 'u']:
+            set_write_isolation(test_table_s, isolation)
+            for test_case in [test_update_condition_eq_success,
+                              test_update_condition_attribute_exists,
+                              test_delete_item_condition,
+                              test_put_item_condition,
+                              test_update_condition_attribute_reference]:
+                test_case(test_table_s)
+    finally:
+        clear_write_isolation(test_table_s)
 
 # Test that the forbid_rmw isolation level prevents read-modify-write requests
 # from working. These test cases make sense only for alternator, so they're skipped
-# when run on AWS
-def test_condition_expression_with_forbidden_rmw(scylla_only, dynamodb, test_table_s):
-    def do_test_with_forbidden_rmw(test_case, table, *args):
-        try:
-            set_write_isolation(table, 'f')
-            test_case(table, *args)
-            assert False, "Expected an exception when running {}".format(test_case.__name__)
-        except ClientError:
-            pass
-        finally:
-            clear_write_isolation(table)
+# when run on AWS (test_table_s_forbid_rmw implies scylla_only)
+def test_condition_expression_with_forbidden_rmw(dynamodb, test_table_s_forbid_rmw):
     for test_case in [test_update_condition_eq_success, test_update_condition_attribute_exists,
                       test_put_item_condition, test_update_condition_attribute_reference]:
-        do_test_with_forbidden_rmw(test_case, test_table_s)
+        with pytest.raises(ClientError):
+            test_case(test_table_s_forbid_rmw)
     # Ensure that regular writes (without rmw) work just fine
     s = random_string()
-    test_table_s.put_item(Item={'p': s, 'regular': 'write'})
-    assert test_table_s.get_item(Key={'p': s}, ConsistentRead=True)['Item'] == {'p': s, 'regular': 'write'}
-    test_table_s.update_item(Key={'p': s}, AttributeUpdates={'write': {'Value': 'regular', 'Action': 'PUT'}})
-    assert test_table_s.get_item(Key={'p': s}, ConsistentRead=True)['Item'] == {'p': s, 'regular': 'write', 'write': 'regular'}
+    test_table_s_forbid_rmw.put_item(Item={'p': s, 'regular': 'write'})
+    assert test_table_s_forbid_rmw.get_item(Key={'p': s}, ConsistentRead=True)['Item'] == {'p': s, 'regular': 'write'}
+    test_table_s_forbid_rmw.update_item(Key={'p': s}, AttributeUpdates={'write': {'Value': 'regular', 'Action': 'PUT'}})
+    assert test_table_s_forbid_rmw.get_item(Key={'p': s}, ConsistentRead=True)['Item'] == {'p': s, 'regular': 'write', 'write': 'regular'}
 
 # Reproducer for issue #6573: binary strings should be ordered as unsigned
 # bytes, i.e., byte 128 comes after 127, not before as with signed bytes.

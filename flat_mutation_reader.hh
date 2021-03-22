@@ -19,6 +19,7 @@
 #include "tracing/trace_state.hh"
 #include "mutation.hh"
 #include "query_class_config.hh"
+#include "mutation_consumer_concepts.hh"
 
 #include <seastar/core/thread.hh>
 #include <seastar/core/file.hh>
@@ -30,28 +31,6 @@
 using seastar::future;
 
 class mutation_source;
-
-template<typename Consumer>
-concept FlatMutationReaderConsumer =
-    requires(Consumer c, mutation_fragment mf) {
-        { c(std::move(mf)) } -> std::same_as<stop_iteration>;
-    };
-
-
-template<typename T>
-concept FlattenedConsumer =
-    StreamedMutationConsumer<T> && requires(T obj, const dht::decorated_key& dk) {
-        { obj.consume_new_partition(dk) };
-        { obj.consume_end_of_partition() };
-    };
-
-template<typename T>
-concept FlattenedConsumerFilter =
-    requires(T filter, const dht::decorated_key& dk, const mutation_fragment& mf) {
-        { filter(dk) } -> std::same_as<bool>;
-        { filter(mf) } -> std::same_as<bool>;
-        { filter.on_end_of_stream() } -> std::same_as<void>;
-    };
 
 /*
  * Allows iteration on mutations using mutation_fragments.
@@ -73,7 +52,6 @@ public:
     private:
         tracked_buffer _buffer;
         size_t _buffer_size = 0;
-        bool _consume_done = false;
     protected:
         size_t max_buffer_size_in_bytes = 8 * 1024;
         bool _end_of_stream = false;
@@ -108,7 +86,7 @@ public:
         impl(schema_ptr s, reader_permit permit) : _buffer(permit), _schema(std::move(s)), _permit(std::move(permit)) { }
         virtual ~impl() {}
         virtual future<> fill_buffer(db::timeout_clock::time_point) = 0;
-        virtual void next_partition() = 0;
+        virtual future<> next_partition() = 0;
 
         bool is_end_of_stream() const { return _end_of_stream; }
         bool is_buffer_empty() const { return _buffer.empty(); }
@@ -142,16 +120,22 @@ public:
         // Stops when consumer returns stop_iteration::yes or end of stream is reached.
         // Next call will start from the next mutation_fragment in the stream.
         future<> consume_pausable(Consumer consumer, db::timeout_clock::time_point timeout) {
-            _consume_done = false;
-            return do_until([this] { return (is_end_of_stream() && is_buffer_empty()) || _consume_done; },
-                            [this, consumer = std::move(consumer), timeout] () mutable {
-                if (is_buffer_empty()) {
-                    return fill_buffer(timeout);
-                }
+            return do_with(std::move(consumer), [this, timeout] (Consumer& consumer) {
+                return repeat([this, &consumer, timeout] {
+                    if (is_end_of_stream() && is_buffer_empty()) {
+                        return make_ready_future<stop_iteration>(stop_iteration::yes);
+                    }
 
-                _consume_done = consumer(pop_mutation_fragment()) == stop_iteration::yes;
+                    if (is_buffer_empty()) {
+                        return fill_buffer(timeout).then([] {
+                            return make_ready_future<stop_iteration>(stop_iteration::no);
+                        });
+                    }
 
-                return make_ready_future<>();
+                    return futurize_invoke([&consumer, mf = pop_mutation_fragment()] () mutable {
+                        return consumer(std::move(mf));
+                    });
+                });
             });
         }
 
@@ -168,7 +152,6 @@ public:
                 }
                 if (is_buffer_empty()) {
                     if (is_end_of_stream()) {
-                        filter.on_end_of_stream();
                         return;
                     }
                     fill_buffer(timeout).get();
@@ -176,10 +159,16 @@ public:
                 }
                 auto mf = pop_mutation_fragment();
                 if (mf.is_partition_start() && !filter(mf.as_partition_start().key())) {
-                    next_partition();
+                    next_partition().get();
                     continue;
                 }
-                if (filter(mf) && (consumer(std::move(mf)) == stop_iteration::yes)) {
+                if (!filter(mf)) {
+                    continue;
+                }
+                auto do_stop = futurize_invoke([&consumer, mf = std::move(mf)] () mutable {
+                    return consumer(std::move(mf));
+                });
+                if (do_stop.get0()) {
                     return;
                 }
             }
@@ -195,38 +184,42 @@ public:
                     : _reader(reader)
                       , _consumer(std::move(c))
             { }
-            stop_iteration operator()(mutation_fragment&& mf) {
+            future<stop_iteration> operator()(mutation_fragment&& mf) {
                 return std::move(mf).consume(*this);
             }
-            stop_iteration consume(static_row&& sr) {
+            future<stop_iteration> consume(static_row&& sr) {
                 return handle_result(_consumer.consume(std::move(sr)));
             }
-            stop_iteration consume(clustering_row&& cr) {
+            future<stop_iteration> consume(clustering_row&& cr) {
                 return handle_result(_consumer.consume(std::move(cr)));
             }
-            stop_iteration consume(range_tombstone&& rt) {
+            future<stop_iteration> consume(range_tombstone&& rt) {
                 return handle_result(_consumer.consume(std::move(rt)));
             }
-            stop_iteration consume(partition_start&& ps) {
+            future<stop_iteration> consume(partition_start&& ps) {
                 _decorated_key.emplace(std::move(ps.key()));
                 _consumer.consume_new_partition(*_decorated_key);
                 if (ps.partition_tombstone()) {
                     _consumer.consume(ps.partition_tombstone());
                 }
-                return stop_iteration::no;
+                return make_ready_future<stop_iteration>(stop_iteration::no);
             }
-            stop_iteration consume(partition_end&& pe) {
+            future<stop_iteration> consume(partition_end&& pe) {
+              return futurize_invoke([this] {
                 return _consumer.consume_end_of_partition();
+              });
             }
         private:
-            stop_iteration handle_result(stop_iteration si) {
+            future<stop_iteration> handle_result(stop_iteration si) {
                 if (si) {
                     if (_consumer.consume_end_of_partition()) {
-                        return stop_iteration::yes;
+                        return make_ready_future<stop_iteration>(stop_iteration::yes);
                     }
-                    _reader.next_partition();
+                    return _reader.next_partition().then([] {
+                        return make_ready_future<stop_iteration>(stop_iteration::no);
+                    });
                 }
-                return stop_iteration::no;
+                return make_ready_future<stop_iteration>(stop_iteration::no);
             }
         };
     public:
@@ -260,6 +253,7 @@ public:
         auto consume_in_thread(Consumer consumer, Filter filter, db::timeout_clock::time_point timeout) {
             auto adapter = consumer_adapter<Consumer>(*this, std::move(consumer));
             consume_pausable_in_thread(std::ref(adapter), std::move(filter), timeout);
+            filter.on_end_of_stream();
             return adapter._consumer.consume_end_of_stream();
         };
 
@@ -394,7 +388,7 @@ public:
     //
     // Can be used to skip over entire partitions if interleaved with
     // `operator()()` calls.
-    void next_partition() { _impl->next_partition(); }
+    future<> next_partition() { return _impl->next_partition(); }
 
     future<> fill_buffer(db::timeout_clock::time_point timeout) { return _impl->fill_buffer(timeout); }
 
@@ -582,11 +576,12 @@ flat_mutation_reader transform(flat_mutation_reader r, T t) {
                 }
             });
         }
-        virtual void next_partition() override {
+        virtual future<> next_partition() override {
             clear_buffer_to_next_partition();
             if (is_buffer_empty()) {
-                _reader.next_partition();
+                return _reader.next_partition();
             }
+            return make_ready_future<>();
         }
         virtual future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override {
             clear_buffer();
@@ -624,12 +619,15 @@ public:
         forward_buffer_to(pr.start());
         return to_reference(_underlying).fast_forward_to(std::move(pr), timeout);
     }
-    virtual void next_partition() override {
+    virtual future<> next_partition() override {
         clear_buffer_to_next_partition();
+        auto maybe_next_partition = make_ready_future<>();
         if (is_buffer_empty()) {
-            to_reference(_underlying).next_partition();
+            maybe_next_partition = to_reference(_underlying).next_partition();
         }
+      return maybe_next_partition.then([this] {
         _end_of_stream = to_reference(_underlying).is_end_of_stream() && to_reference(_underlying).is_buffer_empty();
+      });
     }
     virtual future<> fast_forward_to(const dht::partition_range& pr, db::timeout_clock::time_point timeout) override {
         _end_of_stream = false;
@@ -747,97 +745,3 @@ make_generating_reader(schema_ptr s, reader_permit permit, std::function<future<
 /// FIXME: reversing should be done in the sstable layer, see #1413.
 flat_mutation_reader
 make_reversing_reader(flat_mutation_reader& original, query::max_result_size max_size);
-
-/// Low level fragment stream validator.
-///
-/// Tracks and validates the monotonicity of the passed in fragment kinds,
-/// position in partition and partition keys. Any subset of these can be
-/// used, but what is used have to be consistent across the entire stream.
-class mutation_fragment_stream_validator {
-    const schema& _schema;
-    mutation_fragment::kind _prev_kind;
-    position_in_partition _prev_pos;
-    dht::decorated_key _prev_partition_key;
-public:
-    explicit mutation_fragment_stream_validator(const schema& s);
-
-    /// Validate the monotonicity of the fragment kind.
-    ///
-    /// Should be used when the full, more heavy-weight position-in-partition
-    /// monotonicity validation provided by
-    /// `operator()(const mutation_fragment&)` is not desired.
-    /// Using both overloads for the same stream is not supported.
-    /// Advances the previous fragment kind, but only if the validation passes.
-    ///
-    /// \returns true if the fragment kind is valid.
-    bool operator()(mutation_fragment::kind kind);
-
-    /// Validates the monotonicity of the mutation fragment.
-    ///
-    /// Validates the mutation fragment kind monotonicity and
-    /// position-in-partition.
-    /// A more complete version of `operator()(mutation_fragment::kind)`.
-    /// Using both overloads for the same stream is not supported.
-    /// Advances the previous fragment kind and position-in-partition, but only
-    /// if the validation passes.
-    ///
-    /// \returns true if the mutation fragment kind is valid.
-    bool operator()(const mutation_fragment& mf);
-
-    /// Validates the monotonicity of the partition.
-    ///
-    /// Does not check fragment level monotonicity.
-    /// Advances the previous partition-key, but only if the validation passes.
-    //
-    /// \returns true if the partition key is valid.
-    bool operator()(const dht::decorated_key& dk);
-
-    /// Validate that the stream was properly closed.
-    ///
-    /// \returns false if the last partition wasn't closed, i.e. the last
-    /// fragment wasn't a `partition_end` fragment.
-    bool on_end_of_stream();
-
-    /// The previous valid fragment kind.
-    mutation_fragment::kind previous_mutation_fragment_kind() const {
-        return _prev_kind;
-    }
-    /// The previous valid position.
-    ///
-    /// Not meaningful, when operator()(position_in_partition_view) is not used.
-    const position_in_partition& previous_position() const {
-        return _prev_pos;
-    }
-    /// The previous valid partition key.
-    const dht::decorated_key& previous_partition_key() const {
-        return _prev_partition_key;
-    }
-};
-
-struct invalid_mutation_fragment_stream : public std::runtime_error {
-    explicit invalid_mutation_fragment_stream(std::runtime_error e);
-};
-
-/// Track position_in_partition transitions and validate monotonicity.
-///
-/// Will throw `invalid_mutation_fragment_stream` if any violation is found.
-/// If the `abort_on_internal_error` configuration option is set, it will
-/// abort instead.
-/// Implements the FlattenedConsumerFilter concept.
-class mutation_fragment_stream_validating_filter {
-    mutation_fragment_stream_validator _validator;
-    sstring _name;
-    bool _compare_keys;
-
-public:
-    /// Constructor.
-    ///
-    /// \arg name is used in log messages to identify the validator, the
-    ///     schema identity is added automatically
-    /// \arg compare_keys enable validating clustering key monotonicity
-    mutation_fragment_stream_validating_filter(sstring_view name, const schema& s, bool compare_keys = false);
-
-    bool operator()(const dht::decorated_key& dk);
-    bool operator()(const mutation_fragment& mv);
-    void on_end_of_stream();
-};
