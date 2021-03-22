@@ -99,7 +99,20 @@ public:
             return true;
         }
         auto& qp = _ctxt.get_query_processor();
-        // FIXME: wait for system tables to be started.
+        // This check should be ok, and even somewhat redundant. "Initialized" above
+        // will only be set once we've generated/queried a key not passing through here
+        // (i.e. a key for write _or_ commit log (should we allow this)). This can only be
+        // done if:
+        // a.) Encryption was already set up, thus table existed and we waited
+        //     for distributed_tables in "ensure_populated"
+        // b.) Encryption was added. In which case we are way past bootstrap
+        //     and can receive user commands.
+        // c.) System table/commit log write, with either first use of this provider,
+        //     in which case we're creating the table (here at least) - thus fine,
+        //     or again, we've waited through "ensure_populated", so keys are
+        //     readble. At worst, we create a few extra keys.
+        // Note: currently c.) is not relevant, as we don't support system/commitlog
+        //       encryption using repl_prov.
         return !qp.local_is_initialized();
     }
 
