@@ -2256,7 +2256,7 @@ const db::commitlog::config& db::commitlog::active_config() const {
 // No commit_io_check needed in the log reader since the database will fail
 // on error at startup if required
 future<>
-db::commitlog::read_log_file(const sstring& filename_in, const sstring& pfx_in, seastar::io_priority_class read_io_prio_class, commit_load_reader_func next, position_type off, const db::extensions* exts) {
+db::commitlog::read_log_file(sstring filename, sstring pfx, seastar::io_priority_class read_io_prio_class, commit_load_reader_func next, position_type off, const db::extensions* exts) {
     struct work {
     private:
         file_input_stream_options make_file_input_stream_options(seastar::io_priority_class read_io_prio_class) {
@@ -2269,7 +2269,7 @@ db::commitlog::read_log_file(const sstring& filename_in, const sstring& pfx_in, 
     public:
         file f;
         descriptor d;
-        stream<buffer_and_replay_position> s;
+        commit_load_reader_func func;
         input_stream<char> fin;
         input_stream<char> r;
         uint64_t id = 0;
@@ -2283,8 +2283,8 @@ db::commitlog::read_log_file(const sstring& filename_in, const sstring& pfx_in, 
         bool failed = false;
         fragmented_temporary_buffer::reader frag_reader;
 
-        work(file f, descriptor din, seastar::io_priority_class read_io_prio_class, position_type o = 0)
-                : f(f), d(din), fin(make_file_input_stream(f, 0, make_file_input_stream_options(read_io_prio_class))), start_off(o) {
+        work(file f, descriptor din, commit_load_reader_func fn, seastar::io_priority_class read_io_prio_class, position_type o = 0)
+                : f(f), d(din), func(std::move(fn)), fin(make_file_input_stream(f, 0, make_file_input_stream_options(read_io_prio_class))), start_off(o) {
         }
         work(work&&) = default;
 
@@ -2404,9 +2404,10 @@ db::commitlog::read_log_file(const sstring& filename_in, const sstring& pfx_in, 
 
         future<> produce(buffer_and_replay_position bar) {
             try {
-                co_await s.produce(std::move(bar));
+                co_await func(std::move(bar));
             } catch (...) {
                 fail();
+                throw;
             }
         }
 
@@ -2557,9 +2558,6 @@ db::commitlog::read_log_file(const sstring& filename_in, const sstring& pfx_in, 
         }
     };
 
-    sstring filename(filename_in);
-    sstring pfx(pfx_in);
-
     auto bare_filename = std::filesystem::path(filename).filename().string();
     if (bare_filename.rfind(pfx, 0) != 0) {
         co_return;
@@ -2585,19 +2583,9 @@ db::commitlog::read_log_file(const sstring& filename_in, const sstring& pfx_in, 
     f = make_checked_file(commit_error_handler, std::move(f));
 
     descriptor d(filename, pfx);
-    work w(std::move(f), d, read_io_prio_class, off);
+    work w(std::move(f), d, std::move(next), read_io_prio_class, off);
 
-    auto s = w.s.listen(next);
-    try {
-        co_await w.s.started();
-        co_await w.read_file();
-        if (!w.failed) {
-            w.s.close();
-        }
-    } catch (...) {
-        w.s.set_exception(std::current_exception());
-    }
-    co_await s.done();
+    co_await w.read_file();
 }
 
 std::vector<sstring> db::commitlog::get_active_segment_names() const {
