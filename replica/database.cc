@@ -2258,7 +2258,10 @@ database::make_keyspace_config(const keyspace_metadata& ksm) {
     }
     cfg.enable_dangerous_direct_import_of_cassandra_counters = _cfg.enable_dangerous_direct_import_of_cassandra_counters();
     cfg.compaction_enforce_min_threshold = _cfg.compaction_enforce_min_threshold;
-    cfg.dirty_memory_manager = &_dirty_memory_manager;
+    cfg.dirty_memory_manager = _cfg.extensions().is_extension_internal_keyspace(ksm.name())
+        ? &_system_dirty_memory_manager
+        : &_dirty_memory_manager
+        ;
     cfg.streaming_read_concurrency_semaphore = &_streaming_concurrency_sem;
     cfg.compaction_concurrency_semaphore = &_compaction_concurrency_sem;
     cfg.cf_stats = &_cf_stats;
