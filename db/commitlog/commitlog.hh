@@ -109,6 +109,7 @@ public:
         bool use_o_dsync = false;
         bool warn_about_segments_left_on_disk_after_shutdown = true;
         bool allow_going_over_size_limit = true;
+        bool zero_terminate_writes = false;
 
         // The base segment ID to use.
         // The segment IDs of newly allocated segments will be issued sequentially

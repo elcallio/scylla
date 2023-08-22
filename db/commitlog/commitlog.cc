@@ -236,6 +236,8 @@ public:
     const uint64_t max_disk_size; // per-shard
     const uint64_t disk_usage_threshold;
 
+    temporary_buffer<char> zero_terminator;
+
     enum class state {
         active, shutting_down, terminated,
     };
@@ -928,7 +930,7 @@ public:
         assert(_closed);
         co_await cycle(true);
 
-        if (file_position() < _segment_manager->max_size) {
+        if (file_position() < _segment_manager->max_size && !_segment_manager->cfg.zero_terminate_writes) {
             clogger.trace("{} is closed but not terminated.", *this);
             assert(_buffer.empty());
             new_buffer(0);
@@ -1096,7 +1098,30 @@ public:
                     for (auto& v : view) {
                         iov.emplace_back(iovec{const_cast<int8_t*>(v.data()), v.size()});
                     }
+
+                    // If enabled, append a zeroed sector after data we actually write, to help
+                    // replayer distinguish actually broken segments from ones just not fully
+                    // terminated
+                    auto write_zeroes = _segment_manager->cfg.zero_terminate_writes && top < _segment_manager->max_size;
+
+                    if (write_zeroes) {
+                        if (_segment_manager->zero_terminator.size() < _alignment) {
+                            temporary_buffer<char> buf(_alignment);
+                            std::fill(buf.get_write(), buf.get_write() + _alignment, 0);
+                            _segment_manager->zero_terminator = std::move(buf);
+                        }
+                        clogger.trace("Adding {} {} bytes zero page at {}", *this, _alignment, top);
+                        iov.emplace_back(iovec{_segment_manager->zero_terminator.get_write(), _alignment });
+                    }
+
                     bytes = co_await _file.dma_write(off, std::move(iov));
+                    if (bytes == size && write_zeroes) {
+                        // wrote all but the terminator? wtf...
+                        // do this, ignore result.
+                        co_await _file.dma_write(off, _segment_manager->zero_terminator.get(), _alignment);
+                    } else {
+                        bytes = std::min(size, bytes);
+                    }
                 } else {
                     bytes = co_await _file.dma_write(off, current.data(), current.size());
                 }
