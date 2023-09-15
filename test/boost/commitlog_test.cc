@@ -753,6 +753,8 @@ SEASTAR_TEST_CASE(test_commitlog_new_segment_odsync){
     });
 }
 
+static constexpr auto deadlock_check_timeout = 10s;
+
 // Test for #8363
 // try to provoke edge case where we race segment deletion
 // and waiting for recycled to be replenished.
@@ -779,7 +781,7 @@ SEASTAR_TEST_CASE(test_commitlog_deadlock_in_recycle) {
     size_t n = 0;
 
     // uncomment for verbosity
-    // logging::logger_registry().set_logger_level("commitlog", logging::log_level::debug);
+    logging::logger_registry().set_logger_level("commitlog", logging::log_level::trace);
 
     auto uuid = make_table_id();
     auto size = log.max_record_size() / 2;
@@ -812,7 +814,7 @@ SEASTAR_TEST_CASE(test_commitlog_deadlock_in_recycle) {
     try {
         while (n < 10 || !num_active_allocations || !num_blocked_on_new_segment) {
             auto now = timeout_clock::now();            
-            rp_handle h = co_await with_timeout(now + 30s, log.add_mutation(uuid, size, db::commitlog::force_sync::no, [&](db::commitlog::output& dst) {
+            rp_handle h = co_await with_timeout(now + deadlock_check_timeout, log.add_mutation(uuid, size, db::commitlog::force_sync::no, [&](db::commitlog::output& dst) {
                 dst.fill('1', size);
             }));
             rps.put(std::move(h));
@@ -890,7 +892,7 @@ SEASTAR_TEST_CASE(test_commitlog_shutdown_during_wait) {
 
     try {
         auto now = timeout_clock::now();
-        co_await with_timeout(now + 30s, log.shutdown());
+        co_await with_timeout(now + deadlock_check_timeout, log.shutdown());
         co_await log.clear();
     } catch (timed_out_error&) {
         BOOST_ERROR("log shutdown timed out. maybe it is deadlocked... Will not free log. ASAN errors and leaks will follow...");
@@ -933,7 +935,7 @@ SEASTAR_TEST_CASE(test_commitlog_deadlock_with_flush_threshold) {
     try {
         while (!done) {
             auto now = timeout_clock::now();
-            rp_handle h = co_await with_timeout(now + 30s, log.add_mutation(uuid, size, db::commitlog::force_sync::no, [&](db::commitlog::output& dst) {
+            rp_handle h = co_await with_timeout(now + deadlock_check_timeout, log.add_mutation(uuid, size, db::commitlog::force_sync::no, [&](db::commitlog::output& dst) {
                 dst.fill('1', size);
             }));
             rps.put(std::move(h));
